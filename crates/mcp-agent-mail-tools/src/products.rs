@@ -1,0 +1,494 @@
+//! Product cluster tools (cross-project operations)
+//!
+//! Ported from legacy Python:
+//! - Feature-gated behind `WORKTREES_ENABLED=1`
+//! - Products are global (not per-project)
+//! - Product keys may match `product_uid` or `name`
+//! - Cross-project search/inbox/thread summary operate across linked projects
+
+use asupersync::Cx;
+use fastmcp::McpErrorCode;
+use fastmcp::prelude::*;
+use mcp_agent_mail_core::Config;
+use mcp_agent_mail_db::{DbPool, ProductRow, micros_to_iso};
+use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::messaging::InboxMessage;
+use crate::search::{ExampleMessage, SingleThreadResponse};
+use crate::tool_util::{db_outcome_to_mcp_result, get_db_pool, resolve_agent, resolve_project};
+
+static PRODUCT_UID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn worktrees_required() -> McpError {
+    McpError::new(
+        McpErrorCode::InvalidParams,
+        "Product Bus is disabled. Enable WORKTREES_ENABLED to use this tool.",
+    )
+}
+
+fn collapse_whitespace(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_hex_uid(candidate: &str) -> bool {
+    let s = candidate.trim();
+    if s.len() < 8 || s.len() > 64 {
+        return false;
+    }
+    s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn generate_product_uid(now_micros: i64) -> String {
+    let seq = PRODUCT_UID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = u64::from(std::process::id());
+    let raw = format!("{now_micros:x}{pid:x}{seq:x}");
+    let mut out = String::with_capacity(20);
+    for ch in raw.chars() {
+        if ch.is_ascii_hexdigit() {
+            out.push(ch.to_ascii_lowercase());
+        }
+        if out.len() == 20 {
+            break;
+        }
+    }
+    while out.len() < 20 {
+        out.push('0');
+    }
+    out
+}
+
+async fn get_product_by_key(cx: &Cx, pool: &DbPool, key: &str) -> McpResult<Option<ProductRow>> {
+    use mcp_agent_mail_db::sqlmodel::{Model, Value};
+
+    let conn = match pool.acquire(cx).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Err(McpError::internal_error(e.to_string())),
+        Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
+        Outcome::Panicked(p) => {
+            return Err(McpError::internal_error(format!(
+                "Internal panic: {}",
+                p.message()
+            )));
+        }
+    };
+    let sql = "SELECT * FROM products WHERE product_uid = ? OR name = ? LIMIT 1";
+    let params = [Value::Text(key.to_string()), Value::Text(key.to_string())];
+    let rows = conn
+        .query_sync(sql, &params)
+        .map_err(|e| McpError::internal_error(e.to_string()))?;
+    let Some(row) = rows.into_iter().next() else {
+        return Ok(None);
+    };
+    let product =
+        ProductRow::from_row(&row).map_err(|e| McpError::internal_error(e.to_string()))?;
+    Ok(Some(product))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProductResponse {
+    pub id: i64,
+    pub product_uid: String,
+    pub name: String,
+    pub created_at: String,
+}
+
+/// Ensure a Product exists. If not, create one.
+#[tool(description = "Ensure a Product exists. If not, create one.")]
+pub async fn ensure_product(
+    ctx: &McpContext,
+    product_key: Option<String>,
+    name: Option<String>,
+) -> McpResult<String> {
+    let config = Config::from_env();
+    if !config.worktrees_enabled {
+        return Err(worktrees_required());
+    }
+
+    let key_raw = product_key
+        .as_deref()
+        .or(name.as_deref())
+        .unwrap_or("")
+        .trim();
+    if key_raw.is_empty() {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "Provide product_key or name.",
+        ));
+    }
+
+    let pool = get_db_pool()?;
+    if let Some(existing) = get_product_by_key(ctx.cx(), &pool, key_raw).await? {
+        let response = ProductResponse {
+            id: existing.id.unwrap_or(0),
+            product_uid: existing.product_uid,
+            name: existing.name,
+            created_at: micros_to_iso(existing.created_at),
+        };
+        return serde_json::to_string(&response)
+            .map_err(|e| McpError::internal_error(format!("JSON error: {e}")));
+    }
+
+    let now = mcp_agent_mail_db::now_micros();
+    let uid = match product_key.as_deref() {
+        Some(pk) if is_hex_uid(pk) => pk.trim().to_ascii_lowercase(),
+        _ => generate_product_uid(now),
+    };
+    let display_name_raw = name.as_deref().unwrap_or(key_raw);
+    let mut display_name = collapse_whitespace(display_name_raw)
+        .chars()
+        .take(255)
+        .collect::<String>();
+    if display_name.is_empty() {
+        display_name = uid.clone();
+    }
+
+    let row = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::ensure_product(
+            ctx.cx(),
+            &pool,
+            Some(uid.as_str()),
+            Some(display_name.as_str()),
+        )
+        .await,
+    )?;
+
+    let response = ProductResponse {
+        id: row.id.unwrap_or(0),
+        product_uid: row.product_uid,
+        name: row.name,
+        created_at: micros_to_iso(row.created_at),
+    };
+
+    serde_json::to_string(&response)
+        .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProductSummary {
+    pub id: i64,
+    pub product_uid: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectSummary {
+    pub id: i64,
+    pub slug: String,
+    pub human_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProductsLinkResponse {
+    pub product: ProductSummary,
+    pub project: ProjectSummary,
+    pub linked: bool,
+}
+
+/// Link a project into a product (idempotent).
+#[tool(description = "Link a project into a product (idempotent).")]
+pub async fn products_link(
+    ctx: &McpContext,
+    product_key: String,
+    project_key: String,
+) -> McpResult<String> {
+    let config = Config::from_env();
+    if !config.worktrees_enabled {
+        return Err(worktrees_required());
+    }
+
+    let pool = get_db_pool()?;
+
+    let product = get_product_by_key(ctx.cx(), &pool, product_key.trim())
+        .await?
+        .ok_or_else(|| {
+            McpError::new(
+                McpErrorCode::InvalidParams,
+                format!("Product '{product_key}' not found."),
+            )
+        })?;
+
+    let project = resolve_project(ctx, &pool, &project_key).await?;
+    let product_id = product.id.unwrap_or(0);
+    let project_id = project.id.unwrap_or(0);
+
+    let _ = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::link_product_to_projects(
+            ctx.cx(),
+            &pool,
+            product_id,
+            &[project_id],
+        )
+        .await,
+    )?;
+
+    let response = ProductsLinkResponse {
+        product: ProductSummary {
+            id: product_id,
+            product_uid: product.product_uid,
+            name: product.name,
+        },
+        project: ProjectSummary {
+            id: project_id,
+            slug: project.slug,
+            human_key: project.human_key,
+        },
+        linked: true,
+    };
+
+    serde_json::to_string(&response)
+        .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProductSearchItem {
+    pub id: i64,
+    pub subject: String,
+    pub importance: String,
+    pub ack_required: i32,
+    pub created_ts: Option<String>,
+    pub thread_id: Option<String>,
+    pub from: String,
+    pub project_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProductSearchResponse {
+    pub result: Vec<ProductSearchItem>,
+}
+
+/// Full-text search across all projects linked to a product.
+#[tool(description = "Full-text search across all projects linked to a product.")]
+pub async fn search_messages_product(
+    ctx: &McpContext,
+    product_key: String,
+    query: String,
+    limit: Option<i32>,
+) -> McpResult<String> {
+    let config = Config::from_env();
+    if !config.worktrees_enabled {
+        return Err(worktrees_required());
+    }
+
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        let response = ProductSearchResponse { result: Vec::new() };
+        return serde_json::to_string(&response)
+            .map_err(|e| McpError::internal_error(format!("JSON error: {e}")));
+    }
+
+    let pool = get_db_pool()?;
+    let max_results = usize::try_from(limit.unwrap_or(20)).unwrap_or(20);
+
+    let product = get_product_by_key(ctx.cx(), &pool, product_key.trim())
+        .await?
+        .ok_or_else(|| {
+            McpError::new(
+                McpErrorCode::InvalidParams,
+                format!("Product '{product_key}' not found."),
+            )
+        })?;
+    let product_id = product.id.unwrap_or(0);
+
+    let projects = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::list_product_projects(ctx.cx(), &pool, product_id).await,
+    )?;
+
+    let mut result: Vec<ProductSearchItem> = Vec::new();
+    for p in projects {
+        let pid = p.id.unwrap_or(0);
+        let rows = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::search_messages(ctx.cx(), &pool, pid, trimmed, max_results)
+                .await,
+        )?;
+        for r in rows {
+            result.push(ProductSearchItem {
+                id: r.id,
+                subject: r.subject,
+                importance: r.importance,
+                ack_required: i32::try_from(r.ack_required).unwrap_or(i32::MAX),
+                created_ts: Some(micros_to_iso(r.created_ts)),
+                thread_id: r.thread_id,
+                from: r.from,
+                project_id: pid,
+            });
+        }
+    }
+
+    result.truncate(max_results);
+
+    let response = ProductSearchResponse { result };
+    serde_json::to_string(&response)
+        .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
+}
+
+/// Retrieve recent messages for an agent across all projects linked to a product (non-mutating).
+#[tool(
+    description = "Retrieve recent messages for an agent across all projects linked to a product."
+)]
+pub async fn fetch_inbox_product(
+    ctx: &McpContext,
+    product_key: String,
+    agent_name: String,
+    limit: Option<i32>,
+    urgent_only: Option<bool>,
+    include_bodies: Option<bool>,
+    since_ts: Option<String>,
+) -> McpResult<String> {
+    let config = Config::from_env();
+    if !config.worktrees_enabled {
+        return Err(worktrees_required());
+    }
+
+    let pool = get_db_pool()?;
+    let product = get_product_by_key(ctx.cx(), &pool, product_key.trim())
+        .await?
+        .ok_or_else(|| {
+            McpError::new(
+                McpErrorCode::InvalidParams,
+                format!("Product '{product_key}' not found."),
+            )
+        })?;
+    let product_id = product.id.unwrap_or(0);
+
+    let projects = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::list_product_projects(ctx.cx(), &pool, product_id).await,
+    )?;
+
+    let max_messages = usize::try_from(limit.unwrap_or(20)).unwrap_or(20);
+    let urgent = urgent_only.unwrap_or(false);
+    let with_bodies = include_bodies.unwrap_or(false);
+    let since_micros = since_ts
+        .as_deref()
+        .and_then(mcp_agent_mail_db::iso_to_micros);
+
+    let mut items: Vec<(i64, i64, InboxMessage)> = Vec::new(); // (created_ts, id, msg)
+    for p in projects {
+        let project_id = p.id.unwrap_or(0);
+        // Skip if agent doesn't exist in this project.
+        let Ok(agent) = resolve_agent(ctx, &pool, project_id, &agent_name).await else {
+            continue;
+        };
+        let rows = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::fetch_inbox(
+                ctx.cx(),
+                &pool,
+                project_id,
+                agent.id.unwrap_or(0),
+                urgent,
+                since_micros,
+                max_messages,
+            )
+            .await,
+        )?;
+        for row in rows {
+            let msg = row.message;
+            let created_ts = msg.created_ts;
+            let id = msg.id.unwrap_or(0);
+            items.push((
+                created_ts,
+                id,
+                InboxMessage {
+                    id,
+                    project_id: msg.project_id,
+                    sender_id: msg.sender_id,
+                    thread_id: msg.thread_id,
+                    subject: msg.subject,
+                    importance: msg.importance,
+                    ack_required: msg.ack_required != 0,
+                    from: row.sender_name,
+                    created_ts: None,
+                    kind: row.kind,
+                    attachments: serde_json::from_str(&msg.attachments).unwrap_or_default(),
+                    body_md: if with_bodies { Some(msg.body_md) } else { None },
+                },
+            ));
+        }
+    }
+
+    items.sort_by(|(a_ts, a_id, _), (b_ts, b_id, _)| b_ts.cmp(a_ts).then_with(|| a_id.cmp(b_id)));
+    let out: Vec<InboxMessage> = items
+        .into_iter()
+        .take(max_messages)
+        .map(|(_, _, m)| m)
+        .collect();
+
+    serde_json::to_string(&out).map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
+}
+
+/// Summarize a thread (by id or thread key) across all projects linked to a product.
+#[tool(description = "Summarize a thread across all projects linked to a product.")]
+#[allow(clippy::too_many_arguments)]
+pub async fn summarize_thread_product(
+    ctx: &McpContext,
+    product_key: String,
+    thread_id: String,
+    include_examples: Option<bool>,
+    llm_mode: Option<bool>,
+    llm_model: Option<String>,
+    per_thread_limit: Option<i32>,
+) -> McpResult<String> {
+    let config = Config::from_env();
+    if !config.worktrees_enabled {
+        return Err(worktrees_required());
+    }
+
+    let _ = (llm_mode, llm_model); // LLM refinement not implemented yet.
+
+    let pool = get_db_pool()?;
+    let product = get_product_by_key(ctx.cx(), &pool, product_key.trim())
+        .await?
+        .ok_or_else(|| {
+            McpError::new(
+                McpErrorCode::InvalidParams,
+                format!("Product '{product_key}' not found."),
+            )
+        })?;
+    let product_id = product.id.unwrap_or(0);
+
+    let projects = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::list_product_projects(ctx.cx(), &pool, product_id).await,
+    )?;
+
+    let mut rows: Vec<mcp_agent_mail_db::queries::ThreadMessageRow> = Vec::new();
+    for p in projects {
+        let project_id = p.id.unwrap_or(0);
+        let limit = per_thread_limit.and_then(|v| usize::try_from(v).ok());
+        let msgs = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::list_thread_messages(
+                ctx.cx(),
+                &pool,
+                project_id,
+                &thread_id,
+                limit,
+            )
+            .await,
+        )?;
+        rows.extend(msgs);
+    }
+
+    rows.sort_by_key(|a| a.created_ts);
+    let summary = crate::search::summarize_messages(&rows);
+
+    let with_examples = include_examples.unwrap_or(false);
+    let mut examples = Vec::new();
+    if with_examples {
+        for row in rows.iter().take(10) {
+            examples.push(ExampleMessage {
+                id: row.id,
+                from: row.from.clone(),
+                subject: row.subject.clone(),
+                created_ts: micros_to_iso(row.created_ts),
+            });
+        }
+    }
+
+    let response = SingleThreadResponse {
+        thread_id,
+        summary,
+        examples,
+    };
+
+    serde_json::to_string(&response)
+        .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
+}

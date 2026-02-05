@@ -1,0 +1,486 @@
+//! Search cluster tools
+//!
+//! Tools for message search and thread summarization:
+//! - `search_messages`: Full-text search over messages
+//! - `summarize_thread`: Extract thread summary
+
+use fastmcp::McpErrorCode;
+use fastmcp::prelude::*;
+use mcp_agent_mail_db::micros_to_iso;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+
+use crate::tool_util::{db_outcome_to_mcp_result, get_db_pool, resolve_project};
+
+/// Search result entry
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResult {
+    pub id: i64,
+    pub subject: String,
+    pub importance: String,
+    pub ack_required: i32,
+    pub created_ts: Option<String>,
+    pub thread_id: Option<String>,
+    pub from: String,
+}
+
+/// Search response wrapper
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResponse {
+    pub result: Vec<SearchResult>,
+}
+
+/// Mention count entry
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MentionCount {
+    pub name: String,
+    pub count: i64,
+}
+
+/// Thread summary
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadSummary {
+    pub participants: Vec<String>,
+    pub key_points: Vec<String>,
+    pub action_items: Vec<String>,
+    pub total_messages: i64,
+    pub open_actions: i64,
+    pub done_actions: i64,
+    pub mentions: Vec<MentionCount>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code_references: Option<Vec<String>>,
+}
+
+/// Single thread summary response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SingleThreadResponse {
+    pub thread_id: String,
+    pub summary: ThreadSummary,
+    pub examples: Vec<ExampleMessage>,
+}
+
+/// Multi-thread aggregate response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiThreadResponse {
+    pub threads: Vec<ThreadEntry>,
+    pub aggregate: AggregateSummary,
+}
+
+/// Thread entry in multi-thread response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadEntry {
+    pub thread_id: String,
+    pub summary: ThreadSummary,
+}
+
+/// Aggregate summary across threads
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AggregateSummary {
+    pub top_mentions: Vec<MentionCount>,
+    pub key_points: Vec<String>,
+    pub action_items: Vec<String>,
+}
+
+/// Example message for summaries
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExampleMessage {
+    pub id: i64,
+    pub from: String,
+    pub subject: String,
+    pub created_ts: String,
+}
+
+fn is_ordered_prefix(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() < 2 {
+        return false;
+    }
+    matches!(bytes[0], b'1' | b'2' | b'3' | b'4' | b'5') && bytes[1] == b'.'
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) fn summarize_messages(
+    rows: &[mcp_agent_mail_db::queries::ThreadMessageRow],
+) -> ThreadSummary {
+    let mut participants: HashSet<String> = HashSet::new();
+    let mut key_points: Vec<String> = Vec::new();
+    let mut action_items: Vec<String> = Vec::new();
+    let mut open_actions: i64 = 0;
+    let mut done_actions: i64 = 0;
+    let mut mentions: HashMap<String, i64> = HashMap::new();
+    let mut code_references: HashSet<String> = HashSet::new();
+    let keywords = ["TODO", "ACTION", "FIXME", "NEXT", "BLOCKED"];
+
+    for row in rows {
+        participants.insert(row.from.clone());
+
+        for line in row.body_md.lines() {
+            let stripped = line.trim();
+            if stripped.is_empty() {
+                continue;
+            }
+
+            // Mentions
+            for token in stripped.split_whitespace() {
+                if let Some(rest) = token.strip_prefix('@') {
+                    let name =
+                        rest.trim_matches(&['.', ',', ':', ';', '(', ')', '[', ']', '{', '}'][..]);
+                    if !name.is_empty() {
+                        *mentions.entry(name.to_string()).or_insert(0) += 1;
+                    }
+                }
+            }
+
+            // Code references in backticks
+            let mut start = 0;
+            while let Some(i) = stripped[start..].find('`') {
+                let i = start + i;
+                if let Some(j_rel) = stripped[i + 1..].find('`') {
+                    let j = i + 1 + j_rel;
+                    let snippet = stripped[i + 1..j].trim();
+                    if (snippet.contains('/')
+                        || snippet.contains(".py")
+                        || snippet.contains(".ts")
+                        || snippet.contains(".md"))
+                        && (1..=120).contains(&snippet.len())
+                    {
+                        code_references.insert(snippet.to_string());
+                    }
+                    start = j + 1;
+                } else {
+                    break;
+                }
+            }
+
+            // Bullet points and ordered lists => key points
+            if stripped.starts_with('-')
+                || stripped.starts_with('*')
+                || stripped.starts_with('+')
+                || is_ordered_prefix(stripped)
+            {
+                let mut normalized = stripped.to_string();
+                if normalized.starts_with("- [ ]")
+                    || normalized.starts_with("- [x]")
+                    || normalized.starts_with("- [X]")
+                {
+                    if let Some((_, rest)) = normalized.split_once(']') {
+                        normalized = rest.trim().to_string();
+                    }
+                }
+                let cleaned = normalized
+                    .trim_start_matches(&['-', '+', '*', ' '][..])
+                    .to_string();
+                if !cleaned.is_empty() {
+                    key_points.push(cleaned);
+                }
+            }
+
+            // Checkbox actions
+            if stripped.starts_with("- [ ]")
+                || stripped.starts_with("* [ ]")
+                || stripped.starts_with("+ [ ]")
+            {
+                open_actions += 1;
+                action_items.push(stripped.to_string());
+                continue;
+            }
+            if stripped.starts_with("- [x]")
+                || stripped.starts_with("- [X]")
+                || stripped.starts_with("* [x]")
+                || stripped.starts_with("* [X]")
+                || stripped.starts_with("+ [x]")
+                || stripped.starts_with("+ [X]")
+            {
+                done_actions += 1;
+                action_items.push(stripped.to_string());
+                continue;
+            }
+
+            let upper = stripped.to_ascii_uppercase();
+            if keywords.iter().any(|k| upper.contains(k)) {
+                action_items.push(stripped.to_string());
+            }
+        }
+    }
+
+    let mut mentions_sorted: Vec<(String, i64)> = mentions.into_iter().collect();
+    mentions_sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mentions = mentions_sorted
+        .into_iter()
+        .take(10)
+        .map(|(name, count)| MentionCount { name, count })
+        .collect::<Vec<_>>();
+
+    let mut participants: Vec<String> = participants.into_iter().collect();
+    participants.sort();
+
+    let code_refs = if code_references.is_empty() {
+        None
+    } else {
+        let mut refs: Vec<String> = code_references.into_iter().collect();
+        refs.sort();
+        Some(refs.into_iter().take(10).collect())
+    };
+
+    ThreadSummary {
+        participants,
+        key_points: key_points.into_iter().take(10).collect(),
+        action_items: action_items.into_iter().take(10).collect(),
+        total_messages: i64::try_from(rows.len()).unwrap_or(i64::MAX),
+        open_actions,
+        done_actions,
+        mentions,
+        code_references: code_refs,
+    }
+}
+
+/// Full-text search over message subjects and bodies.
+///
+/// Supports FTS5 syntax:
+/// - Phrases: "build plan"
+/// - Prefix: migrat*
+/// - Boolean: plan AND users
+///
+/// # Parameters
+/// - `project_key`: Project identifier
+/// - `query`: FTS5 query string
+/// - `limit`: Max results (default: 20)
+///
+/// # Returns
+/// List of matching message summaries
+#[tool(description = "Full-text search over subject and body for a project.")]
+pub async fn search_messages(
+    ctx: &McpContext,
+    project_key: String,
+    query: String,
+    limit: Option<i32>,
+) -> McpResult<String> {
+    let max_results_raw = limit.unwrap_or(20);
+    if max_results_raw < 1 {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "limit must be at least 1",
+        ));
+    }
+    let max_results = usize::try_from(max_results_raw)
+        .map_err(|_| McpError::new(McpErrorCode::InvalidParams, "limit exceeds supported range"))?;
+
+    // Validate query is not empty
+    if query.trim().is_empty() {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "Query cannot be empty",
+        ));
+    }
+
+    let pool = get_db_pool()?;
+    let project = resolve_project(ctx, &pool, &project_key).await?;
+    let project_id = project.id.unwrap_or(0);
+
+    // Execute search (currently uses LIKE; will be upgraded to FTS5)
+    let rows = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::search_messages(
+            ctx.cx(),
+            &pool,
+            project_id,
+            &query,
+            max_results,
+        )
+        .await,
+    )?;
+
+    let results: Vec<SearchResult> = rows
+        .into_iter()
+        .map(|r| SearchResult {
+            id: r.id,
+            subject: r.subject,
+            importance: r.importance,
+            ack_required: i32::try_from(r.ack_required).unwrap_or(i32::MAX),
+            created_ts: Some(micros_to_iso(r.created_ts)),
+            thread_id: r.thread_id,
+            from: r.from,
+        })
+        .collect();
+
+    tracing::debug!(
+        "Searched messages in project {} for '{}' (limit: {}, found: {})",
+        project_key,
+        query,
+        max_results,
+        results.len()
+    );
+
+    let response = SearchResponse { result: results };
+    serde_json::to_string(&response)
+        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+}
+
+/// Extract participants, key points, and action items for threads.
+///
+/// Single-thread mode (single `thread_id)`:
+/// - Returns detailed summary with optional example messages
+///
+/// Multi-thread mode (comma-separated IDs like "TKT-1,TKT-2"):
+/// - Returns aggregate digest across all threads
+///
+/// # Parameters
+/// - `project_key`: Project identifier
+/// - `thread_id`: Single ID or comma-separated IDs
+/// - `include_examples`: Include up to 3 sample messages (single-thread only)
+/// - `llm_mode`: Refine summary with AI (if enabled)
+/// - `llm_model`: Override model for AI refinement
+/// - `per_thread_limit`: Max messages per thread (multi-thread mode)
+#[allow(clippy::too_many_lines)]
+#[tool(description = "Extract participants, key points, and action items for threads.")]
+pub async fn summarize_thread(
+    ctx: &McpContext,
+    project_key: String,
+    thread_id: String,
+    include_examples: Option<bool>,
+    llm_mode: Option<bool>,
+    llm_model: Option<String>,
+    per_thread_limit: Option<i32>,
+) -> McpResult<String> {
+    let with_examples = include_examples.unwrap_or(false);
+    let use_llm = llm_mode.unwrap_or(true);
+    let msg_limit_raw = per_thread_limit.unwrap_or(50);
+    if msg_limit_raw < 1 {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "per_thread_limit must be at least 1",
+        ));
+    }
+    let msg_limit = usize::try_from(msg_limit_raw).map_err(|_| {
+        McpError::new(
+            McpErrorCode::InvalidParams,
+            "per_thread_limit exceeds supported range",
+        )
+    })?;
+
+    let pool = get_db_pool()?;
+    let project = resolve_project(ctx, &pool, &project_key).await?;
+    let project_id = project.id.unwrap_or(0);
+
+    // Check if multi-thread mode (comma-separated)
+    let thread_ids: Vec<&str> = thread_id
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if thread_ids.is_empty() {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "thread_id cannot be empty",
+        ));
+    }
+
+    if thread_ids.len() > 1 {
+        // Multi-thread mode - aggregate across threads
+        let mut all_mentions: HashMap<String, i64> = HashMap::new();
+        let mut all_actions: Vec<String> = Vec::new();
+        let mut all_points: Vec<String> = Vec::new();
+        let mut threads: Vec<ThreadEntry> = Vec::new();
+
+        for tid in &thread_ids {
+            let messages = db_outcome_to_mcp_result(
+                mcp_agent_mail_db::queries::list_thread_messages(
+                    ctx.cx(),
+                    &pool,
+                    project_id,
+                    tid,
+                    Some(msg_limit),
+                )
+                .await,
+            )?;
+
+            let summary = summarize_messages(&messages);
+            for mention in &summary.mentions {
+                *all_mentions.entry(mention.name.clone()).or_insert(0) += mention.count;
+            }
+            all_actions.extend(summary.action_items.clone());
+            all_points.extend(summary.key_points.clone());
+
+            threads.push(ThreadEntry {
+                thread_id: (*tid).to_string(),
+                summary,
+            });
+        }
+
+        let mut mentions_sorted: Vec<(String, i64)> = all_mentions.into_iter().collect();
+        mentions_sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let top_mentions = mentions_sorted
+            .into_iter()
+            .take(10)
+            .map(|(name, count)| MentionCount { name, count })
+            .collect();
+
+        let response = MultiThreadResponse {
+            threads,
+            aggregate: AggregateSummary {
+                top_mentions,
+                key_points: all_points.into_iter().take(25).collect(),
+                action_items: all_actions.into_iter().take(25).collect(),
+            },
+        };
+
+        tracing::debug!(
+            "Summarized {} threads in project {} (llm: {}, limit: {})",
+            thread_ids.len(),
+            project_key,
+            use_llm,
+            msg_limit
+        );
+
+        serde_json::to_string(&response)
+            .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+    } else {
+        // Single-thread mode
+        let tid = thread_ids[0];
+        let messages = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::list_thread_messages(
+                ctx.cx(),
+                &pool,
+                project_id,
+                tid,
+                Some(msg_limit),
+            )
+            .await,
+        )?;
+
+        let summary = summarize_messages(&messages);
+        let examples = if with_examples {
+            messages
+                .iter()
+                .take(3)
+                .map(|m| ExampleMessage {
+                    id: m.id,
+                    from: m.from.clone(),
+                    subject: m.subject.clone(),
+                    created_ts: micros_to_iso(m.created_ts),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let response = SingleThreadResponse {
+            thread_id: tid.to_string(),
+            summary,
+            examples,
+        };
+
+        tracing::debug!(
+            "Summarized thread {} in project {} (examples: {}, llm: {}, model: {:?}, messages: {})",
+            tid,
+            project_key,
+            with_examples,
+            use_llm,
+            llm_model,
+            messages.len()
+        );
+
+        serde_json::to_string(&response)
+            .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+    }
+}

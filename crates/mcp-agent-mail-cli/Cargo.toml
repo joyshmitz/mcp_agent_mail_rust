@@ -1,0 +1,23 @@
+[package]
+name = "mcp-agent-mail-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "am"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+serde.workspace = true
+serde_json.workspace = true
+ftui.workspace = true
+ftui-runtime = { workspace = true, features = ["stdio-capture"] }
+thiserror.workspace = true
+chrono.workspace = true
+mcp-agent-mail-core = { workspace = true }
+mcp-agent-mail-share = { workspace = true }
+mcp-agent-mail-guard = { workspace = true }
+mcp-agent-mail-server = { workspace = true }

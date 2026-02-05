@@ -1,0 +1,38 @@
+[package]
+name = "mcp-agent-mail"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "MCP Agent Mail - multi-agent coordination via MCP"
+
+[[bin]]
+name = "mcp-agent-mail"
+path = "src/main.rs"
+
+[dependencies]
+mcp-agent-mail-core = { workspace = true }
+mcp-agent-mail-storage = { workspace = true }
+mcp-agent-mail-tools = { workspace = true }
+mcp-agent-mail-server = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+ftui-runtime = { workspace = true, features = ["stdio-capture"] }
+
+[dev-dependencies]
+criterion = { workspace = true }
+fastmcp = { workspace = true }
+fastmcp-core = { workspace = true }
+mcp-agent-mail-conformance = { workspace = true }
+mcp-agent-mail-db = { workspace = true }
+tempfile = { workspace = true }
+
+[[bench]]
+name = "benchmarks"
+harness = false
+
+[lints]
+workspace = true

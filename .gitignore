@@ -1,0 +1,16 @@
+# Build artifacts
+/target/
+.cargo-target-*/
+
+# SQLite databases (runtime)
+*.sqlite3
+storage.sqlite3
+
+# Temp dirs
+_tmp_storage_root/
+
+# Misc build output
+a.out
+
+# bv (beads viewer) local config and caches
+.bv/

@@ -1,0 +1,303 @@
+#![forbid(unsafe_code)]
+
+use serde_json::Value;
+use std::path::{Path, PathBuf};
+
+/// Inline attachments at or below this size (bytes).
+pub const INLINE_ATTACHMENT_THRESHOLD: usize = 64 * 1024; // 64 KiB
+/// Mark attachments at or above this size as external (not bundled).
+pub const DETACH_ATTACHMENT_THRESHOLD: usize = 25 * 1024 * 1024; // 25 MiB
+/// Chunk SQLite DB when size exceeds this threshold (bytes).
+pub const DEFAULT_CHUNK_THRESHOLD: usize = 20 * 1024 * 1024; // 20 MiB
+/// Chunk size in bytes when chunking is enabled.
+pub const DEFAULT_CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
+
+/// Supported scrub presets for sharing.
+pub const SCRUB_PRESETS: [&str; 3] = ["standard", "strict", "archive"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrubPreset {
+    Standard,
+    Strict,
+    Archive,
+}
+
+impl ScrubPreset {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Strict => "strict",
+            Self::Archive => "archive",
+        }
+    }
+}
+
+impl std::fmt::Display for ScrubPreset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ShareError {
+    #[error("not implemented")]
+    NotImplemented,
+    #[error("invalid scrub preset: {preset}")]
+    InvalidScrubPreset { preset: String },
+    #[error("invalid threshold for {field}: {value}")]
+    InvalidThreshold { field: &'static str, value: i64 },
+    #[error("bundle not found: {path}")]
+    BundleNotFound { path: String },
+    #[error("manifest.json not found in {path}")]
+    ManifestNotFound { path: String },
+    #[error("failed to parse manifest.json: {message}")]
+    ManifestParse { message: String },
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+pub type ShareResult<T> = Result<T, ShareError>;
+
+/// Normalize and validate a scrub preset string (case-insensitive).
+pub fn normalize_scrub_preset(input: &str) -> ShareResult<ScrubPreset> {
+    let preset = input.trim().to_ascii_lowercase();
+    match preset.as_str() {
+        "standard" => Ok(ScrubPreset::Standard),
+        "strict" => Ok(ScrubPreset::Strict),
+        "archive" => Ok(ScrubPreset::Archive),
+        _ => Err(ShareError::InvalidScrubPreset { preset }),
+    }
+}
+
+/// Adjust detach threshold to exceed inline threshold (legacy behavior).
+#[must_use]
+pub fn adjust_detach_threshold(inline_threshold: usize, detach_threshold: usize) -> usize {
+    if detach_threshold > inline_threshold {
+        return detach_threshold;
+    }
+    let bump = inline_threshold / 2;
+    inline_threshold + std::cmp::max(1024, bump.max(1))
+}
+
+/// Validate non-negative integer thresholds and minimum chunk size.
+pub fn validate_thresholds(
+    inline_threshold: i64,
+    detach_threshold: i64,
+    chunk_threshold: i64,
+    chunk_size: i64,
+) -> ShareResult<()> {
+    if inline_threshold < 0 {
+        return Err(ShareError::InvalidThreshold {
+            field: "inline_threshold",
+            value: inline_threshold,
+        });
+    }
+    if detach_threshold < 0 {
+        return Err(ShareError::InvalidThreshold {
+            field: "detach_threshold",
+            value: detach_threshold,
+        });
+    }
+    if chunk_threshold < 0 {
+        return Err(ShareError::InvalidThreshold {
+            field: "chunk_threshold",
+            value: chunk_threshold,
+        });
+    }
+    if chunk_size < 1024 {
+        return Err(ShareError::InvalidThreshold {
+            field: "chunk_size",
+            value: chunk_size,
+        });
+    }
+    Ok(())
+}
+
+/// Default output path for decrypt when `--output` is omitted.
+#[must_use]
+pub fn default_decrypt_output(encrypted_path: &Path) -> PathBuf {
+    if encrypted_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("age"))
+        .unwrap_or(false)
+    {
+        return encrypted_path.with_extension("");
+    }
+    let stem = encrypted_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("bundle");
+    let suffix = encrypted_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let mut file_name = format!("{stem}_decrypted");
+    if !suffix.is_empty() {
+        file_name.push('.');
+        file_name.push_str(suffix);
+    }
+    encrypted_path.with_file_name(file_name)
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredExportConfig {
+    pub projects: Vec<String>,
+    pub inline_threshold: i64,
+    pub detach_threshold: i64,
+    pub chunk_threshold: i64,
+    pub chunk_size: i64,
+    pub scrub_preset: String,
+}
+
+fn coerce_int(value: Option<&Value>, default: i64) -> i64 {
+    let Some(value) = value else { return default };
+    if let Some(n) = value.as_i64() {
+        return n;
+    }
+    if let Some(s) = value.as_str() {
+        return s.parse::<i64>().unwrap_or(default);
+    }
+    default
+}
+
+fn get_object<'a>(root: &'a Value, key: &str) -> Option<&'a serde_json::Map<String, Value>> {
+    root.get(key)?.as_object()
+}
+
+fn get_str_list(value: Option<&Value>) -> Vec<String> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    let Some(arr) = value.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect()
+}
+
+/// Load export configuration defaults from an existing bundle.
+pub fn load_bundle_export_config(bundle_dir: &Path) -> ShareResult<StoredExportConfig> {
+    let manifest_path = bundle_dir.join("manifest.json");
+    if !manifest_path.exists() {
+        return Err(ShareError::ManifestNotFound {
+            path: bundle_dir.display().to_string(),
+        });
+    }
+    let manifest_text =
+        std::fs::read_to_string(&manifest_path).map_err(|e| ShareError::ManifestParse {
+            message: e.to_string(),
+        })?;
+    let manifest: Value =
+        serde_json::from_str(&manifest_text).map_err(|e| ShareError::ManifestParse {
+            message: e.to_string(),
+        })?;
+
+    let export_config = get_object(&manifest, "export_config");
+    let attachments_section = get_object(&manifest, "attachments");
+    let attachments_config = attachments_section
+        .and_then(|v| v.get("config"))
+        .and_then(|v| v.as_object());
+    let project_scope = get_object(&manifest, "project_scope");
+    let scrub_section = get_object(&manifest, "scrub");
+    let database_section = get_object(&manifest, "database");
+
+    let raw_projects = export_config
+        .and_then(|v| v.get("projects"))
+        .or_else(|| project_scope.and_then(|v| v.get("requested")));
+    let projects = get_str_list(raw_projects);
+
+    let scrub_preset = export_config
+        .and_then(|v| v.get("scrub_preset"))
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            scrub_section
+                .and_then(|v| v.get("preset"))
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or("standard")
+        .to_string();
+
+    let inline_threshold = coerce_int(
+        export_config
+            .and_then(|v| v.get("inline_threshold"))
+            .or_else(|| attachments_config.and_then(|v| v.get("inline_threshold"))),
+        INLINE_ATTACHMENT_THRESHOLD as i64,
+    );
+    let detach_threshold = coerce_int(
+        export_config
+            .and_then(|v| v.get("detach_threshold"))
+            .or_else(|| attachments_config.and_then(|v| v.get("detach_threshold"))),
+        DETACH_ATTACHMENT_THRESHOLD as i64,
+    );
+    let chunk_threshold = coerce_int(
+        export_config.and_then(|v| v.get("chunk_threshold")),
+        DEFAULT_CHUNK_THRESHOLD as i64,
+    );
+
+    let chunk_manifest = database_section
+        .and_then(|v| v.get("chunk_manifest"))
+        .and_then(|v| v.as_object());
+    let mut chunk_size = coerce_int(
+        export_config
+            .and_then(|v| v.get("chunk_size"))
+            .or_else(|| chunk_manifest.and_then(|v| v.get("chunk_size"))),
+        DEFAULT_CHUNK_SIZE as i64,
+    );
+
+    let chunk_config_path = bundle_dir.join("mailbox.sqlite3.config.json");
+    if chunk_config_path.exists() {
+        if let Ok(text) = std::fs::read_to_string(&chunk_config_path) {
+            if let Ok(config) = serde_json::from_str::<Value>(&text) {
+                if let Some(obj) = config.as_object() {
+                    chunk_size = coerce_int(obj.get("chunk_size"), chunk_size);
+                    let threshold = coerce_int(obj.get("threshold_bytes"), chunk_threshold);
+                    return Ok(StoredExportConfig {
+                        projects,
+                        inline_threshold,
+                        detach_threshold,
+                        chunk_threshold: threshold,
+                        chunk_size,
+                        scrub_preset,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(StoredExportConfig {
+        projects,
+        inline_threshold,
+        detach_threshold,
+        chunk_threshold,
+        chunk_size,
+        scrub_preset,
+    })
+}
+
+// Placeholder API surfaces for future implementation.
+pub fn export_bundle() -> ShareResult<()> {
+    Err(ShareError::NotImplemented)
+}
+
+pub fn update_bundle() -> ShareResult<()> {
+    Err(ShareError::NotImplemented)
+}
+
+pub fn preview_bundle() -> ShareResult<()> {
+    Err(ShareError::NotImplemented)
+}
+
+pub fn verify_bundle() -> ShareResult<()> {
+    Err(ShareError::NotImplemented)
+}
+
+pub fn decrypt_bundle() -> ShareResult<()> {
+    Err(ShareError::NotImplemented)
+}
+
+pub fn launch_wizard() -> ShareResult<()> {
+    Err(ShareError::NotImplemented)
+}

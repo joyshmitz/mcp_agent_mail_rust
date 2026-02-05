@@ -1,0 +1,87 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/mcp-agent-mail",
+  "crates/mcp-agent-mail-core",
+  "crates/mcp-agent-mail-db",
+  "crates/mcp-agent-mail-storage",
+  "crates/mcp-agent-mail-server",
+  "crates/mcp-agent-mail-tools",
+  "crates/mcp-agent-mail-cli",
+  "crates/mcp-agent-mail-guard",
+  "crates/mcp-agent-mail-share",
+  "crates/mcp-agent-mail-conformance",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Required internal dependencies (local projects)
+fastmcp = { path = "../fastmcp_rust/crates/fastmcp", package = "fastmcp-rust" }
+fastmcp-core = { path = "../fastmcp_rust/crates/fastmcp-core" }
+fastmcp-server = { path = "../fastmcp_rust/crates/fastmcp-server" }
+fastmcp-transport = { path = "../fastmcp_rust/crates/fastmcp-transport" }
+fastmcp-protocol = { path = "../fastmcp_rust/crates/fastmcp-protocol" }
+
+asupersync = { path = "../asupersync" }
+
+sqlmodel = { path = "../sqlmodel_rust/crates/sqlmodel" }
+sqlmodel-core = { path = "../sqlmodel_rust/crates/sqlmodel-core" }
+sqlmodel-query = { path = "../sqlmodel_rust/crates/sqlmodel-query" }
+sqlmodel-schema = { path = "../sqlmodel_rust/crates/sqlmodel-schema" }
+sqlmodel-session = { path = "../sqlmodel_rust/crates/sqlmodel-session" }
+sqlmodel-pool = { path = "../sqlmodel_rust/crates/sqlmodel-pool" }
+sqlmodel-sqlite = { path = "../sqlmodel_rust/crates/sqlmodel-sqlite" }
+
+ftui = { path = "../frankentui/crates/ftui" }
+ftui-runtime = { path = "../frankentui/crates/ftui-runtime" }
+beads_rust = { path = "../beads_rust" }
+
+# Agent detection (tokio-based upstream; declare optional in crates that use it)
+coding-agent-search = { path = "../coding_agent_session_search" }
+
+# Internal workspace crates
+mcp-agent-mail-core = { path = "crates/mcp-agent-mail-core" }
+mcp-agent-mail-db = { path = "crates/mcp-agent-mail-db" }
+mcp-agent-mail-storage = { path = "crates/mcp-agent-mail-storage" }
+mcp-agent-mail-server = { path = "crates/mcp-agent-mail-server" }
+mcp-agent-mail-tools = { path = "crates/mcp-agent-mail-tools" }
+mcp-agent-mail-cli = { path = "crates/mcp-agent-mail-cli" }
+mcp-agent-mail-guard = { path = "crates/mcp-agent-mail-guard" }
+mcp-agent-mail-share = { path = "crates/mcp-agent-mail-share" }
+mcp-agent-mail-conformance = { path = "crates/mcp-agent-mail-conformance" }
+
+# Core ecosystem deps
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+git2 = "0.19"
+globset = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3"
+clap = { version = "4", features = ["derive"] }
+sha1 = "0.10"
+criterion = { version = "0.8", features = ["html_reports"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# Allow early development lints
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+
+[patch.crates-io]
+# Force a single asupersync throughout the dependency graph to avoid
+# type-identity mismatches (Cx/Outcome/etc).
+asupersync = { path = "../asupersync" }

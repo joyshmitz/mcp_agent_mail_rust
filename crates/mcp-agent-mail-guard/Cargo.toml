@@ -1,0 +1,17 @@
+[package]
+name = "mcp-agent-mail-guard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+regex.workspace = true
+thiserror.workspace = true
+git2.workspace = true
+mcp-agent-mail-core = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true

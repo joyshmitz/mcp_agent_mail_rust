@@ -1,0 +1,648 @@
+//! Macro cluster tools
+//!
+//! Composite tools that combine multiple operations:
+//! - `macro_start_session`: Boot project session
+//! - `macro_prepare_thread`: Align with existing thread
+//! - `macro_file_reservation_cycle`: Reserve and optionally release files
+//! - `macro_contact_handshake`: Request + approve + welcome message
+
+use fastmcp::McpErrorCode;
+use fastmcp::prelude::*;
+use serde::{Deserialize, Serialize};
+
+use crate::identity::{AgentResponse, ProjectResponse, WhoisResponse};
+use crate::messaging::InboxMessage;
+use crate::reservations::{ReleaseResult, ReservationResponse};
+use crate::search::{ExampleMessage, ThreadSummary};
+use crate::tool_util::{db_outcome_to_mcp_result, get_db_pool, resolve_project};
+use mcp_agent_mail_db::micros_to_iso;
+use serde::de::DeserializeOwned;
+use serde_json::Value;
+
+/// Start session response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartSessionResponse {
+    pub project: ProjectResponse,
+    pub agent: AgentResponse,
+    pub file_reservations: ReservationResponse,
+    pub inbox: Vec<InboxMessage>,
+}
+
+/// Prepare thread response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrepareThreadResponse {
+    pub project: ProjectResponse,
+    pub agent: AgentResponse,
+    pub thread: PreparedThread,
+    pub inbox: Vec<InboxMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreparedThread {
+    pub thread_id: String,
+    pub summary: ThreadSummary,
+    pub examples: Vec<ExampleMessage>,
+    pub total_messages: i64,
+}
+
+/// File reservation cycle response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReservationCycleResponse {
+    pub file_reservations: ReservationResponse,
+    pub released: Option<ReleaseResult>,
+}
+
+/// Contact handshake response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandshakeResponse {
+    pub request: Value,
+    pub response: Option<Value>,
+    pub welcome_message: Option<Value>,
+}
+
+fn parse_json<T: DeserializeOwned>(payload: String, label: &str) -> McpResult<T> {
+    serde_json::from_str(&payload).map_err(|e| {
+        McpError::new(
+            McpErrorCode::InternalError,
+            format!("{label} JSON error: {e}"),
+        )
+    })
+}
+
+/// Boot a project session: ensure project + register agent + reserve files + fetch inbox.
+///
+/// # Parameters
+/// - `human_key`: Absolute path to project directory
+/// - `program`: Agent program
+/// - `model`: Model identifier
+/// - `agent_name`: Optional agent name
+/// - `task_description`: Optional task description
+/// - `file_reservation_paths`: Paths to reserve
+/// - `file_reservation_reason`: Reason for reservations
+/// - `file_reservation_ttl_seconds`: TTL for reservations
+/// - `inbox_limit`: Max inbox messages to fetch
+#[allow(clippy::too_many_arguments)]
+#[tool(
+    description = "Boot a project session: ensure project, register agent, reserve files, fetch inbox."
+)]
+pub async fn macro_start_session(
+    ctx: &McpContext,
+    human_key: String,
+    program: String,
+    model: String,
+    agent_name: Option<String>,
+    task_description: Option<String>,
+    file_reservation_paths: Option<Vec<String>>,
+    file_reservation_reason: Option<String>,
+    file_reservation_ttl_seconds: Option<i64>,
+    inbox_limit: Option<i32>,
+) -> McpResult<String> {
+    // Validate human_key is absolute
+    if !human_key.starts_with('/') {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "human_key must be an absolute path",
+        ));
+    }
+
+    let project_json = crate::identity::ensure_project(ctx, human_key.clone(), None).await?;
+    let project: ProjectResponse = parse_json(project_json, "project")?;
+
+    let agent_json = crate::identity::register_agent(
+        ctx,
+        project.human_key.clone(),
+        program,
+        model,
+        agent_name,
+        task_description,
+        None,
+    )
+    .await?;
+    let agent: AgentResponse = parse_json(agent_json, "agent")?;
+
+    let reservation_result = if let Some(paths) = file_reservation_paths {
+        if paths.is_empty() {
+            ReservationResponse {
+                granted: Vec::new(),
+                conflicts: Vec::new(),
+            }
+        } else {
+            let ttl = file_reservation_ttl_seconds.unwrap_or(3600);
+            let reason = file_reservation_reason.unwrap_or_else(|| "macro-session".to_string());
+            let reservation_json = crate::reservations::file_reservation_paths(
+                ctx,
+                project.human_key.clone(),
+                agent.name.clone(),
+                paths,
+                Some(ttl),
+                Some(true),
+                Some(reason),
+            )
+            .await?;
+            parse_json(reservation_json, "file_reservations")?
+        }
+    } else {
+        ReservationResponse {
+            granted: Vec::new(),
+            conflicts: Vec::new(),
+        }
+    };
+
+    let inbox_json = crate::messaging::fetch_inbox(
+        ctx,
+        project.human_key.clone(),
+        agent.name.clone(),
+        Some(false),
+        None,
+        Some(inbox_limit.unwrap_or(10)),
+        Some(false),
+    )
+    .await?;
+    let inbox: Vec<InboxMessage> = parse_json(inbox_json, "inbox")?;
+
+    let response = StartSessionResponse {
+        project,
+        agent,
+        file_reservations: reservation_result,
+        inbox,
+    };
+
+    tracing::debug!(
+        "Starting session for project {} (inbox_limit: {:?})",
+        human_key,
+        inbox_limit
+    );
+
+    serde_json::to_string(&response)
+        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+}
+
+/// Align with an existing thread: register + summarize + fetch inbox.
+///
+/// # Parameters
+/// - `project_key`: Project identifier
+/// - `thread_id`: Thread to prepare for
+/// - `program`: Agent program
+/// - `model`: Model identifier
+/// - `agent_name`: Optional agent name
+/// - `task_description`: Optional task description
+/// - `register_if_missing`: Register agent if not exists
+/// - `include_examples`: Include example messages in summary
+/// - `include_inbox_bodies`: Include inbox message bodies
+/// - `llm_mode`: Use LLM for summary refinement
+/// - `llm_model`: Override LLM model
+/// - `inbox_limit`: Max inbox messages
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[tool(
+    description = "Align with an existing thread: register agent, summarize thread, fetch inbox."
+)]
+pub async fn macro_prepare_thread(
+    ctx: &McpContext,
+    project_key: String,
+    thread_id: String,
+    program: String,
+    model: String,
+    agent_name: Option<String>,
+    task_description: Option<String>,
+    register_if_missing: Option<bool>,
+    include_examples: Option<bool>,
+    include_inbox_bodies: Option<bool>,
+    llm_mode: Option<bool>,
+    llm_model: Option<String>,
+    inbox_limit: Option<i32>,
+) -> McpResult<String> {
+    let pool = get_db_pool()?;
+    let project_row = resolve_project(ctx, &pool, &project_key).await?;
+    let project = ProjectResponse {
+        id: project_row.id.unwrap_or(0),
+        slug: project_row.slug,
+        human_key: project_row.human_key,
+        created_at: micros_to_iso(project_row.created_at),
+    };
+    let project_id = project_row.id.unwrap_or(0);
+
+    let should_register = register_if_missing.unwrap_or(true);
+    let agent = if should_register {
+        let agent_json = crate::identity::register_agent(
+            ctx,
+            project.human_key.clone(),
+            program,
+            model,
+            agent_name,
+            task_description,
+            None,
+        )
+        .await?;
+        parse_json(agent_json, "agent")?
+    } else {
+        let agent_name = agent_name.ok_or_else(|| {
+            McpError::new(
+                McpErrorCode::InvalidParams,
+                "agent_name is required when register_if_missing is false",
+            )
+        })?;
+        let whois_json =
+            crate::identity::whois(ctx, project.human_key.clone(), agent_name, None, None).await?;
+        let whois: WhoisResponse = parse_json(whois_json, "agent")?;
+        whois.agent
+    };
+
+    let messages = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::list_thread_messages(
+            ctx.cx(),
+            &pool,
+            project_id,
+            &thread_id,
+            None,
+        )
+        .await,
+    )?;
+
+    let include_examples = include_examples.unwrap_or(true);
+    let summary = crate::search::summarize_messages(&messages);
+    let examples = if include_examples {
+        messages
+            .iter()
+            .take(3)
+            .map(|m| ExampleMessage {
+                id: m.id,
+                from: m.from.clone(),
+                subject: m.subject.clone(),
+                created_ts: micros_to_iso(m.created_ts),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let thread = PreparedThread {
+        thread_id: thread_id.clone(),
+        total_messages: summary.total_messages,
+        summary,
+        examples,
+    };
+
+    let inbox_json = crate::messaging::fetch_inbox(
+        ctx,
+        project.human_key.clone(),
+        agent.name.clone(),
+        Some(false),
+        None,
+        Some(inbox_limit.unwrap_or(10)),
+        Some(include_inbox_bodies.unwrap_or(false)),
+    )
+    .await?;
+    let inbox: Vec<InboxMessage> = parse_json(inbox_json, "inbox")?;
+
+    let response = PrepareThreadResponse {
+        project,
+        agent,
+        thread,
+        inbox,
+    };
+
+    tracing::debug!(
+        "Preparing thread {} in project {} (register: {:?}, examples: {:?}, llm: {:?})",
+        thread_id,
+        project_key,
+        register_if_missing,
+        include_examples,
+        llm_mode
+    );
+
+    if let Some(model) = llm_model {
+        tracing::debug!("LLM model: {}", model);
+    }
+    if let Some(bodies) = include_inbox_bodies {
+        tracing::debug!("Include inbox bodies: {}", bodies);
+    }
+    if let Some(limit) = inbox_limit {
+        tracing::debug!("Inbox limit: {}", limit);
+    }
+
+    serde_json::to_string(&response)
+        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+}
+
+/// Reserve files and optionally release at the end.
+///
+/// # Parameters
+/// - `project_key`: Project identifier
+/// - `agent_name`: Agent making reservations
+/// - `paths`: File paths/globs to reserve
+/// - `ttl_seconds`: Time to live
+/// - `exclusive`: Exclusive intent
+/// - `reason`: Reservation reason
+/// - `auto_release`: Release after operation
+#[allow(clippy::too_many_arguments)]
+#[tool(description = "Reserve files and optionally release them at the end.")]
+pub async fn macro_file_reservation_cycle(
+    ctx: &McpContext,
+    project_key: String,
+    agent_name: String,
+    paths: Vec<String>,
+    ttl_seconds: Option<i64>,
+    exclusive: Option<bool>,
+    reason: Option<String>,
+    auto_release: Option<bool>,
+) -> McpResult<String> {
+    let ttl = ttl_seconds.unwrap_or(3600);
+    let is_exclusive = exclusive.unwrap_or(true);
+    let should_release = auto_release.unwrap_or(false);
+
+    // Validate TTL >= 60 seconds
+    if ttl < 60 {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            "ttl_seconds must be at least 60 seconds",
+        ));
+    }
+
+    let reservation_json = crate::reservations::file_reservation_paths(
+        ctx,
+        project_key.clone(),
+        agent_name.clone(),
+        paths.clone(),
+        Some(ttl),
+        Some(is_exclusive),
+        Some(
+            reason
+                .clone()
+                .unwrap_or_else(|| "macro-file_reservation".to_string()),
+        ),
+    )
+    .await?;
+    let file_reservations: ReservationResponse = parse_json(reservation_json, "file_reservations")?;
+
+    let released = if should_release {
+        let release_json = crate::reservations::release_file_reservations(
+            ctx,
+            project_key.clone(),
+            agent_name.clone(),
+            Some(paths),
+            None,
+        )
+        .await?;
+        Some(parse_json::<ReleaseResult>(release_json, "released")?)
+    } else {
+        None
+    };
+
+    let response = ReservationCycleResponse {
+        file_reservations,
+        released,
+    };
+
+    tracing::debug!(
+        "File reservation cycle for {} in project {} (auto_release: {})",
+        agent_name,
+        project_key,
+        should_release
+    );
+
+    serde_json::to_string(&response)
+        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+}
+
+/// Request contact + optionally auto-approve + optionally send welcome message.
+///
+/// # Parameters
+/// - `project_key`: Project identifier
+/// - `requester`: Requesting agent (alias for `from_agent`)
+/// - `target`: Target agent (alias for `to_agent`)
+/// - `to_agent`: Target agent name
+/// - `to_project`: Target project if different
+/// - `reason`: Contact request reason
+/// - `auto_accept`: Auto-approve the request
+/// - `ttl_seconds`: TTL for the link
+/// - `welcome_subject`: Subject for welcome message
+/// - `welcome_body`: Body for welcome message
+/// - `thread_id`: Thread for welcome message
+/// - `register_if_missing`: Register requester if not exists
+/// - `program`: Program for registration
+/// - `model`: Model for registration
+/// - `task_description`: Task for registration
+#[tool(description = "Request contact + optionally approve + send welcome message.")]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub async fn macro_contact_handshake(
+    ctx: &McpContext,
+    project_key: String,
+    requester: Option<String>,
+    target: Option<String>,
+    agent_name: Option<String>,
+    to_agent: Option<String>,
+    to_project: Option<String>,
+    reason: Option<String>,
+    auto_accept: Option<bool>,
+    ttl_seconds: Option<i64>,
+    welcome_subject: Option<String>,
+    welcome_body: Option<String>,
+    thread_id: Option<String>,
+    register_if_missing: Option<bool>,
+    program: Option<String>,
+    model: Option<String>,
+    task_description: Option<String>,
+) -> McpResult<String> {
+    // Resolve agent names from aliases
+    let from_agent = requester.or(agent_name).ok_or_else(|| {
+        McpError::new(
+            McpErrorCode::InvalidParams,
+            "requester or agent_name is required",
+        )
+    })?;
+
+    let target_agent = target.or(to_agent).ok_or_else(|| {
+        McpError::new(
+            McpErrorCode::InvalidParams,
+            "target or to_agent is required",
+        )
+    })?;
+
+    let should_auto_accept = auto_accept.unwrap_or(false);
+    let ttl = ttl_seconds.unwrap_or(604_800); // 7 days
+    let target_project_key = to_project.clone().unwrap_or_else(|| project_key.clone());
+
+    // Fast path: auto-accept same-project without welcome message.
+    if should_auto_accept
+        && to_project.is_none()
+        && welcome_subject.is_none()
+        && welcome_body.is_none()
+    {
+        let pool = get_db_pool()?;
+        let project = resolve_project(ctx, &pool, &project_key).await?;
+        let project_id = project.id.unwrap_or(0);
+
+        let from_row = crate::tool_util::resolve_agent(ctx, &pool, project_id, &from_agent).await?;
+        let mut to_row =
+            crate::tool_util::resolve_agent(ctx, &pool, project_id, &target_agent).await;
+        if to_row.is_err() {
+            let should_register = register_if_missing.unwrap_or(false);
+            if should_register {
+                let program = program.unwrap_or_else(|| "unknown".to_string());
+                let model = model.unwrap_or_else(|| "unknown".to_string());
+                let _ = crate::identity::register_agent(
+                    ctx,
+                    project.human_key.clone(),
+                    program,
+                    model,
+                    Some(target_agent.clone()),
+                    task_description,
+                    None,
+                )
+                .await?;
+                to_row =
+                    crate::tool_util::resolve_agent(ctx, &pool, project_id, &target_agent).await;
+            }
+        }
+        let to_row = to_row
+            .map_err(|_| McpError::new(McpErrorCode::InvalidParams, "target agent not found"))?;
+
+        let ttl = if ttl < 60 { 60 } else { ttl };
+
+        let _ = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::request_contact(
+                ctx.cx(),
+                &pool,
+                project_id,
+                from_row.id.unwrap_or(0),
+                project_id,
+                to_row.id.unwrap_or(0),
+                reason.as_deref().unwrap_or(""),
+                ttl,
+            )
+            .await,
+        )?;
+        let (_, approved) = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::respond_contact(
+                ctx.cx(),
+                &pool,
+                project_id,
+                from_row.id.unwrap_or(0),
+                project_id,
+                to_row.id.unwrap_or(0),
+                true,
+                ttl,
+            )
+            .await,
+        )?;
+
+        let payload = crate::contacts::ContactLinkState {
+            from: from_agent.clone(),
+            from_project: project.human_key.clone(),
+            to: target_agent.clone(),
+            to_project: project.human_key.clone(),
+            status: approved.status,
+            expires_ts: approved.expires_ts.map(micros_to_iso),
+        };
+
+        let response = HandshakeResponse {
+            request: serde_json::to_value(&payload).unwrap_or(Value::Null),
+            response: Some(serde_json::to_value(&payload).unwrap_or(Value::Null)),
+            welcome_message: None,
+        };
+
+        return serde_json::to_string(&response)
+            .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")));
+    }
+
+    let request_json = crate::contacts::request_contact(
+        ctx,
+        project_key.clone(),
+        from_agent.clone(),
+        target_agent.clone(),
+        Some(target_project_key.clone()),
+        reason.clone(),
+        Some(ttl),
+        register_if_missing,
+        program.clone(),
+        model.clone(),
+        task_description.clone(),
+    )
+    .await?;
+    let request_val: Value = parse_json(request_json, "request")?;
+
+    let response_val = if should_auto_accept {
+        let respond_json = crate::contacts::respond_contact(
+            ctx,
+            target_project_key.clone(),
+            target_agent.clone(),
+            from_agent.clone(),
+            if to_project.is_some() {
+                Some(project_key.clone())
+            } else {
+                None
+            },
+            true,
+            Some(ttl),
+        )
+        .await?;
+        Some(parse_json(respond_json, "response")?)
+    } else {
+        None
+    };
+
+    let has_welcome = welcome_subject.is_some() && welcome_body.is_some();
+    let thread_id_for_log = thread_id.clone();
+
+    let welcome_val = if let (Some(subject), Some(body)) = (welcome_subject, welcome_body) {
+        if to_project.is_none() {
+            let welcome_json = crate::messaging::send_message(
+                ctx,
+                project_key.clone(),
+                from_agent.clone(),
+                vec![target_agent.clone()],
+                subject,
+                body,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None, // ack_required
+                thread_id,
+                None,
+            )
+            .await?;
+            Some(parse_json(welcome_json, "welcome_message")?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let response = HandshakeResponse {
+        request: request_val,
+        response: response_val,
+        welcome_message: welcome_val,
+    };
+
+    tracing::debug!(
+        "Contact handshake from {} to {} in project {} (auto_accept: {}, welcome: {})",
+        from_agent,
+        target_agent,
+        project_key,
+        should_auto_accept,
+        has_welcome
+    );
+
+    // Log registration params
+    if let Some(reg) = register_if_missing {
+        if reg {
+            tracing::debug!(
+                "Auto-register: program={:?}, model={:?}, task={:?}",
+                program,
+                model,
+                task_description
+            );
+        }
+    }
+    if let Some(tid) = thread_id_for_log {
+        tracing::debug!("Welcome message thread: {}", tid);
+    }
+
+    serde_json::to_string(&response)
+        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+}
+
+// removed generate_slug (unused; slug derivation handled by ensure_project)

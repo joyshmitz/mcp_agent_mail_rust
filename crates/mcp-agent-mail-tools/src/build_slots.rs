@@ -1,0 +1,293 @@
+//! Build slot cluster tools (coarse concurrency control)
+//!
+//! Ported from legacy Python:
+//! - Only meaningful when `WORKTREES_ENABLED=1`
+//! - Stores per-slot leases as JSON files under the per-project archive root:
+//!   `{storage_root}/projects/{project_slug}/build_slots/{slot}/{agent__branch}.json`
+//! - Conflicts are detected by scanning active (non-expired) leases.
+
+use fastmcp::McpErrorCode;
+use fastmcp::prelude::*;
+use mcp_agent_mail_core::Config;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+use crate::tool_util::{get_db_pool, resolve_project};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildSlotLease {
+    pub slot: String,
+    pub agent: String,
+    pub branch: Option<String>,
+    pub exclusive: bool,
+    pub acquired_ts: String,
+    pub expires_ts: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub released_ts: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcquireBuildSlotResponse {
+    pub granted: BuildSlotLease,
+    pub conflicts: Vec<BuildSlotLease>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenewBuildSlotResponse {
+    pub renewed: bool,
+    pub expires_ts: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseBuildSlotResponse {
+    pub released: bool,
+    pub released_at: String,
+}
+
+fn safe_component(value: &str) -> String {
+    let mut safe = value.trim().to_string();
+    for ch in ['/', '\\', ':', '*', '?', '"', '<', '>', '|', ' '] {
+        safe = safe.replace(ch, "_");
+    }
+    if safe.is_empty() {
+        "unknown".to_string()
+    } else {
+        safe
+    }
+}
+
+fn project_archive_root(config: &Config, project_slug: &str) -> PathBuf {
+    config.storage_root.join("projects").join(project_slug)
+}
+
+fn slot_dir(project_root: &Path, slot: &str) -> PathBuf {
+    project_root.join("build_slots").join(safe_component(slot))
+}
+
+fn compute_branch(repo_path: &str) -> Option<String> {
+    let repo = git2::Repository::discover(repo_path).ok()?;
+    let head = repo.head().ok()?;
+    head.shorthand().map(str::to_string)
+}
+
+fn read_active_leases(slot_path: &Path, now: chrono::DateTime<chrono::Utc>) -> Vec<BuildSlotLease> {
+    let mut results = Vec::new();
+    let Ok(entries) = std::fs::read_dir(slot_path) else {
+        return results;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(lease) = serde_json::from_str::<BuildSlotLease>(&text) else {
+            continue;
+        };
+        if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(&lease.expires_ts) {
+            if exp.with_timezone(&chrono::Utc) <= now {
+                continue;
+            }
+        }
+        results.push(lease);
+    }
+    results
+}
+
+fn write_lease_json(path: &Path, lease: &BuildSlotLease) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let text =
+        serde_json::to_string_pretty(lease).map_err(|e| std::io::Error::other(e.to_string()))?;
+    std::fs::write(path, text)
+}
+
+fn worktrees_required() -> McpError {
+    McpError::new(
+        McpErrorCode::InvalidParams,
+        "Build slots are disabled. Enable WORKTREES_ENABLED to use this tool.",
+    )
+}
+
+/// Acquire a build slot (advisory), optionally exclusive. Returns conflicts when another holder is active.
+#[tool(description = "Acquire a build slot (advisory), optionally exclusive.")]
+pub async fn acquire_build_slot(
+    ctx: &McpContext,
+    project_key: String,
+    agent_name: String,
+    slot: String,
+    ttl_seconds: Option<i64>,
+    exclusive: Option<bool>,
+) -> McpResult<String> {
+    let config = Config::from_env();
+    if !config.worktrees_enabled {
+        return Err(worktrees_required());
+    }
+
+    let pool = get_db_pool()?;
+    let project = resolve_project(ctx, &pool, &project_key).await?;
+
+    let now = chrono::Utc::now();
+    let ttl = std::cmp::max(ttl_seconds.unwrap_or(3600), 60);
+    let expires_ts = (now + chrono::Duration::seconds(ttl)).to_rfc3339();
+    let branch = compute_branch(&project.human_key);
+    let is_exclusive = exclusive.unwrap_or(true);
+
+    let project_root = project_archive_root(&config, &project.slug);
+    let slot_path = slot_dir(&project_root, &slot);
+    std::fs::create_dir_all(&slot_path)
+        .map_err(|e| McpError::internal_error(format!("failed to create slot dir: {e}")))?;
+
+    let active = read_active_leases(&slot_path, now);
+    let mut conflicts = Vec::new();
+    if is_exclusive {
+        for entry in active {
+            if entry.agent == agent_name && entry.branch == branch {
+                continue;
+            }
+            if entry.exclusive {
+                conflicts.push(entry);
+            }
+        }
+    }
+
+    let holder_id = safe_component(&format!(
+        "{agent_name}__{}",
+        branch.clone().unwrap_or_else(|| "unknown".to_string())
+    ));
+    let lease_path = slot_path.join(format!("{holder_id}.json"));
+
+    let granted = BuildSlotLease {
+        slot: slot.clone(),
+        agent: agent_name.clone(),
+        branch,
+        exclusive: is_exclusive,
+        acquired_ts: now.to_rfc3339(),
+        expires_ts,
+        released_ts: None,
+    };
+
+    // Best-effort write, matching legacy behavior.
+    let _ = write_lease_json(&lease_path, &granted);
+
+    let response = AcquireBuildSlotResponse { granted, conflicts };
+    serde_json::to_string(&response)
+        .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
+}
+
+/// Extend expiry for an existing build slot lease. No-op if missing.
+#[tool(description = "Extend expiry for an existing build slot lease.")]
+pub async fn renew_build_slot(
+    ctx: &McpContext,
+    project_key: String,
+    agent_name: String,
+    slot: String,
+    extend_seconds: Option<i64>,
+) -> McpResult<String> {
+    let config = Config::from_env();
+    if !config.worktrees_enabled {
+        return Err(worktrees_required());
+    }
+
+    let pool = get_db_pool()?;
+    let project = resolve_project(ctx, &pool, &project_key).await?;
+
+    let now = chrono::Utc::now();
+    let extend = std::cmp::max(extend_seconds.unwrap_or(1800), 60);
+    let new_exp = (now + chrono::Duration::seconds(extend)).to_rfc3339();
+
+    let project_root = project_archive_root(&config, &project.slug);
+    let slot_path = slot_dir(&project_root, &slot);
+
+    let branch = compute_branch(&project.human_key);
+    let holder_id = safe_component(&format!(
+        "{agent_name}__{}",
+        branch.clone().unwrap_or_else(|| "unknown".to_string())
+    ));
+    let lease_path = slot_path.join(format!("{holder_id}.json"));
+
+    let mut current = std::fs::read_to_string(&lease_path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<BuildSlotLease>(&t).ok())
+        .unwrap_or_else(|| BuildSlotLease {
+            slot: slot.clone(),
+            agent: agent_name.clone(),
+            branch: branch.clone(),
+            exclusive: true,
+            acquired_ts: now.to_rfc3339(),
+            expires_ts: new_exp.clone(),
+            released_ts: None,
+        });
+
+    current.slot = slot;
+    current.agent = agent_name;
+    current.branch = branch;
+    current.expires_ts.clone_from(&new_exp);
+    let _ = write_lease_json(&lease_path, &current);
+
+    let response = RenewBuildSlotResponse {
+        renewed: true,
+        expires_ts: new_exp,
+    };
+    serde_json::to_string(&response)
+        .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
+}
+
+/// Mark an active slot lease as released (non-destructive; keeps JSON with `released_ts`).
+#[tool(description = "Release a build slot lease (non-destructive).")]
+pub async fn release_build_slot(
+    ctx: &McpContext,
+    project_key: String,
+    agent_name: String,
+    slot: String,
+) -> McpResult<String> {
+    let config = Config::from_env();
+    if !config.worktrees_enabled {
+        return Err(worktrees_required());
+    }
+
+    let pool = get_db_pool()?;
+    let project = resolve_project(ctx, &pool, &project_key).await?;
+
+    let now = chrono::Utc::now();
+    let now_iso = now.to_rfc3339();
+
+    let project_root = project_archive_root(&config, &project.slug);
+    let slot_path = slot_dir(&project_root, &slot);
+    let branch = compute_branch(&project.human_key);
+    let holder_id = safe_component(&format!(
+        "{agent_name}__{}",
+        branch.clone().unwrap_or_else(|| "unknown".to_string())
+    ));
+    let lease_path = slot_path.join(format!("{holder_id}.json"));
+
+    let mut released = false;
+    let mut data = std::fs::read_to_string(&lease_path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<BuildSlotLease>(&t).ok())
+        .unwrap_or_else(|| BuildSlotLease {
+            slot,
+            agent: agent_name,
+            branch,
+            exclusive: true,
+            acquired_ts: now_iso.clone(),
+            expires_ts: now_iso.clone(),
+            released_ts: None,
+        });
+
+    data.released_ts = Some(now_iso.clone());
+    data.expires_ts.clone_from(&now_iso);
+    if write_lease_json(&lease_path, &data).is_ok() {
+        released = true;
+    }
+
+    let response = ReleaseBuildSlotResponse {
+        released,
+        released_at: now_iso,
+    };
+    serde_json::to_string(&response)
+        .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
+}

@@ -1,0 +1,27 @@
+[package]
+name = "mcp-agent-mail-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+regex.workspace = true
+dirs = "6"
+shellexpand = "3"
+sha1.workspace = true
+
+[features]
+# Placeholder feature for optional agent detection integration
+agent-detect = ["coding-agent-search"]
+
+[dependencies.coding-agent-search]
+workspace = true
+optional = true
+
+[lints]
+workspace = true

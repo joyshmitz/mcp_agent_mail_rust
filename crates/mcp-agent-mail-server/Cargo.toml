@@ -1,0 +1,24 @@
+[package]
+name = "mcp-agent-mail-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+asupersync.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+fastmcp.workspace = true
+fastmcp-core.workspace = true
+fastmcp-protocol.workspace = true
+fastmcp-server.workspace = true
+fastmcp-transport.workspace = true
+chrono.workspace = true
+mcp-agent-mail-core = { path = "../mcp-agent-mail-core" }
+mcp-agent-mail-db = { path = "../mcp-agent-mail-db" }
+mcp-agent-mail-tools = { path = "../mcp-agent-mail-tools" }
+
+[lints]
+workspace = true
