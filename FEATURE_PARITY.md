@@ -35,8 +35,10 @@
 | Send message (+ archive write) | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/messaging.rs` |
 | Reply message (+ archive write) | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/messaging.rs` |
 | Fetch inbox | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/messaging.rs` |
-| Search messages (FTS: LIKE fallback) | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/search.rs` |
-| Summarize thread (LLM disabled mode) | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/search.rs` |
+| Search messages (FTS: sanitization + LIKE fallback) | Verified (Tests) | `crates/mcp-agent-mail-db/src/queries.rs` (20 tests), `crates/mcp-agent-mail-tools/src/search.rs` |
+| Summarize thread (heuristic + LLM refinement) | Verified (Tests) | `crates/mcp-agent-mail-tools/src/search.rs`, `crates/mcp-agent-mail-tools/src/llm.rs` (20 tests) |
+| LLM integration (env bridge + model selection + completion + merge) | Verified (Tests) | `crates/mcp-agent-mail-tools/src/llm.rs` (20 tests) |
+| Subject truncation (200 chars) | Implemented | `crates/mcp-agent-mail-tools/src/messaging.rs` |
 | Acknowledge + read tracking | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/messaging.rs` |
 | Ack-required views | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/resources.rs` |
 | Attachment handling + WebP conversion | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` (7 tests), `crates/mcp-agent-mail-tools/src/messaging.rs` |

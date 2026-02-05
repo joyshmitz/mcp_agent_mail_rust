@@ -864,6 +864,192 @@ pub struct SearchRow {
     pub from: String,
 }
 
+// FTS5 unsearchable patterns that cannot produce meaningful results.
+const FTS5_UNSEARCHABLE: &[&str] = &["*", "**", "***", ".", "..", "...", "?", "??", "???"];
+
+/// Sanitize an FTS5 query string, fixing common issues.
+///
+/// Returns `None` when the query cannot produce meaningful results (caller
+/// should return an empty list). Ports Python `_sanitize_fts_query()`.
+#[must_use]
+pub fn sanitize_fts_query(query: &str) -> Option<String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Bare unsearchable patterns
+    if FTS5_UNSEARCHABLE.contains(&trimmed) {
+        return None;
+    }
+
+    // Bare boolean operators without terms
+    let upper = trimmed.to_ascii_uppercase();
+    if matches!(upper.as_str(), "AND" | "OR" | "NOT") {
+        return None;
+    }
+
+    let mut result = trimmed.to_string();
+
+    // FTS5 doesn't support leading wildcards (*foo); strip and recurse
+    if let Some(stripped) = result.strip_prefix('*') {
+        return sanitize_fts_query(stripped);
+    }
+
+    // Trailing lone asterisk: "foo *" → "foo"
+    if result.ends_with(" *") {
+        result.truncate(result.len() - 2);
+        let trimmed_end = result.trim_end().to_string();
+        if trimmed_end.is_empty() {
+            return None;
+        }
+        result = trimmed_end;
+    }
+
+    // Collapse multiple consecutive spaces
+    while result.contains("  ") {
+        result = result.replace("  ", " ");
+    }
+
+    // Quote hyphenated tokens to prevent FTS5 from interpreting hyphens as operators.
+    // Match: POL-358, FEAT-123, foo-bar-baz (not already quoted)
+    result = quote_hyphenated_tokens(&result);
+
+    if result.is_empty() { None } else { Some(result) }
+}
+
+/// Quote hyphenated tokens (e.g. `POL-358` → `"POL-358"`) for FTS5.
+fn quote_hyphenated_tokens(query: &str) -> String {
+    if !query.contains('-') {
+        return query.to_string();
+    }
+    // If the entire query is a single quoted string, leave it alone
+    if query.starts_with('"') && query.ends_with('"') && query.chars().filter(|c| *c == '"').count() == 2 {
+        return query.to_string();
+    }
+
+    let mut out = String::with_capacity(query.len() + 8);
+    let mut in_quote = false;
+    let mut i = 0;
+    let bytes = query.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            in_quote = !in_quote;
+            out.push('"');
+            i += 1;
+            continue;
+        }
+        if in_quote {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        // Try to match a hyphenated token: [A-Za-z0-9]+(-[A-Za-z0-9]+)+
+        if bytes[i].is_ascii_alphanumeric() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_alphanumeric() {
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] == b'-' {
+                // Potential hyphenated token – check for at least one more segment
+                let mut has_hyphen_segment = false;
+                let mut j = i;
+                while j < bytes.len() && bytes[j] == b'-' {
+                    j += 1;
+                    let seg_start = j;
+                    while j < bytes.len() && bytes[j].is_ascii_alphanumeric() {
+                        j += 1;
+                    }
+                    if j > seg_start {
+                        has_hyphen_segment = true;
+                    } else {
+                        break;
+                    }
+                }
+                if has_hyphen_segment {
+                    out.push('"');
+                    out.push_str(&query[start..j]);
+                    out.push('"');
+                    i = j;
+                } else {
+                    out.push_str(&query[start..i]);
+                }
+            } else {
+                out.push_str(&query[start..i]);
+            }
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Extract LIKE fallback terms from a raw search query.
+///
+/// Returns up to `max_terms` alphanumeric tokens (min 2 chars each),
+/// excluding FTS boolean keywords.
+fn extract_like_terms(query: &str, max_terms: usize) -> Vec<String> {
+    const STOPWORDS: &[&str] = &["AND", "OR", "NOT", "NEAR"];
+    let mut terms: Vec<String> = Vec::new();
+    for token in query.split(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '_' && c != '/' && c != '-') {
+        if token.len() < 2 {
+            continue;
+        }
+        if STOPWORDS.contains(&token.to_ascii_uppercase().as_str()) {
+            continue;
+        }
+        if !terms.iter().any(|t| t == token) {
+            terms.push(token.to_string());
+        }
+        if terms.len() >= max_terms {
+            break;
+        }
+    }
+    terms
+}
+
+/// Escape LIKE wildcards for literal substring matching.
+fn like_escape(term: &str) -> String {
+    term.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+/// LIKE fallback when FTS5 fails (e.g. malformed query syntax).
+/// Builds `subject LIKE '%term%' OR body_md LIKE '%term%'` for each term.
+async fn run_like_fallback(
+    cx: &Cx,
+    conn: &sqlmodel_sqlite::SqliteConnection,
+    project_id: i64,
+    terms: &[String],
+    limit: i64,
+) -> Outcome<Vec<sqlmodel_core::Row>, DbError> {
+    // params layout: [project_id, term1_like, term1_like, term2_like, term2_like, ..., limit]
+    let mut params: Vec<Value> = Vec::with_capacity(2 + terms.len() * 2);
+    params.push(Value::BigInt(project_id));
+
+    let mut where_parts: Vec<&str> = Vec::with_capacity(terms.len());
+    for term in terms {
+        let escaped = format!("%{}%", like_escape(term));
+        params.push(Value::Text(escaped.clone()));
+        params.push(Value::Text(escaped));
+        where_parts.push("(m.subject LIKE ? ESCAPE '\\' OR m.body_md LIKE ? ESCAPE '\\')");
+    }
+    let where_clause = where_parts.join(" AND ");
+    params.push(Value::BigInt(limit));
+
+    let sql = format!(
+        "SELECT m.id, m.subject, m.importance, m.ack_required, m.created_ts, m.thread_id, a.name as from_name \
+         FROM messages m \
+         JOIN agents a ON a.id = m.sender_id \
+         WHERE m.project_id = ? AND {where_clause} \
+         ORDER BY m.id ASC \
+         LIMIT ?"
+    );
+    map_sql_outcome(traw_query(cx, conn, &sql, &params).await)
+}
+
 pub async fn search_messages(
     cx: &Cx,
     pool: &DbPool,
@@ -878,28 +1064,14 @@ pub async fn search_messages(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
-    let trimmed = query.trim();
     let Ok(limit_i64) = i64::try_from(limit) else {
         return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
     };
 
-    let rows_out = if trimmed.is_empty() {
-        // Fallback for empty queries: LIKE on subject/body; deterministic order by id ASC.
-        let like = "%".to_string();
-        let sql = "SELECT m.id, m.subject, m.importance, m.ack_required, m.created_ts, m.thread_id, a.name as from_name \
-                   FROM messages m \
-                   JOIN agents a ON a.id = m.sender_id \
-                   WHERE m.project_id = ? AND (m.subject LIKE ? OR m.body_md LIKE ?) \
-                   ORDER BY m.id ASC \
-                   LIMIT ?";
-        let params = [
-            Value::BigInt(project_id),
-            Value::Text(like.clone()),
-            Value::Text(like),
-            Value::BigInt(limit_i64),
-        ];
-        map_sql_outcome(traw_query(cx, &*conn, sql, &params).await)
-    } else {
+    // Sanitize the FTS query; None means "no meaningful results possible"
+    let sanitized = sanitize_fts_query(query);
+
+    let rows_out = if let Some(ref fts_query) = sanitized {
         // FTS5-backed search with relevance ordering.
         let sql = "SELECT m.id, m.subject, m.importance, m.ack_required, m.created_ts, m.thread_id, a.name as from_name \
                    FROM fts_messages \
@@ -910,10 +1082,27 @@ pub async fn search_messages(
                    LIMIT ?";
         let params = [
             Value::BigInt(project_id),
-            Value::Text(trimmed.to_string()),
+            Value::Text(fts_query.clone()),
             Value::BigInt(limit_i64),
         ];
-        map_sql_outcome(traw_query(cx, &*conn, sql, &params).await)
+        let fts_result = traw_query(cx, &*conn, sql, &params).await;
+
+        // On FTS failure, fall back to LIKE with extracted terms
+        match &fts_result {
+            Outcome::Err(_) => {
+                tracing::warn!("FTS query failed for '{}', attempting LIKE fallback", query);
+                let terms = extract_like_terms(query, 5);
+                if terms.is_empty() {
+                    Outcome::Ok(Vec::new())
+                } else {
+                    run_like_fallback(cx, &*conn, project_id, &terms, limit_i64).await
+                }
+            }
+            _ => map_sql_outcome(fts_result),
+        }
+    } else {
+        // Empty/unsearchable query: return empty results
+        Outcome::Ok(Vec::new())
     };
     match rows_out {
         Outcome::Ok(rows) => {
@@ -2108,5 +2297,161 @@ pub async fn list_product_projects(
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_empty_returns_none() {
+        assert!(sanitize_fts_query("").is_none());
+        assert!(sanitize_fts_query("   ").is_none());
+    }
+
+    #[test]
+    fn sanitize_unsearchable_patterns() {
+        for p in ["*", "**", "***", ".", "..", "...", "?", "??", "???"] {
+            assert!(sanitize_fts_query(p).is_none(), "expected None for '{p}'");
+        }
+    }
+
+    #[test]
+    fn sanitize_bare_boolean_operators() {
+        assert!(sanitize_fts_query("AND").is_none());
+        assert!(sanitize_fts_query("OR").is_none());
+        assert!(sanitize_fts_query("NOT").is_none());
+        assert!(sanitize_fts_query("and").is_none());
+    }
+
+    #[test]
+    fn sanitize_strips_leading_wildcard() {
+        assert_eq!(sanitize_fts_query("*foo"), Some("foo".to_string()));
+        assert_eq!(sanitize_fts_query("**foo"), Some("foo".to_string()));
+    }
+
+    #[test]
+    fn sanitize_strips_trailing_lone_wildcard() {
+        assert_eq!(sanitize_fts_query("foo *"), Some("foo".to_string()));
+        assert!(sanitize_fts_query(" *").is_none());
+    }
+
+    #[test]
+    fn sanitize_collapses_multiple_spaces() {
+        assert_eq!(
+            sanitize_fts_query("foo  bar   baz"),
+            Some("foo bar baz".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_preserves_prefix_wildcard() {
+        assert_eq!(sanitize_fts_query("migrat*"), Some("migrat*".to_string()));
+    }
+
+    #[test]
+    fn sanitize_preserves_boolean_with_terms() {
+        assert_eq!(
+            sanitize_fts_query("plan AND users"),
+            Some("plan AND users".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_quotes_hyphenated_tokens() {
+        assert_eq!(
+            sanitize_fts_query("POL-358"),
+            Some("\"POL-358\"".to_string())
+        );
+        assert_eq!(
+            sanitize_fts_query("search for FEAT-123 and bd-42"),
+            Some("search for \"FEAT-123\" and \"bd-42\"".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_leaves_already_quoted() {
+        assert_eq!(
+            sanitize_fts_query("\"build plan\""),
+            Some("\"build plan\"".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_simple_term() {
+        assert_eq!(sanitize_fts_query("hello"), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn extract_terms_basic() {
+        let terms = extract_like_terms("foo AND bar OR baz", 5);
+        assert_eq!(terms, vec!["foo", "bar", "baz"]);
+    }
+
+    #[test]
+    fn extract_terms_skips_stopwords() {
+        let terms = extract_like_terms("AND OR NOT NEAR", 5);
+        assert!(terms.is_empty());
+    }
+
+    #[test]
+    fn extract_terms_skips_short() {
+        let terms = extract_like_terms("a b cd ef", 5);
+        assert_eq!(terms, vec!["cd", "ef"]);
+    }
+
+    #[test]
+    fn extract_terms_respects_max() {
+        let terms = extract_like_terms("alpha beta gamma delta epsilon", 3);
+        assert_eq!(terms.len(), 3);
+    }
+
+    #[test]
+    fn extract_terms_deduplicates() {
+        let terms = extract_like_terms("foo bar foo bar", 5);
+        assert_eq!(terms, vec!["foo", "bar"]);
+    }
+
+    #[test]
+    fn like_escape_special_chars() {
+        assert_eq!(like_escape("100%"), "100\\%");
+        assert_eq!(like_escape("a_b"), "a\\_b");
+        assert_eq!(like_escape("a\\b"), "a\\\\b");
+    }
+
+    #[test]
+    fn quote_hyphenated_no_hyphen() {
+        assert_eq!(quote_hyphenated_tokens("hello world"), "hello world");
+    }
+
+    #[test]
+    fn quote_hyphenated_single() {
+        assert_eq!(quote_hyphenated_tokens("POL-358"), "\"POL-358\"");
+    }
+
+    #[test]
+    fn quote_hyphenated_multi_segment() {
+        assert_eq!(quote_hyphenated_tokens("foo-bar-baz"), "\"foo-bar-baz\"");
+    }
+
+    #[test]
+    fn quote_hyphenated_in_context() {
+        assert_eq!(
+            quote_hyphenated_tokens("search FEAT-123 done"),
+            "search \"FEAT-123\" done"
+        );
+    }
+
+    #[test]
+    fn quote_hyphenated_already_quoted() {
+        assert_eq!(
+            quote_hyphenated_tokens("\"already-quoted\""),
+            "\"already-quoted\""
+        );
     }
 }

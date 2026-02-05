@@ -10,6 +10,7 @@ use mcp_agent_mail_db::micros_to_iso;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+use crate::llm;
 use crate::tool_util::{db_outcome_to_mcp_result, get_db_pool, resolve_project};
 
 /// Search result entry
@@ -415,13 +416,67 @@ pub async fn summarize_thread(
             .map(|(name, count)| MentionCount { name, count })
             .collect();
 
+        let mut aggregate = AggregateSummary {
+            top_mentions,
+            key_points: all_points.into_iter().take(25).collect(),
+            action_items: all_actions.into_iter().take(25).collect(),
+        };
+
+        // LLM refinement for multi-thread (if enabled)
+        let config = mcp_agent_mail_core::Config::from_env();
+        if use_llm && config.llm_enabled {
+            let thread_context: Vec<(String, Vec<String>, Vec<String>)> = threads
+                .iter()
+                .take(llm::MAX_THREADS_FOR_CONTEXT)
+                .map(|t| {
+                    (
+                        t.thread_id.clone(),
+                        t.summary
+                            .key_points
+                            .iter()
+                            .take(llm::MAX_KEY_POINTS_PER_THREAD)
+                            .cloned()
+                            .collect(),
+                        t.summary
+                            .action_items
+                            .iter()
+                            .take(llm::MAX_ACTIONS_PER_THREAD)
+                            .cloned()
+                            .collect(),
+                    )
+                })
+                .collect();
+
+            let system = llm::multi_thread_system_prompt();
+            let user = llm::multi_thread_user_prompt(&thread_context);
+
+            match llm::complete_system_user(
+                system,
+                &user,
+                llm_model.as_deref(),
+                Some(config.llm_temperature),
+                Some(config.llm_max_tokens),
+            )
+            .await
+            {
+                Ok(output) => {
+                    if let Some(parsed) = llm::parse_json_safely(&output.content) {
+                        aggregate = llm::merge_multi_thread_aggregate(&aggregate, &parsed);
+                    } else {
+                        tracing::debug!(
+                            "summarize_thread.llm_skipped: could not parse LLM response"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("summarize_thread.llm_skipped: {e}");
+                }
+            }
+        }
+
         let response = MultiThreadResponse {
             threads,
-            aggregate: AggregateSummary {
-                top_mentions,
-                key_points: all_points.into_iter().take(25).collect(),
-                action_items: all_actions.into_iter().take(25).collect(),
-            },
+            aggregate,
         };
 
         tracing::debug!(
@@ -448,7 +503,42 @@ pub async fn summarize_thread(
             .await,
         )?;
 
-        let summary = summarize_messages(&messages);
+        let mut summary = summarize_messages(&messages);
+
+        // LLM refinement (if enabled)
+        let config = mcp_agent_mail_core::Config::from_env();
+        if use_llm && config.llm_enabled {
+            let msg_tuples: Vec<(i64, String, String, String)> = messages
+                .iter()
+                .take(llm::MAX_MESSAGES_FOR_LLM)
+                .map(|m| (m.id, m.from.clone(), m.subject.clone(), m.body_md.clone()))
+                .collect();
+
+            let system = llm::single_thread_system_prompt();
+            let user = llm::single_thread_user_prompt(&msg_tuples);
+
+            match llm::complete_system_user(
+                system,
+                &user,
+                llm_model.as_deref(),
+                Some(config.llm_temperature),
+                Some(config.llm_max_tokens),
+            )
+            .await
+            {
+                Ok(output) => {
+                    if let Some(parsed) = llm::parse_json_safely(&output.content) {
+                        summary = llm::merge_single_thread_summary(&summary, &parsed);
+                    } else {
+                        tracing::debug!("thread_summary.llm_skipped: could not parse LLM response");
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("thread_summary.llm_skipped: {e}");
+                }
+            }
+        }
+
         let examples = if with_examples {
             messages
                 .iter()

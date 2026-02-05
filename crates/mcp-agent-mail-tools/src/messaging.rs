@@ -280,6 +280,17 @@ pub async fn send_message(
         ));
     }
 
+    // Truncate subject at 200 chars (parity with Python legacy)
+    let subject = if subject.len() > 200 {
+        tracing::warn!(
+            "Subject exceeds 200 characters ({}); truncating",
+            subject.len()
+        );
+        subject[..200].to_string()
+    } else {
+        subject
+    };
+
     // Validate importance
     let importance_val = importance.unwrap_or_else(|| "normal".to_string());
     if !["low", "normal", "high", "urgent"].contains(&importance_val.as_str()) {
@@ -832,11 +843,25 @@ pub async fn reply_message(
         .clone()
         .unwrap_or_else(|| message_id.to_string());
 
-    // Apply subject prefix if not already present
-    let subject = if original.subject.starts_with(&prefix) {
+    // Apply subject prefix if not already present (case-insensitive)
+    let subject = if original
+        .subject
+        .to_ascii_lowercase()
+        .starts_with(&prefix.to_ascii_lowercase())
+    {
         original.subject.clone()
     } else {
         format!("{prefix} {}", original.subject)
+    };
+    // Truncate subject at 200 chars (parity with Python legacy)
+    let subject = if subject.len() > 200 {
+        tracing::warn!(
+            "Reply subject exceeds 200 characters ({}); truncating",
+            subject.len()
+        );
+        subject[..200].to_string()
+    } else {
+        subject
     };
 
     // Default to to original sender if not specified

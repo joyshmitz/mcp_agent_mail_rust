@@ -18,6 +18,7 @@
 pub mod build_slots;
 pub mod contacts;
 pub mod identity;
+pub mod llm;
 pub mod macros;
 pub mod messaging;
 pub mod products;

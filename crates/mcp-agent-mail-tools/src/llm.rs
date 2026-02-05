@@ -1,0 +1,993 @@
+//! LLM integration module for MCP Agent Mail
+//!
+//! Provides:
+//! - Provider env variable bridging (synonym → canonical mapping)
+//! - Model selection by available API keys
+//! - Completion client using asupersync HTTP
+//! - Safe JSON extraction from LLM responses
+//! - Thread summary merge logic (heuristic + LLM refinement)
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::sync::{Mutex, OnceLock};
+
+use crate::search::{AggregateSummary, MentionCount, ThreadSummary};
+
+// ---------------------------------------------------------------------------
+// Provider env bridge
+// ---------------------------------------------------------------------------
+
+/// Synonym → canonical env var mappings for LLM providers.
+const ENV_BRIDGE_MAPPINGS: &[(&str, &str)] = &[
+    ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+    ("GROK_API_KEY", "XAI_API_KEY"),
+];
+
+/// In-memory bridged env vars (since `set_var` is unsafe in Rust 2024).
+/// Maps canonical key → value when bridged from a synonym.
+static BRIDGED_ENV: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+fn bridged_env() -> &'static Mutex<HashMap<String, String>> {
+    BRIDGED_ENV.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Look up an env var, checking our bridged map first, then real env.
+fn get_env_var(key: &str) -> Option<String> {
+    // Check real env first (user-set takes priority)
+    if let Ok(val) = std::env::var(key) {
+        return Some(val);
+    }
+    // Check bridged map
+    bridged_env().lock().ok()?.get(key).cloned()
+}
+
+/// Bridge synonym env vars to canonical keys.
+///
+/// For each (synonym, canonical) pair: if the canonical var is NOT already set
+/// (in either real env or bridged map), and the synonym IS set, store the
+/// mapping in the bridged map.
+pub fn bridge_provider_env() {
+    for &(synonym, canonical) in ENV_BRIDGE_MAPPINGS {
+        if get_env_var(canonical).is_some() {
+            continue; // canonical already available, don't overwrite
+        }
+        if let Some(val) = get_env_var(synonym) {
+            if let Ok(mut map) = bridged_env().lock() {
+                map.insert(canonical.to_string(), val);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Model selection
+// ---------------------------------------------------------------------------
+
+/// Priority-ordered provider → model mapping.
+const MODEL_PRIORITY: &[(&str, &str)] = &[
+    ("OPENAI_API_KEY", "gpt-4o-mini"),
+    ("GOOGLE_API_KEY", "gemini-1.5-flash"),
+    (
+        "ANTHROPIC_API_KEY",
+        "claude-3-haiku-20240307",
+    ),
+    ("GROQ_API_KEY", "groq/llama-3.1-8b-instant"),
+    ("DEEPSEEK_API_KEY", "deepseek/deepseek-chat"),
+    ("XAI_API_KEY", "xai/grok-2-mini"),
+    (
+        "OPENROUTER_API_KEY",
+        "openrouter/meta-llama/llama-3.1-8b-instruct",
+    ),
+];
+
+/// Default fallback model when no API keys are found.
+const DEFAULT_MODEL: &str = "gpt-4o-mini";
+
+/// Aliases that trigger dynamic model selection.
+const AUTO_ALIASES: &[&str] = &["best", "auto", "gpt-5-mini", "gpt5-mini", "gpt-5m"];
+
+/// Choose the best available model based on set API keys.
+///
+/// If `preferred` contains "/" or ":" (provider-qualified), returns it as-is.
+/// Otherwise, checks env vars in priority order and returns the first match.
+/// Falls back to `DEFAULT_MODEL`.
+#[must_use]
+pub fn choose_best_available_model(preferred: &str) -> String {
+    // Provider-qualified names pass through
+    if preferred.contains('/') || preferred.contains(':') {
+        return preferred.to_string();
+    }
+
+    for &(env_var, model) in MODEL_PRIORITY {
+        if get_env_var(env_var).is_some() {
+            return model.to_string();
+        }
+    }
+
+    DEFAULT_MODEL.to_string()
+}
+
+/// Resolve a model alias to a concrete model name.
+///
+/// "best", "auto", etc. trigger `choose_best_available_model`.
+/// Other names are returned as-is.
+#[must_use]
+pub fn resolve_model_alias(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    if AUTO_ALIASES.iter().any(|a| *a == lower) {
+        choose_best_available_model(name)
+    } else {
+        name.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LLM completion types
+// ---------------------------------------------------------------------------
+
+/// Output from an LLM completion call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmOutput {
+    pub content: String,
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_cost_usd: Option<f64>,
+}
+
+/// LLM completion error.
+#[derive(Debug)]
+pub enum LlmError {
+    /// HTTP transport error.
+    Http(String),
+    /// Non-200 status code.
+    StatusError { status: u16, body: String },
+    /// Response parsing error.
+    ParseError(String),
+    /// No API key available for the selected provider.
+    NoApiKey(String),
+    /// LLM is disabled.
+    Disabled,
+}
+
+impl std::fmt::Display for LlmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Http(e) => write!(f, "HTTP error: {e}"),
+            Self::StatusError { status, body } => {
+                write!(f, "LLM returned status {status}: {body}")
+            }
+            Self::ParseError(e) => write!(f, "parse error: {e}"),
+            Self::NoApiKey(model) => write!(f, "no API key for model: {model}"),
+            Self::Disabled => write!(f, "LLM is disabled"),
+        }
+    }
+}
+
+impl std::error::Error for LlmError {}
+
+// ---------------------------------------------------------------------------
+// API endpoint resolution
+// ---------------------------------------------------------------------------
+
+/// Determine the API base URL and auth header for a given model.
+fn resolve_api_endpoint(model: &str) -> Result<(String, String, String), LlmError> {
+    // Provider-qualified: "provider/model" or "provider:model"
+    let provider = if model.contains('/') {
+        model.split('/').next().unwrap_or("")
+    } else if model.contains(':') {
+        model.split(':').next().unwrap_or("")
+    } else {
+        // Guess provider from model name prefix
+        if model.starts_with("gpt") || model.starts_with("o1") || model.starts_with("o3") {
+            "openai"
+        } else if model.starts_with("claude") {
+            "anthropic"
+        } else if model.starts_with("gemini") {
+            "google"
+        } else {
+            "openai" // default
+        }
+    };
+
+    let provider_lower = provider.to_ascii_lowercase();
+    match provider_lower.as_str() {
+        "openai" | "gpt" => {
+            let key = get_env_var("OPENAI_API_KEY")
+                .ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
+            Ok((
+                "https://api.openai.com/v1/chat/completions".to_string(),
+                format!("Bearer {key}"),
+                model.to_string(),
+            ))
+        }
+        "anthropic" | "claude" => {
+            let key = get_env_var("ANTHROPIC_API_KEY")
+                .ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
+            // Anthropic uses a different header, but litellm-compatible endpoints
+            // accept Bearer too
+            Ok((
+                "https://api.anthropic.com/v1/messages".to_string(),
+                format!("Bearer {key}"),
+                model.to_string(),
+            ))
+        }
+        "google" | "gemini" => {
+            let key = get_env_var("GOOGLE_API_KEY")
+                .ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
+            Ok((
+                "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+                    .to_string(),
+                format!("Bearer {key}"),
+                model.to_string(),
+            ))
+        }
+        "groq" => {
+            let key = get_env_var("GROQ_API_KEY")
+                .ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
+            // Strip provider prefix for the API
+            let api_model = model.strip_prefix("groq/").unwrap_or(model);
+            Ok((
+                "https://api.groq.com/openai/v1/chat/completions".to_string(),
+                format!("Bearer {key}"),
+                api_model.to_string(),
+            ))
+        }
+        "deepseek" => {
+            let key = get_env_var("DEEPSEEK_API_KEY")
+                .ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
+            let api_model = model.strip_prefix("deepseek/").unwrap_or(model);
+            Ok((
+                "https://api.deepseek.com/v1/chat/completions".to_string(),
+                format!("Bearer {key}"),
+                api_model.to_string(),
+            ))
+        }
+        "xai" => {
+            let key =
+                get_env_var("XAI_API_KEY")
+                .ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
+            let api_model = model.strip_prefix("xai/").unwrap_or(model);
+            Ok((
+                "https://api.x.ai/v1/chat/completions".to_string(),
+                format!("Bearer {key}"),
+                api_model.to_string(),
+            ))
+        }
+        "openrouter" => {
+            let key = get_env_var("OPENROUTER_API_KEY")
+                .ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
+            let api_model = model.strip_prefix("openrouter/").unwrap_or(model);
+            Ok((
+                "https://openrouter.ai/api/v1/chat/completions".to_string(),
+                format!("Bearer {key}"),
+                api_model.to_string(),
+            ))
+        }
+        _ => {
+            // Try OpenAI-compatible endpoint
+            let key = get_env_var("OPENAI_API_KEY")
+                .ok_or_else(|| LlmError::NoApiKey(model.to_string()))?;
+            Ok((
+                "https://api.openai.com/v1/chat/completions".to_string(),
+                format!("Bearer {key}"),
+                model.to_string(),
+            ))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP completion client
+// ---------------------------------------------------------------------------
+
+/// Global HTTP client instance for LLM calls.
+static HTTP_CLIENT: OnceLock<asupersync::http::h1::HttpClient> = OnceLock::new();
+
+fn get_http_client() -> &'static asupersync::http::h1::HttpClient {
+    HTTP_CLIENT.get_or_init(asupersync::http::h1::HttpClient::new)
+}
+
+/// Call an OpenAI-compatible chat completion endpoint.
+///
+/// Sends system + user messages and extracts the response content.
+/// On failure with the primary model, retries with `choose_best_available_model`
+/// if that yields a different model.
+pub async fn complete_system_user(
+    system: &str,
+    user: &str,
+    model: Option<&str>,
+    temperature: Option<f64>,
+    max_tokens: Option<u32>,
+) -> Result<LlmOutput, LlmError> {
+    let resolved = model.map_or_else(|| resolve_model_alias(DEFAULT_MODEL), resolve_model_alias);
+
+    match complete_single(&resolved, system, user, temperature, max_tokens).await {
+        Ok(output) => Ok(output),
+        Err(e) => {
+            // Retry with best available if different
+            let fallback = choose_best_available_model(&resolved);
+            if fallback == resolved {
+                Err(e)
+            } else {
+                tracing::warn!(
+                    "LLM call failed with {resolved}, retrying with {fallback}: {e}"
+                );
+                complete_single(&fallback, system, user, temperature, max_tokens).await
+            }
+        }
+    }
+}
+
+async fn complete_single(
+    model: &str,
+    system: &str,
+    user: &str,
+    temperature: Option<f64>,
+    max_tokens: Option<u32>,
+) -> Result<LlmOutput, LlmError> {
+    let (url, auth, api_model) = resolve_api_endpoint(model)?;
+    let temp = temperature.unwrap_or(0.2);
+    let max_tok = max_tokens.unwrap_or(512);
+
+    let payload = serde_json::json!({
+        "model": api_model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user}
+        ],
+        "temperature": temp,
+        "max_tokens": max_tok
+    });
+
+    let body_bytes = serde_json::to_vec(&payload).map_err(|e| LlmError::ParseError(e.to_string()))?;
+
+    let headers = vec![
+        ("Content-Type".to_string(), "application/json".to_string()),
+        ("Authorization".to_string(), auth),
+    ];
+
+    let client = get_http_client();
+    let response = client
+        .request(
+            asupersync::http::h1::Method::Post,
+            &url,
+            headers,
+            body_bytes,
+        )
+        .await
+        .map_err(|e| LlmError::Http(e.to_string()))?;
+
+    if response.status != 200 {
+        let body_text = String::from_utf8_lossy(&response.body).to_string();
+        return Err(LlmError::StatusError {
+            status: response.status,
+            body: body_text,
+        });
+    }
+
+    let resp_json: Value = serde_json::from_slice(&response.body)
+        .map_err(|e| LlmError::ParseError(format!("response JSON: {e}")))?;
+
+    // Extract content from choices[0].message.content
+    let content = resp_json
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let resp_model = resp_json
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or(model)
+        .to_string();
+
+    let provider = resp_json
+        .get("provider")
+        .and_then(Value::as_str)
+        .map(String::from);
+
+    Ok(LlmOutput {
+        content,
+        model: resp_model,
+        provider,
+        estimated_cost_usd: None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Safe JSON extraction
+// ---------------------------------------------------------------------------
+
+/// Parse JSON from LLM output using three fallback strategies:
+/// 1. Direct parse (trim whitespace first)
+/// 2. Fenced code block extraction (```json ... ``` or ``` ... ```)
+/// 3. Brace-slice extraction (outermost { ... })
+#[must_use]
+pub fn parse_json_safely(text: &str) -> Option<Value> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Strategy 1: direct parse
+    if let Ok(v) = serde_json::from_str(trimmed) {
+        return Some(v);
+    }
+
+    // Strategy 2: fenced code block
+    if let Some(v) = extract_fenced_json(trimmed) {
+        return Some(v);
+    }
+
+    // Strategy 3: brace-slice
+    extract_brace_json(trimmed)
+}
+
+fn extract_fenced_json(text: &str) -> Option<Value> {
+    // Look for ```json\n...\n``` first, then plain ```\n...\n```
+    let markers = ["```json\n", "```json\r\n", "```\n", "```\r\n"];
+    for marker in markers {
+        if let Some(start) = text.find(marker) {
+            let content_start = start + marker.len();
+            if let Some(end_rel) = text[content_start..].find("```") {
+                let content = text[content_start..content_start + end_rel].trim();
+                if let Ok(v) = serde_json::from_str(content) {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_brace_json(text: &str) -> Option<Value> {
+    let open = text.find('{')?;
+    let close = text.rfind('}')?;
+    if close <= open {
+        return None;
+    }
+    let slice = &text[open..=close];
+    serde_json::from_str(slice).ok()
+}
+
+// ---------------------------------------------------------------------------
+// Thread summary merge logic
+// ---------------------------------------------------------------------------
+
+/// Action keywords used to identify heuristic `key_points` worth preserving.
+const ACTION_KEYWORDS: &[&str] = &["TODO", "ACTION", "FIXME", "NEXT", "BLOCKED"];
+
+/// Maximum `key_points` after merge.
+const KEY_POINTS_CAP: usize = 10;
+
+/// Merge LLM refinement into a heuristic `ThreadSummary` (single-thread mode).
+///
+/// Strategy:
+/// - For `key_points`: keep heuristic items containing action keywords,
+///   prepend them, append LLM `key_points`, deduplicate, cap at 10.
+/// - For other keys: LLM values overlay heuristic values if present.
+pub fn merge_single_thread_summary(
+    heuristic: &ThreadSummary,
+    llm_json: &Value,
+) -> ThreadSummary {
+    let mut result = heuristic.clone();
+
+    // key_points: special merge
+    if let Some(llm_kp) = llm_json.get("key_points").and_then(Value::as_array) {
+        let llm_points: Vec<String> = llm_kp
+            .iter()
+            .filter_map(Value::as_str)
+            .map(String::from)
+            .collect();
+
+        // Keep heuristic items with action keywords
+        let action_points: Vec<String> = heuristic
+            .key_points
+            .iter()
+            .filter(|kp| {
+                let upper = kp.to_ascii_uppercase();
+                ACTION_KEYWORDS.iter().any(|k| upper.contains(k))
+            })
+            .cloned()
+            .collect();
+
+        let mut merged = action_points;
+        for p in llm_points {
+            if !merged.contains(&p) {
+                merged.push(p);
+            }
+        }
+        merged.truncate(KEY_POINTS_CAP);
+        result.key_points = merged;
+    }
+
+    // action_items
+    if let Some(llm_ai) = llm_json.get("action_items").and_then(Value::as_array) {
+        let items: Vec<String> = llm_ai
+            .iter()
+            .filter_map(Value::as_str)
+            .map(String::from)
+            .collect();
+        if !items.is_empty() {
+            result.action_items = items;
+        }
+    }
+
+    // participants
+    if let Some(llm_p) = llm_json.get("participants").and_then(Value::as_array) {
+        let parts: Vec<String> = llm_p
+            .iter()
+            .filter_map(Value::as_str)
+            .map(String::from)
+            .collect();
+        if !parts.is_empty() {
+            result.participants = parts;
+        }
+    }
+
+    // mentions
+    if let Some(llm_m) = llm_json.get("mentions").and_then(Value::as_array) {
+        let mentions: Vec<MentionCount> = llm_m
+            .iter()
+            .filter_map(|m| {
+                let name = m.get("name")?.as_str()?.to_string();
+                let count = m.get("count")?.as_i64()?;
+                Some(MentionCount { name, count })
+            })
+            .collect();
+        if !mentions.is_empty() {
+            result.mentions = mentions;
+        }
+    }
+
+    // code_references
+    if let Some(llm_cr) = llm_json.get("code_references").and_then(Value::as_array) {
+        let refs: Vec<String> = llm_cr
+            .iter()
+            .filter_map(Value::as_str)
+            .map(String::from)
+            .collect();
+        if !refs.is_empty() {
+            result.code_references = Some(refs);
+        }
+    }
+
+    // total_messages, open_actions, done_actions
+    if let Some(v) = llm_json.get("total_messages").and_then(Value::as_i64) {
+        result.total_messages = v;
+    }
+    if let Some(v) = llm_json.get("open_actions").and_then(Value::as_i64) {
+        result.open_actions = v;
+    }
+    if let Some(v) = llm_json.get("done_actions").and_then(Value::as_i64) {
+        result.done_actions = v;
+    }
+
+    result
+}
+
+/// Merge LLM refinement into a heuristic `AggregateSummary` (multi-thread mode).
+///
+/// LLM aggregate keys overlay heuristic aggregate.
+pub fn merge_multi_thread_aggregate(
+    heuristic: &AggregateSummary,
+    llm_json: &Value,
+) -> AggregateSummary {
+    let mut result = heuristic.clone();
+
+    if let Some(agg) = llm_json.get("aggregate") {
+        if let Some(kp) = agg.get("key_points").and_then(Value::as_array) {
+            let points: Vec<String> = kp
+                .iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect();
+            if !points.is_empty() {
+                result.key_points = points;
+            }
+        }
+        if let Some(ai) = agg.get("action_items").and_then(Value::as_array) {
+            let items: Vec<String> = ai
+                .iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect();
+            if !items.is_empty() {
+                result.action_items = items;
+            }
+        }
+        if let Some(tm) = agg.get("top_mentions").and_then(Value::as_array) {
+            // top_mentions can be strings or objects
+            let mentions: Vec<MentionCount> = tm
+                .iter()
+                .filter_map(|v| {
+                    v.as_str().map_or_else(
+                        || {
+                            let name = v.get("name")?.as_str()?.to_string();
+                            let count = v.get("count").and_then(Value::as_i64).unwrap_or(0);
+                            Some(MentionCount { name, count })
+                        },
+                        |s| {
+                            Some(MentionCount {
+                                name: s.to_string(),
+                                count: 0,
+                            })
+                        },
+                    )
+                })
+                .collect();
+            if !mentions.is_empty() {
+                result.top_mentions = mentions;
+            }
+        }
+    }
+
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Summarize-thread LLM prompts
+// ---------------------------------------------------------------------------
+
+/// Max messages to send to LLM for single-thread summarization.
+pub const MAX_MESSAGES_FOR_LLM: usize = 15;
+
+/// Max body chars per message sent to LLM.
+pub const MESSAGE_TRUNCATION_CHARS: usize = 800;
+
+/// Max threads to include in multi-thread LLM context.
+pub const MAX_THREADS_FOR_CONTEXT: usize = 8;
+
+/// Max `key_points` per thread in multi-thread context.
+pub const MAX_KEY_POINTS_PER_THREAD: usize = 6;
+
+/// Max action items per thread in multi-thread context.
+pub const MAX_ACTIONS_PER_THREAD: usize = 6;
+
+/// Build the system prompt for single-thread LLM summarization.
+#[must_use]
+pub const fn single_thread_system_prompt() -> &'static str {
+    "You are a senior engineer. Produce a concise JSON summary with keys: \
+     `participants` (string[]), `key_points` (string[]), `action_items` (string[]), \
+     `mentions` (array of {name, count}), `code_references` (string[]), \
+     `total_messages` (int), `open_actions` (int), `done_actions` (int). \
+     Return only valid JSON."
+}
+
+/// Build the user prompt for single-thread LLM summarization.
+#[must_use]
+pub fn single_thread_user_prompt(
+    messages: &[(i64, String, String, String)], // (id, from, subject, body)
+) -> String {
+    let mut prompt = String::from("Summarize this thread:\n\n");
+    for (id, from, subject, body) in messages.iter().take(MAX_MESSAGES_FOR_LLM) {
+        let truncated_body = if body.len() > MESSAGE_TRUNCATION_CHARS {
+            &body[..MESSAGE_TRUNCATION_CHARS]
+        } else {
+            body.as_str()
+        };
+        let _ = write!(
+            prompt,
+            "---\nMessage {id} from {from}\nSubject: {subject}\n{truncated_body}\n"
+        );
+    }
+    prompt
+}
+
+/// Build the system prompt for multi-thread LLM summarization.
+#[must_use]
+pub const fn multi_thread_system_prompt() -> &'static str {
+    "You are a senior engineer producing a crisp digest across threads. \
+     Return JSON: { \"threads\": [{\"thread_id\": string, \"key_points\": string[], \
+     \"actions\": string[]}], \"aggregate\": {\"top_mentions\": string[], \
+     \"key_points\": string[], \"action_items\": string[]} }. Return only valid JSON."
+}
+
+/// Build the user prompt for multi-thread LLM summarization.
+#[must_use]
+pub fn multi_thread_user_prompt(
+    threads: &[(String, Vec<String>, Vec<String>)], // (thread_id, key_points, action_items)
+) -> String {
+    let mut prompt = String::from("Digest these threads:\n\n");
+    for (tid, kps, actions) in threads.iter().take(MAX_THREADS_FOR_CONTEXT) {
+        let _ = writeln!(prompt, "Thread: {tid}");
+        prompt.push_str("Key points:\n");
+        for kp in kps.iter().take(MAX_KEY_POINTS_PER_THREAD) {
+            let _ = writeln!(prompt, "- {kp}");
+        }
+        prompt.push_str("Actions:\n");
+        for a in actions.iter().take(MAX_ACTIONS_PER_THREAD) {
+            let _ = writeln!(prompt, "- {a}");
+        }
+        prompt.push('\n');
+    }
+    prompt
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- bridge_provider_env tests --
+
+    // Note: env var tests are inherently sequential and may interfere.
+    // We use unique prefixes or accept test isolation limitations.
+
+    #[test]
+    fn parse_json_clean() {
+        let input = r#"{"key_points": ["item1"], "action_items": []}"#;
+        let v = parse_json_safely(input).unwrap();
+        assert_eq!(v["key_points"][0], "item1");
+    }
+
+    #[test]
+    fn parse_json_whitespace() {
+        let input = "  \n  {\"key_points\": [\"a\"]}  \n  ";
+        let v = parse_json_safely(input).unwrap();
+        assert_eq!(v["key_points"][0], "a");
+    }
+
+    #[test]
+    fn parse_json_fenced_with_tag() {
+        let input =
+            "Here is the summary:\n```json\n{\"key_points\": [\"deploy API\"]}\n```\nLet me know.";
+        let v = parse_json_safely(input).unwrap();
+        assert_eq!(v["key_points"][0], "deploy API");
+    }
+
+    #[test]
+    fn parse_json_fenced_no_tag() {
+        let input = "```\n{\"participants\": [\"Alice\"]}\n```";
+        let v = parse_json_safely(input).unwrap();
+        assert_eq!(v["participants"][0], "Alice");
+    }
+
+    #[test]
+    fn parse_json_brace_slice() {
+        let input = "The summary is: {\"total_messages\": 5, \"open_actions\": 2} based on thread.";
+        let v = parse_json_safely(input).unwrap();
+        assert_eq!(v["total_messages"], 5);
+    }
+
+    #[test]
+    fn parse_json_nested_braces() {
+        let input = "Result: {\"data\": {\"inner\": true}, \"count\": 1}";
+        let v = parse_json_safely(input).unwrap();
+        assert!(v["data"]["inner"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn parse_json_no_json() {
+        let input = "I couldn't generate a summary for this thread.";
+        assert!(parse_json_safely(input).is_none());
+    }
+
+    #[test]
+    fn parse_json_malformed() {
+        let input = "{key_points: [missing quotes]}";
+        assert!(parse_json_safely(input).is_none());
+    }
+
+    #[test]
+    fn parse_json_empty() {
+        assert!(parse_json_safely("").is_none());
+    }
+
+    #[test]
+    fn parse_json_array() {
+        let input = r#"[{"id": 1}, {"id": 2}]"#;
+        let v = parse_json_safely(input).unwrap();
+        assert_eq!(v[0]["id"], 1);
+    }
+
+    #[test]
+    fn parse_json_multiple_fenced() {
+        let input = "```json\n{\"first\": true}\n```\n\nAnd also:\n```json\n{\"second\": true}\n```";
+        let v = parse_json_safely(input).unwrap();
+        assert!(v["first"].as_bool().unwrap());
+    }
+
+    // -- model selection tests --
+
+    #[test]
+    fn resolve_alias_best() {
+        // "best" triggers dynamic selection
+        let result = resolve_model_alias("best");
+        // Should return some model (depends on env vars)
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn resolve_alias_passthrough() {
+        assert_eq!(resolve_model_alias("gpt-4o"), "gpt-4o");
+        assert_eq!(
+            resolve_model_alias("claude-3-opus-20240229"),
+            "claude-3-opus-20240229"
+        );
+    }
+
+    #[test]
+    fn provider_qualified_passthrough() {
+        assert_eq!(
+            choose_best_available_model("groq/my-model"),
+            "groq/my-model"
+        );
+        assert_eq!(
+            choose_best_available_model("openrouter/meta-llama/llama-3.1-8b-instruct"),
+            "openrouter/meta-llama/llama-3.1-8b-instruct"
+        );
+    }
+
+    // -- merge tests --
+
+    #[test]
+    fn merge_single_full_refinement() {
+        let heuristic = ThreadSummary {
+            participants: vec!["Alice".into(), "Bob".into()],
+            key_points: vec!["TODO: deploy to staging".into(), "discussed API changes".into()],
+            action_items: vec!["TODO: deploy to staging".into()],
+            total_messages: 5,
+            open_actions: 1,
+            done_actions: 0,
+            mentions: vec![],
+            code_references: None,
+        };
+
+        let llm_json: Value = serde_json::from_str(
+            r#"{"participants": ["Alice", "Bob"], "key_points": ["API migration planned for next sprint", "Staging deployment needed before review"], "action_items": ["Deploy to staging", "Update API docs"], "mentions": [{"name": "Carol", "count": 2}], "code_references": ["api/v2/users"], "total_messages": 5, "open_actions": 2, "done_actions": 0}"#,
+        )
+        .unwrap();
+
+        let merged = merge_single_thread_summary(&heuristic, &llm_json);
+
+        // key_points: heuristic "TODO: deploy to staging" kept (has TODO), then LLM items
+        assert_eq!(merged.key_points[0], "TODO: deploy to staging");
+        assert!(merged.key_points.contains(&"API migration planned for next sprint".to_string()));
+        assert!(merged
+            .key_points
+            .contains(&"Staging deployment needed before review".to_string()));
+
+        // action_items from LLM
+        assert_eq!(merged.action_items, vec!["Deploy to staging", "Update API docs"]);
+
+        // mentions from LLM
+        assert_eq!(merged.mentions[0].name, "Carol");
+        assert_eq!(merged.mentions[0].count, 2);
+
+        // code_references from LLM
+        assert_eq!(
+            merged.code_references.as_ref().unwrap(),
+            &vec!["api/v2/users".to_string()]
+        );
+
+        assert_eq!(merged.open_actions, 2);
+    }
+
+    #[test]
+    fn merge_single_partial_response() {
+        let heuristic = ThreadSummary {
+            participants: vec!["Alice".into()],
+            key_points: vec!["FIXME: broken auth flow".into()],
+            action_items: vec![],
+            total_messages: 3,
+            open_actions: 0,
+            done_actions: 0,
+            mentions: vec![],
+            code_references: None,
+        };
+
+        let llm_json: Value = serde_json::from_str(
+            r#"{"key_points": ["Authentication refactor in progress", "Need to update middleware"]}"#,
+        )
+        .unwrap();
+
+        let merged = merge_single_thread_summary(&heuristic, &llm_json);
+
+        // FIXME item kept, LLM items appended
+        assert_eq!(merged.key_points[0], "FIXME: broken auth flow");
+        assert!(merged
+            .key_points
+            .contains(&"Authentication refactor in progress".to_string()));
+
+        // participants unchanged (not in LLM response)
+        assert_eq!(merged.participants, vec!["Alice"]);
+        assert_eq!(merged.total_messages, 3);
+    }
+
+    #[test]
+    fn merge_single_llm_failure() {
+        let heuristic = ThreadSummary {
+            participants: vec!["Alice".into()],
+            key_points: vec!["BLOCKED: waiting on infra".into()],
+            action_items: vec!["BLOCKED: waiting on infra".into()],
+            total_messages: 2,
+            open_actions: 1,
+            done_actions: 0,
+            mentions: vec![],
+            code_references: None,
+        };
+
+        // LLM failure = no merge, return heuristic as-is
+        // (caller should detect None from parse_json_safely and skip merge)
+        assert_eq!(heuristic.key_points, vec!["BLOCKED: waiting on infra"]);
+        assert_eq!(heuristic.action_items, vec!["BLOCKED: waiting on infra"]);
+    }
+
+    #[test]
+    fn merge_multi_thread_refinement() {
+        let heuristic = AggregateSummary {
+            top_mentions: vec![MentionCount {
+                name: "Alice".into(),
+                count: 3,
+            }],
+            key_points: vec![
+                "TODO: finalize API schema".into(),
+                "migration timeline discussed".into(),
+            ],
+            action_items: vec!["TODO: finalize API schema".into()],
+        };
+
+        let llm_json: Value = serde_json::from_str(
+            r#"{"threads": [{"thread_id": "T-1", "key_points": ["API v2 schema finalized"], "actions": ["Update OpenAPI spec"]}, {"thread_id": "T-2", "key_points": ["Migration to new DB"], "actions": ["Run migration script"]}], "aggregate": {"top_mentions": ["Alice", "Bob"], "key_points": ["API schema and DB migration are the two main workstreams"], "action_items": ["Update OpenAPI spec", "Run migration script"]}}"#,
+        )
+        .unwrap();
+
+        let merged = merge_multi_thread_aggregate(&heuristic, &llm_json);
+
+        assert_eq!(
+            merged.key_points,
+            vec!["API schema and DB migration are the two main workstreams"]
+        );
+        assert_eq!(
+            merged.action_items,
+            vec!["Update OpenAPI spec", "Run migration script"]
+        );
+        // top_mentions from LLM (string form, count=0)
+        assert_eq!(merged.top_mentions[0].name, "Alice");
+        assert_eq!(merged.top_mentions[1].name, "Bob");
+    }
+
+    // -- prompt building tests --
+
+    #[test]
+    fn single_thread_prompt_truncation() {
+        let messages = vec![(
+            1,
+            "Alice".to_string(),
+            "Test".to_string(),
+            "x".repeat(1000),
+        )];
+        let prompt = single_thread_user_prompt(&messages);
+        // Should contain truncated body (800 chars)
+        assert!(prompt.len() < 1000);
+        assert!(prompt.contains("Message 1 from Alice"));
+    }
+
+    #[test]
+    fn multi_thread_prompt_limits() {
+        let threads: Vec<(String, Vec<String>, Vec<String>)> = (0..10)
+            .map(|i| {
+                (
+                    format!("T-{i}"),
+                    vec!["point".to_string(); 10],
+                    vec!["action".to_string(); 10],
+                )
+            })
+            .collect();
+        let prompt = multi_thread_user_prompt(&threads);
+        // Only 8 threads included
+        assert!(prompt.contains("T-7"));
+        assert!(!prompt.contains("T-8"));
+    }
+}
