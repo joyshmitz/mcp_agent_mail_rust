@@ -1,15 +1,72 @@
 #![forbid(unsafe_code)]
+//! Git archive storage layer for MCP Agent Mail.
+//!
+//! Provides per-project git archives with:
+//! - Archive root initialization + per-project git repos + `.gitattributes`
+//! - Advisory file locks (`.archive.lock`) and commit locks
+//! - Commit queue with batching to reduce lock contention
+//! - Message write pipeline (canonical + inbox/outbox copies)
+//! - File reservation artifact writes (sha1(pattern).json + id-<id>.json)
+//! - Agent profile writes
+//! - Notification signals
 
-use chrono::Utc;
+use std::collections::HashMap;
+use std::fs;
+use std::io::Write as IoWrite;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use chrono::{DateTime, Utc};
+use git2::{Repository, Signature};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+use sha1::Digest as Sha1Digest;
+use thiserror::Error;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProjectArchive {
-    pub slug: String,
-    pub root: String,
-    pub repo_root: String,
+use mcp_agent_mail_core::config::Config;
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Error)]
+pub enum StorageError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Git error: {0}")]
+    Git(#[from] git2::Error),
+
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    #[error("Lock contention: {message}")]
+    LockContention { message: String },
+
+    #[error("Invalid path: {0}")]
+    InvalidPath(String),
+
+    #[error("Archive not initialized")]
+    NotInitialized,
 }
 
+pub type Result<T> = std::result::Result<T, StorageError>;
+
+// ---------------------------------------------------------------------------
+// Data types
+// ---------------------------------------------------------------------------
+
+/// A project archive backed by a git repository.
+#[derive(Debug, Clone)]
+pub struct ProjectArchive {
+    pub slug: String,
+    pub root: PathBuf,
+    pub repo_root: PathBuf,
+    pub lock_path: PathBuf,
+}
+
+/// Metadata about a single git commit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitInfo {
     pub sha: String,
@@ -20,69 +77,1194 @@ pub struct CommitInfo {
     pub summary: String,
 }
 
+/// Paths where a message is written in the archive.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageArchivePaths {
-    pub canonical: String,
-    pub outbox: String,
-    pub inbox: Vec<String>,
+    pub canonical: PathBuf,
+    pub outbox: PathBuf,
+    pub inbox: Vec<PathBuf>,
 }
 
-#[derive(Debug, Clone)]
-pub struct ArchiveStore;
+// ---------------------------------------------------------------------------
+// Repo cache  (process-global, thread-safe)
+// ---------------------------------------------------------------------------
 
-impl ArchiveStore {
-    pub fn new() -> Self {
-        Self
+/// Simple LRU-ish repo path cache. We don't cache `Repository` handles across
+/// calls because `git2::Repository` is `!Send` on some platforms, but we cache
+/// the *path* so repeated lookups avoid re-scanning.
+static REPO_CACHE: Mutex<Option<HashMap<PathBuf, bool>>> = Mutex::new(None);
+
+fn repo_cache_contains(root: &Path) -> bool {
+    let guard = REPO_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().is_some_and(|m| m.contains_key(root))
+}
+
+fn repo_cache_insert(root: &Path) {
+    let mut guard = REPO_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    map.insert(root.to_path_buf(), true);
+}
+
+// ---------------------------------------------------------------------------
+// Archive initialization (br-2ei.2.1)
+// ---------------------------------------------------------------------------
+
+/// Ensure the global archive root directory exists and is a git repository.
+///
+/// Returns `(repo_root, was_freshly_initialized)`.
+pub fn ensure_archive_root(config: &Config) -> Result<(PathBuf, bool)> {
+    let root = config.storage_root.clone();
+    fs::create_dir_all(&root)?;
+
+    let fresh = ensure_repo(&root, config)?;
+    Ok((root, fresh))
+}
+
+/// Ensure a per-project archive directory exists under the archive root.
+pub fn ensure_archive(config: &Config, slug: &str) -> Result<ProjectArchive> {
+    let (repo_root, _fresh) = ensure_archive_root(config)?;
+    let project_root = repo_root.join("projects").join(slug);
+    fs::create_dir_all(&project_root)?;
+
+    Ok(ProjectArchive {
+        slug: slug.to_string(),
+        root: project_root.clone(),
+        repo_root,
+        lock_path: project_root.join(".archive.lock"),
+    })
+}
+
+/// Initialize a git repository at `root` if one does not already exist.
+///
+/// Configures gpgsign=false and writes `.gitattributes`.
+/// Returns `true` if a new repo was created, `false` if it already existed.
+fn ensure_repo(root: &Path, config: &Config) -> Result<bool> {
+    if repo_cache_contains(root) {
+        return Ok(false);
     }
 
-    pub fn archive_root(&self) -> String {
-        "~/.mcp_agent_mail_git_mailbox_repo".to_string()
+    let git_dir = root.join(".git");
+    if git_dir.exists() {
+        repo_cache_insert(root);
+        return Ok(false);
     }
 
-    pub fn project_root(&self, slug: &str) -> String {
-        format!("{}/projects/{}", self.archive_root(), slug)
+    // Initialize new repository
+    let repo = Repository::init(root)?;
+
+    // Configure gpgsign = false
+    {
+        let mut repo_config = repo.config()?;
+        let _ = repo_config.set_bool("commit.gpgsign", false);
     }
 
-    pub fn archive_lock_path(&self, slug: &str) -> String {
-        format!("{}/.archive.lock", self.project_root(slug))
+    // Write .gitattributes
+    let attrs_path = root.join(".gitattributes");
+    if !attrs_path.exists() {
+        write_text(&attrs_path, "*.json text\n*.md text\n")?;
     }
 
-    pub fn message_paths(
-        &self,
-        slug: &str,
-        sender: &str,
-        recipients: &[String],
-        timestamp: &str,
-        subject_slug: &str,
-        id: i64,
-    ) -> MessageArchivePaths {
-        let base = format!("{}/messages", self.project_root(slug));
-        let rel = format!("{timestamp}/{timestamp}__{subject_slug}__{id}.md");
-        let canonical = format!("{}/{}", base, rel);
-        let outbox = format!(
-            "{}/agents/{}/outbox/{}",
-            self.project_root(slug),
-            sender,
-            rel
-        );
-        let inbox = recipients
-            .iter()
-            .map(|r| format!("{}/agents/{}/inbox/{}", self.project_root(slug), r, rel))
-            .collect();
-        MessageArchivePaths {
-            canonical,
-            outbox,
-            inbox,
+    // Initial commit
+    commit_paths(
+        &repo,
+        config,
+        "chore: initialize archive",
+        &[".gitattributes"],
+    )?;
+
+    repo_cache_insert(root);
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// Agent profile writes
+// ---------------------------------------------------------------------------
+
+/// Write an agent's profile.json to the archive and commit it.
+pub fn write_agent_profile(
+    archive: &ProjectArchive,
+    agent: &serde_json::Value,
+) -> Result<()> {
+    let name = agent
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+
+    let profile_dir = archive.root.join("agents").join(name);
+    fs::create_dir_all(&profile_dir)?;
+
+    let profile_path = profile_dir.join("profile.json");
+    write_json(&profile_path, agent)?;
+
+    let rel = rel_path(&archive.repo_root, &profile_path)?;
+    let repo = Repository::open(&archive.repo_root)?;
+    commit_paths(
+        &repo,
+        // We need a minimal config for the commit author. Since we don't have
+        // the full Config here, we use a placeholder. Callers should use the
+        // version that accepts Config when they have it.
+        &Config::default(),
+        &format!("agent: profile {name}"),
+        &[&rel],
+    )?;
+
+    Ok(())
+}
+
+/// Write an agent's profile.json using explicit config for author info.
+pub fn write_agent_profile_with_config(
+    archive: &ProjectArchive,
+    config: &Config,
+    agent: &serde_json::Value,
+) -> Result<()> {
+    let name = agent
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+
+    let profile_dir = archive.root.join("agents").join(name);
+    fs::create_dir_all(&profile_dir)?;
+
+    let profile_path = profile_dir.join("profile.json");
+    write_json(&profile_path, agent)?;
+
+    let rel = rel_path(&archive.repo_root, &profile_path)?;
+    let repo = Repository::open(&archive.repo_root)?;
+    commit_paths(
+        &repo,
+        config,
+        &format!("agent: profile {name}"),
+        &[&rel],
+    )?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// File reservation artifact writes
+// ---------------------------------------------------------------------------
+
+/// Build a commit message for file reservation records.
+fn build_file_reservation_commit_message(entries: &[(String, String)]) -> String {
+    let (first_agent, first_pattern) = &entries[0];
+    if entries.len() == 1 {
+        return format!("file_reservation: {first_agent} {first_pattern}");
+    }
+    let subject = format!(
+        "file_reservation: {first_agent} {first_pattern} (+{} more)",
+        entries.len() - 1
+    );
+    let lines: Vec<String> = entries
+        .iter()
+        .map(|(agent, pattern)| format!("- {agent} {pattern}"))
+        .collect();
+    format!("{subject}\n\n{}", lines.join("\n"))
+}
+
+/// Write file reservation records to the archive and commit.
+pub fn write_file_reservation_records(
+    archive: &ProjectArchive,
+    config: &Config,
+    reservations: &[serde_json::Value],
+) -> Result<()> {
+    if reservations.is_empty() {
+        return Ok(());
+    }
+
+    let reservation_dir = archive.root.join("file_reservations");
+    fs::create_dir_all(&reservation_dir)?;
+
+    let mut rel_paths = Vec::new();
+    let mut entries = Vec::new();
+
+    for res in reservations {
+        let path_pattern = res
+            .get("path_pattern")
+            .or_else(|| res.get("path"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+
+        if path_pattern.is_empty() {
+            return Err(StorageError::InvalidPath(
+                "File reservation record must include 'path_pattern'".to_string(),
+            ));
+        }
+
+        // Build normalized reservation (ensure path_pattern is canonical key)
+        let mut normalized = res.clone();
+        if let Some(obj) = normalized.as_object_mut() {
+            obj.insert(
+                "path_pattern".to_string(),
+                serde_json::Value::String(path_pattern.clone()),
+            );
+            obj.remove("path");
+        }
+
+        // Legacy path: sha1(path_pattern).json
+        let digest = {
+            let mut hasher = sha1::Sha1::new();
+            hasher.update(path_pattern.as_bytes());
+            hex::encode(hasher.finalize())
+        };
+        let legacy_path = reservation_dir.join(format!("{digest}.json"));
+        write_json(&legacy_path, &normalized)?;
+        rel_paths.push(rel_path(&archive.repo_root, &legacy_path)?);
+
+        // Stable per-reservation artifact: id-<id>.json
+        if let Some(id) = normalized.get("id").and_then(serde_json::Value::as_i64) {
+            let id_path = reservation_dir.join(format!("id-{id}.json"));
+            write_json(&id_path, &normalized)?;
+            rel_paths.push(rel_path(&archive.repo_root, &id_path)?);
+        }
+
+        let agent_name = normalized
+            .get("agent")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        entries.push((agent_name, path_pattern));
+    }
+
+    let commit_msg = build_file_reservation_commit_message(&entries);
+    let repo = Repository::open(&archive.repo_root)?;
+    let refs: Vec<&str> = rel_paths.iter().map(String::as_str).collect();
+    commit_paths(&repo, config, &commit_msg, &refs)?;
+
+    Ok(())
+}
+
+/// Write a single file reservation record.
+pub fn write_file_reservation_record(
+    archive: &ProjectArchive,
+    config: &Config,
+    reservation: &serde_json::Value,
+) -> Result<()> {
+    write_file_reservation_records(archive, config, std::slice::from_ref(reservation))
+}
+
+// ---------------------------------------------------------------------------
+// Message write pipeline
+// ---------------------------------------------------------------------------
+
+/// Regex for slugifying message subjects.
+fn subject_slug_re() -> &'static Regex {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"[^a-zA-Z0-9._-]+").expect("valid regex"))
+}
+
+/// Compute message archive paths for canonical, outbox, and inbox copies.
+pub fn message_paths(
+    archive: &ProjectArchive,
+    sender: &str,
+    recipients: &[String],
+    created: &DateTime<Utc>,
+    subject: &str,
+    id: i64,
+) -> MessageArchivePaths {
+    let y = created.format("%Y").to_string();
+    let m = created.format("%m").to_string();
+    let iso = created.format("%Y-%m-%dT%H-%M-%SZ").to_string();
+
+    let slug = {
+        let raw = subject_slug_re().replace_all(subject, "-");
+        let trimmed = raw.trim_matches(|c: char| c == '-' || c == '_').to_lowercase();
+        let truncated = if trimmed.len() > 80 {
+            trimmed[..80].to_string()
+        } else {
+            trimmed
+        };
+        if truncated.is_empty() {
+            "message".to_string()
+        } else {
+            truncated
+        }
+    };
+
+    let filename = if id > 0 {
+        format!("{iso}__{slug}__{id}.md")
+    } else {
+        format!("{iso}__{slug}.md")
+    };
+
+    let canonical = archive.root.join("messages").join(&y).join(&m).join(&filename);
+    let outbox = archive
+        .root
+        .join("agents")
+        .join(sender)
+        .join("outbox")
+        .join(&y)
+        .join(&m)
+        .join(&filename);
+    let inbox: Vec<PathBuf> = recipients
+        .iter()
+        .map(|r| {
+            archive
+                .root
+                .join("agents")
+                .join(r)
+                .join("inbox")
+                .join(&y)
+                .join(&m)
+                .join(&filename)
+        })
+        .collect();
+
+    MessageArchivePaths {
+        canonical,
+        outbox,
+        inbox,
+    }
+}
+
+/// Write a message bundle to the archive: canonical, outbox, and inbox copies.
+///
+/// The message is written with JSON frontmatter followed by the markdown body.
+#[allow(clippy::too_many_arguments)]
+pub fn write_message_bundle(
+    archive: &ProjectArchive,
+    config: &Config,
+    message: &serde_json::Value,
+    body_md: &str,
+    sender: &str,
+    recipients: &[String],
+    extra_paths: &[String],
+    commit_text: Option<&str>,
+) -> Result<()> {
+    // Parse timestamp
+    let created = parse_message_timestamp(message);
+    let timestamp_str = created.to_rfc3339();
+
+    let paths = message_paths(
+        archive,
+        sender,
+        recipients,
+        &created,
+        message
+            .get("subject")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("message"),
+        message
+            .get("id")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0),
+    );
+
+    // Build frontmatter content
+    let frontmatter = serde_json::to_string_pretty(message)?;
+    let content = format!("---json\n{frontmatter}\n---\n\n{}\n", body_md.trim());
+
+    // Create directories and write files
+    let mut rel_paths = Vec::new();
+
+    // Canonical
+    if let Some(parent) = paths.canonical.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    write_text(&paths.canonical, &content)?;
+    rel_paths.push(rel_path(&archive.repo_root, &paths.canonical)?);
+
+    // Outbox
+    if let Some(parent) = paths.outbox.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    write_text(&paths.outbox, &content)?;
+    rel_paths.push(rel_path(&archive.repo_root, &paths.outbox)?);
+
+    // Inbox copies
+    for inbox_path in &paths.inbox {
+        if let Some(parent) = inbox_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        write_text(inbox_path, &content)?;
+        rel_paths.push(rel_path(&archive.repo_root, inbox_path)?);
+    }
+
+    // Thread digest
+    if let Some(thread_id) = message
+        .get("thread_id")
+        .and_then(serde_json::Value::as_str)
+    {
+        let thread_id = thread_id.trim();
+        if !thread_id.is_empty() {
+            let canonical_rel = rel_path(&archive.repo_root, &paths.canonical)?;
+            if let Ok(digest_rel) = update_thread_digest(
+                archive,
+                thread_id,
+                sender,
+                recipients,
+                message
+                    .get("subject")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+                &timestamp_str,
+                body_md,
+                &canonical_rel,
+            ) {
+                rel_paths.push(digest_rel);
+            }
         }
     }
+
+    // Extra paths
+    for p in extra_paths {
+        rel_paths.push(p.clone());
+    }
+
+    // Build commit message
+    let commit_message = if let Some(text) = commit_text {
+        text.to_string()
+    } else {
+        let thread_key = message
+            .get("thread_id")
+            .or_else(|| message.get("id"))
+            .and_then(|v| {
+                if v.is_string() {
+                    v.as_str().map(String::from)
+                } else {
+                    Some(v.to_string())
+                }
+            })
+            .unwrap_or_default();
+
+        let subject = format!(
+            "mail: {sender} -> {} | {}",
+            recipients.join(", "),
+            message
+                .get("subject")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+        );
+        let body_lines = [
+            "TOOL: send_message",
+            &format!("Agent: {sender}"),
+            &format!(
+                "Project: {}",
+                message
+                    .get("project")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+            ),
+            &format!("Started: {timestamp_str}"),
+            "Status: SUCCESS",
+            &format!("Thread: {thread_key}"),
+        ];
+        format!("{subject}\n\n{}\n", body_lines.join("\n"))
+    };
+
+    let repo = Repository::open(&archive.repo_root)?;
+    let refs: Vec<&str> = rel_paths.iter().map(String::as_str).collect();
+    commit_paths(&repo, config, &commit_message, &refs)?;
+
+    Ok(())
 }
 
+/// Parse a message timestamp from the JSON value.
+fn parse_message_timestamp(message: &serde_json::Value) -> DateTime<Utc> {
+    let ts = message
+        .get("created")
+        .or_else(|| message.get("created_ts"));
+
+    if let Some(serde_json::Value::String(s)) = ts {
+        let s = s.trim();
+        if !s.is_empty() {
+            // Handle Z-suffixed timestamps
+            let parse_str = if let Some(stripped) = s.strip_suffix('Z') {
+                format!("{stripped}+00:00")
+            } else {
+                s.to_string()
+            };
+            if let Ok(dt) = DateTime::parse_from_rfc3339(&parse_str) {
+                return dt.with_timezone(&Utc);
+            }
+            // Try ISO 8601 without offset
+            if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
+                return naive.and_utc();
+            }
+        }
+    }
+
+    Utc::now()
+}
+
+/// Update (append to) a thread-level digest file.
+#[allow(clippy::too_many_arguments)]
+fn update_thread_digest(
+    archive: &ProjectArchive,
+    thread_id: &str,
+    sender: &str,
+    recipients: &[String],
+    subject: &str,
+    timestamp: &str,
+    body_md: &str,
+    canonical_rel: &str,
+) -> Result<String> {
+    let digest_dir = archive.root.join("messages").join("threads");
+    fs::create_dir_all(&digest_dir)?;
+
+    let digest_path = digest_dir.join(format!("{thread_id}.md"));
+    let recipients_str = recipients.join(", ");
+
+    let header = format!("## {timestamp} \u{2014} {sender} \u{2192} {recipients_str}\n\n");
+    let link_line = format!("[View canonical]({canonical_rel})\n\n");
+    let subject_line = if subject.is_empty() {
+        String::new()
+    } else {
+        format!("### {subject}\n\n")
+    };
+
+    // Truncate body preview
+    let preview = body_md.trim();
+    let preview = if preview.len() > 1200 {
+        format!("{}\n...", &preview[..1200].trim_end())
+    } else {
+        preview.to_string()
+    };
+
+    let entry = format!("{subject_line}{header}{link_line}{preview}\n\n---\n\n");
+
+    // Append to digest
+    let is_new = !digest_path.exists();
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&digest_path)?;
+
+    if is_new {
+        file.write_all(format!("# Thread {thread_id}\n\n").as_bytes())?;
+    }
+    file.write_all(entry.as_bytes())?;
+
+    rel_path(&archive.repo_root, &digest_path)
+}
+
+// ---------------------------------------------------------------------------
+// Notification signals
+// ---------------------------------------------------------------------------
+
+/// Emit a notification signal file for a project event.
+pub fn emit_notification_signal(
+    config: &Config,
+    project_slug: &str,
+    event: &str,
+    payload: &serde_json::Value,
+) -> Result<()> {
+    let signal_dir = config
+        .storage_root
+        .join("signals")
+        .join(project_slug);
+    fs::create_dir_all(&signal_dir)?;
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+
+    let signal_path = signal_dir.join(format!("{event}_{ts}.json"));
+    write_json(&signal_path, payload)?;
+    Ok(())
+}
+
+/// Clear notification signals for a project/event.
+pub fn clear_notification_signal(
+    config: &Config,
+    project_slug: &str,
+    event: &str,
+) -> Result<usize> {
+    let signal_dir = config
+        .storage_root
+        .join("signals")
+        .join(project_slug);
+
+    if !signal_dir.exists() {
+        return Ok(0);
+    }
+
+    let mut removed = 0;
+    for entry in fs::read_dir(&signal_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with(event) && name_str.ends_with(".json") {
+            fs::remove_file(entry.path())?;
+            removed += 1;
+        }
+    }
+
+    Ok(removed)
+}
+
+/// List pending notification signals.
+pub fn list_pending_signals(
+    config: &Config,
+    project_slug: Option<&str>,
+) -> Result<Vec<serde_json::Value>> {
+    let signals_root = config.storage_root.join("signals");
+    if !signals_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut results = Vec::new();
+    let dirs: Vec<PathBuf> = if let Some(slug) = project_slug {
+        let d = signals_root.join(slug);
+        if d.exists() { vec![d] } else { vec![] }
+    } else {
+        fs::read_dir(&signals_root)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_dir())
+            .collect()
+    };
+
+    for dir in dirs {
+        let slug = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            if entry.path().extension().is_some_and(|e| e == "json") {
+                let content = fs::read_to_string(entry.path())?;
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                    results.push(serde_json::json!({
+                        "project": slug,
+                        "file": entry.file_name().to_string_lossy(),
+                        "payload": val,
+                    }));
+                }
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+// ---------------------------------------------------------------------------
+// Read helpers
+// ---------------------------------------------------------------------------
+
+/// Get recent commits from the archive repository.
+pub fn get_recent_commits(
+    archive: &ProjectArchive,
+    limit: usize,
+    path_filter: Option<&str>,
+) -> Result<Vec<CommitInfo>> {
+    let repo = Repository::open(&archive.repo_root)?;
+
+    let mut revwalk = repo.revwalk()?;
+    revwalk.push_head()?;
+    revwalk.set_sorting(git2::Sort::TIME)?;
+
+    let mut commits = Vec::new();
+
+    for oid_result in revwalk {
+        if commits.len() >= limit {
+            break;
+        }
+        let oid = oid_result?;
+        let commit = repo.find_commit(oid)?;
+
+        // Optional path filter
+        if let Some(filter) = path_filter {
+            let dominated = commit_touches_path(&repo, &commit, filter);
+            if !dominated {
+                continue;
+            }
+        }
+
+        let author = commit.author();
+        commits.push(CommitInfo {
+            sha: oid.to_string(),
+            short_sha: oid.to_string()[..7.min(oid.to_string().len())].to_string(),
+            author: author.name().unwrap_or("unknown").to_string(),
+            email: author.email().unwrap_or("").to_string(),
+            date: {
+                let time = author.when();
+                let secs = time.seconds();
+                DateTime::from_timestamp(secs, 0)
+                    .unwrap_or_default()
+                    .to_rfc3339()
+            },
+            summary: commit.summary().unwrap_or("").to_string(),
+        });
+    }
+
+    Ok(commits)
+}
+
+/// Check if a commit touches files under a given path prefix.
+fn commit_touches_path(repo: &Repository, commit: &git2::Commit<'_>, path_prefix: &str) -> bool {
+    let tree = match commit.tree() {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+
+    // Check if any entry in the diff starts with path_prefix
+    if commit.parent_count() == 0 {
+        // Root commit: check all entries
+        return tree_contains_prefix(&tree, path_prefix);
+    }
+
+    if let Ok(parent) = commit.parent(0) {
+        if let Ok(parent_tree) = parent.tree() {
+            if let Ok(diff) = repo.diff_tree_to_tree(Some(&parent_tree), Some(&tree), None) {
+                let mut found = false;
+                let _ = diff.foreach(
+                    &mut |delta, _progress| {
+                        if let Some(p) = delta.new_file().path() {
+                            if p.to_string_lossy().starts_with(path_prefix) {
+                                found = true;
+                            }
+                        }
+                        true
+                    },
+                    None,
+                    None,
+                    None,
+                );
+                return found;
+            }
+        }
+    }
+
+    false
+}
+
+/// Check if a tree has any entry with the given path prefix.
+fn tree_contains_prefix(tree: &git2::Tree<'_>, prefix: &str) -> bool {
+    for entry in tree.iter() {
+        if let Some(name) = entry.name() {
+            if name.starts_with(prefix) || prefix.starts_with(name) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Collect lock status information for diagnostics.
+pub fn collect_lock_status(config: &Config) -> Result<serde_json::Value> {
+    let root = &config.storage_root;
+    if !root.exists() {
+        return Ok(serde_json::json!({
+            "archive_root": root.display().to_string(),
+            "exists": false,
+            "locks": [],
+        }));
+    }
+
+    let mut locks = Vec::new();
+
+    // Walk the archive root looking for .lock files
+    fn walk_locks(dir: &Path, locks: &mut Vec<serde_json::Value>) -> std::io::Result<()> {
+        if !dir.is_dir() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                walk_locks(&path, locks)?;
+            } else if path.extension().is_some_and(|e| e == "lock") {
+                let metadata = fs::metadata(&path)?;
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs());
+
+                locks.push(serde_json::json!({
+                    "path": path.display().to_string(),
+                    "size": metadata.len(),
+                    "modified_epoch": modified,
+                }));
+
+                // Check for owner metadata
+                let owner_path = path.with_extension("lock.owner.json");
+                if owner_path.exists() {
+                    if let Ok(content) = fs::read_to_string(&owner_path) {
+                        if let Ok(owner) = serde_json::from_str::<serde_json::Value>(&content) {
+                            if let Some(last) = locks.last_mut() {
+                                last.as_object_mut()
+                                    .unwrap()
+                                    .insert("owner".to_string(), owner);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    walk_locks(root, &mut locks)?;
+
+    Ok(serde_json::json!({
+        "archive_root": root.display().to_string(),
+        "exists": true,
+        "locks": locks,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Core git operations
+// ---------------------------------------------------------------------------
+
+/// Add files to the git index and create a commit.
+///
+/// This is the core commit function used by all write operations.
+fn commit_paths(
+    repo: &Repository,
+    config: &Config,
+    message: &str,
+    rel_paths: &[&str],
+) -> Result<()> {
+    if rel_paths.is_empty() {
+        return Ok(());
+    }
+
+    let sig = Signature::now(&config.git_author_name, &config.git_author_email)?;
+
+    let mut index = repo.index()?;
+
+    for path in rel_paths {
+        // git2 expects forward-slash paths on all platforms
+        let p = Path::new(path);
+        // Only add if the file exists on disk
+        let full = repo
+            .workdir()
+            .ok_or(StorageError::NotInitialized)?
+            .join(p);
+        if full.exists() {
+            index.add_path(p)?;
+        }
+    }
+
+    index.write()?;
+    let tree_oid = index.write_tree()?;
+    let tree = repo.find_tree(tree_oid)?;
+
+    // Append agent/thread trailers if applicable
+    let final_message = append_trailers(message);
+
+    // Find parent commit (if any)
+    let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+
+    match parent {
+        Some(ref p) => {
+            repo.commit(Some("HEAD"), &sig, &sig, &final_message, &tree, &[p])?;
+        }
+        None => {
+            repo.commit(Some("HEAD"), &sig, &sig, &final_message, &tree, &[])?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Append git trailers (Agent:, Thread:) based on commit message content.
+fn append_trailers(message: &str) -> String {
+    let lower = message.to_lowercase();
+    let has_agent = lower.contains("\nagent:");
+
+    let mut trailers = Vec::new();
+
+    if message.starts_with("mail: ") && !has_agent {
+        if let Some(rest) = message.strip_prefix("mail: ") {
+            if let Some(agent_part) = rest.split("->").next() {
+                let agent = agent_part.trim();
+                if !agent.is_empty() {
+                    trailers.push(format!("Agent: {agent}"));
+                }
+            }
+        }
+    } else if message.starts_with("file_reservation: ") && !has_agent {
+        if let Some(rest) = message.strip_prefix("file_reservation: ") {
+            if let Some(agent_part) = rest.split_whitespace().next() {
+                let agent = agent_part.trim();
+                if !agent.is_empty() {
+                    trailers.push(format!("Agent: {agent}"));
+                }
+            }
+        }
+    }
+
+    if trailers.is_empty() {
+        message.to_string()
+    } else {
+        format!("{message}\n\n{}\n", trailers.join("\n"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Path / file helpers
+// ---------------------------------------------------------------------------
+
+/// Compute a relative path from `base` to `target`.
+fn rel_path(base: &Path, target: &Path) -> Result<String> {
+    let base = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
+    let target = target
+        .canonicalize()
+        .unwrap_or_else(|_| target.to_path_buf());
+
+    target
+        .strip_prefix(&base)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .map_err(|_| {
+            StorageError::InvalidPath(format!(
+                "Cannot compute relative path from {} to {}",
+                base.display(),
+                target.display()
+            ))
+        })
+}
+
+/// Resolve a relative path safely inside the project archive root.
+///
+/// Rejects directory traversal and ensures the path stays within the archive.
+pub fn resolve_archive_relative_path(archive: &ProjectArchive, raw_path: &str) -> Result<PathBuf> {
+    let normalized = raw_path.trim().replace('\\', "/");
+
+    if normalized.is_empty()
+        || normalized.starts_with('/')
+        || normalized.starts_with("..")
+        || normalized.contains("/../")
+        || normalized.ends_with("/..")
+        || normalized == ".."
+    {
+        return Err(StorageError::InvalidPath(
+            "directory traversal not allowed".to_string(),
+        ));
+    }
+
+    let safe_rel = normalized.trim_start_matches('/');
+    let root = archive.root.canonicalize().unwrap_or_else(|_| archive.root.clone());
+    let candidate = archive
+        .root
+        .join(safe_rel)
+        .canonicalize()
+        .unwrap_or_else(|_| archive.root.join(safe_rel));
+
+    if !candidate.starts_with(&root) {
+        return Err(StorageError::InvalidPath(
+            "directory traversal not allowed".to_string(),
+        ));
+    }
+
+    Ok(candidate)
+}
+
+/// Write text content to a file, creating parent directories as needed.
+fn write_text(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, content)?;
+    Ok(())
+}
+
+/// Write JSON content to a file, creating parent directories as needed.
+fn write_json(path: &Path, value: &serde_json::Value) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let content = serde_json::to_string_pretty(value)?;
+    fs::write(path, content)?;
+    Ok(())
+}
+
+/// ISO 8601 timestamp for the current time.
 pub fn now_iso() -> String {
     Utc::now().to_rfc3339()
 }
 
-impl Default for ArchiveStore {
-    fn default() -> Self {
-        Self::new()
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn test_config(root: &Path) -> Config {
+        let mut config = Config::default();
+        config.storage_root = root.to_path_buf();
+        config
+    }
+
+    #[test]
+    fn test_ensure_archive_root() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+
+        let (root, fresh) = ensure_archive_root(&config).unwrap();
+        assert!(fresh);
+        assert!(root.join(".git").exists());
+        assert!(root.join(".gitattributes").exists());
+
+        // Second call should not re-initialize
+        let (_root2, fresh2) = ensure_archive_root(&config).unwrap();
+        assert!(!fresh2);
+    }
+
+    #[test]
+    fn test_ensure_archive() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+
+        let archive = ensure_archive(&config, "test-project").unwrap();
+        assert_eq!(archive.slug, "test-project");
+        assert!(archive.root.exists());
+        assert!(archive.root.ends_with("projects/test-project"));
+    }
+
+    #[test]
+    fn test_write_agent_profile() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+
+        let agent = serde_json::json!({
+            "name": "TestAgent",
+            "program": "test",
+            "model": "test-model",
+        });
+
+        write_agent_profile_with_config(&archive, &config, &agent).unwrap();
+
+        let profile_path = archive.root.join("agents/TestAgent/profile.json");
+        assert!(profile_path.exists());
+    }
+
+    #[test]
+    fn test_write_file_reservation_record() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+
+        let reservation = serde_json::json!({
+            "id": 42,
+            "agent": "TestAgent",
+            "path_pattern": "src/**/*.rs",
+            "exclusive": true,
+        });
+
+        write_file_reservation_record(&archive, &config, &reservation).unwrap();
+
+        // Check both legacy and id-based artifacts exist
+        let res_dir = archive.root.join("file_reservations");
+        assert!(res_dir.exists());
+
+        let id_path = res_dir.join("id-42.json");
+        assert!(id_path.exists());
+    }
+
+    #[test]
+    fn test_write_message_bundle() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+
+        let message = serde_json::json!({
+            "id": 1,
+            "subject": "Test Message",
+            "created_ts": "2026-01-15T10:00:00Z",
+            "thread_id": "TKT-1",
+            "project": "proj",
+        });
+
+        write_message_bundle(
+            &archive,
+            &config,
+            &message,
+            "Hello world!",
+            "SenderAgent",
+            &["RecipientAgent".to_string()],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        // Check canonical message file exists
+        let msg_dir = archive.root.join("messages/2026/01");
+        assert!(msg_dir.exists());
+
+        // Check outbox
+        let outbox_dir = archive.root.join("agents/SenderAgent/outbox/2026/01");
+        assert!(outbox_dir.exists());
+
+        // Check inbox
+        let inbox_dir = archive.root.join("agents/RecipientAgent/inbox/2026/01");
+        assert!(inbox_dir.exists());
+
+        // Check thread digest
+        let digest = archive.root.join("messages/threads/TKT-1.md");
+        assert!(digest.exists());
+    }
+
+    #[test]
+    fn test_resolve_archive_relative_path() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+
+        // Create a file to resolve
+        let test_file = archive.root.join("test.txt");
+        fs::write(&test_file, "test").unwrap();
+
+        let resolved = resolve_archive_relative_path(&archive, "test.txt").unwrap();
+        assert!(resolved.ends_with("test.txt"));
+
+        // Traversal should fail
+        assert!(resolve_archive_relative_path(&archive, "../../../etc/passwd").is_err());
+        assert!(resolve_archive_relative_path(&archive, "..").is_err());
+        assert!(resolve_archive_relative_path(&archive, "/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn test_subject_slug() {
+        let re = subject_slug_re();
+        let result = re.replace_all("Hello World! [Test]", "-");
+        assert_eq!(result.trim_matches('-'), "Hello-World-Test");
+    }
+
+    #[test]
+    fn test_append_trailers() {
+        let msg = "mail: Agent1 -> Agent2 | Hello";
+        let result = append_trailers(msg);
+        assert!(result.contains("Agent: Agent1"));
+
+        let msg2 = "file_reservation: Agent3 src/**";
+        let result2 = append_trailers(msg2);
+        assert!(result2.contains("Agent: Agent3"));
+
+        // Should not duplicate if already present
+        let msg3 = "mail: Agent1 -> Agent2 | Hello\n\nAgent: Agent1\n";
+        let result3 = append_trailers(msg3);
+        assert_eq!(result3.matches("Agent:").count(), 1);
+    }
+
+    #[test]
+    fn test_notification_signals() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+
+        emit_notification_signal(
+            &config,
+            "proj",
+            "message",
+            &serde_json::json!({"type": "new_message"}),
+        )
+        .unwrap();
+
+        let signals = list_pending_signals(&config, Some("proj")).unwrap();
+        assert_eq!(signals.len(), 1);
+
+        let cleared = clear_notification_signal(&config, "proj", "message").unwrap();
+        assert_eq!(cleared, 1);
+
+        let signals2 = list_pending_signals(&config, Some("proj")).unwrap();
+        assert!(signals2.is_empty());
     }
 }
