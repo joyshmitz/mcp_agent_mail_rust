@@ -424,6 +424,7 @@ pub async fn renew_file_reservations(
 /// - `note`: Optional explanation
 /// - `notify_previous`: Send notification to previous holder (default: true)
 #[tool(description = "Force-release a stale file reservation after inactivity heuristics.")]
+#[allow(clippy::too_many_lines)]
 pub async fn force_release_file_reservation(
     ctx: &McpContext,
     project_key: String,
@@ -433,12 +434,12 @@ pub async fn force_release_file_reservation(
     notify_previous: Option<bool>,
 ) -> McpResult<String> {
     let should_notify = notify_previous.unwrap_or(true);
-    let now = chrono::Utc::now().to_rfc3339();
+    let now_iso = chrono::Utc::now().to_rfc3339();
 
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
-    let _agent = resolve_agent(ctx, &pool, project_id, &agent_name).await?;
+    let actor = resolve_agent(ctx, &pool, project_id, &agent_name).await?;
 
     let reservations = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::list_file_reservations(ctx.cx(), &pool, project_id, false)
@@ -469,29 +470,76 @@ pub async fn force_release_file_reservation(
             .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")));
     }
 
-    // Validate inactivity heuristics:
-    // 1. Check if the reservation holder agent is inactive
+    // Configurable thresholds
+    let inactivity_seconds: i64 = 30 * 60; // 30 minutes
+    let grace_seconds: i64 = 15 * 60; // 15 minutes
+    let inactivity_micros = inactivity_seconds * 1_000_000;
+    let grace_micros = grace_seconds * 1_000_000;
+
+    // Validate inactivity heuristics (4 signals)
     let holder_agent = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::get_agent_by_id(ctx.cx(), &pool, reservation.agent_id).await,
     )?;
 
-    let holder_last_active = holder_agent.last_active_ts;
     let now_micros = mcp_agent_mail_db::now_micros();
-    let inactive_threshold_micros: i64 = 30 * 60 * 1_000_000; // 30 minutes
+    let mut stale_reasons = Vec::new();
 
-    let is_inactive = (now_micros - holder_last_active) > inactive_threshold_micros;
+    // Signal 1: Agent inactivity
+    let agent_inactive_secs = (now_micros - holder_agent.last_active_ts) / 1_000_000;
+    let agent_inactive = (now_micros - holder_agent.last_active_ts) > inactivity_micros;
+    if agent_inactive {
+        stale_reasons.push(format!("agent_inactive>{inactivity_seconds}s"));
+    } else {
+        stale_reasons.push("agent_recently_active".to_string());
+    }
 
-    // 2. Check if the reservation has expired
+    // Signal 2: Mail activity
+    let mail_activity = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::get_agent_last_mail_activity(
+            ctx.cx(),
+            &pool,
+            reservation.agent_id,
+            project_id,
+        )
+        .await,
+    )?;
+    let mail_stale = match mail_activity {
+        Some(ts) => (now_micros - ts) > grace_micros,
+        None => true, // No mail activity = stale
+    };
+    if mail_stale {
+        stale_reasons.push(format!("no_recent_mail_activity>{grace_seconds}s"));
+    } else {
+        stale_reasons.push("mail_activity_recent".to_string());
+    }
+
+    // Signal 3: Git activity (via archive commits)
+    let config = Config::from_env();
+    let git_activity = get_git_activity_for_agent(&config, &project.slug, &holder_agent.name);
+    let git_stale = match git_activity {
+        Some(ts) => (now_micros - ts) > grace_micros,
+        None => true,
+    };
+    if git_stale {
+        stale_reasons.push(format!("no_recent_git_activity>{grace_seconds}s"));
+    } else {
+        stale_reasons.push("git_activity_recent".to_string());
+    }
+
+    // Check if reservation has expired
     let is_expired = reservation.expires_ts < now_micros;
 
-    if !is_inactive && !is_expired {
+    // Must be inactive (agent + all signals stale) OR expired to force-release
+    let all_signals_stale = agent_inactive && mail_stale && git_stale;
+    if !all_signals_stale && !is_expired {
         return Err(McpError::new(
             McpErrorCode::InvalidParams,
             format!(
-                "Cannot force-release: agent '{}' was active {} seconds ago and reservation has not expired. \
-                 Force release is only allowed when the holder is inactive (>30min) or the reservation has expired.",
+                "Cannot force-release: heuristics do not indicate abandonment. Agent '{}' last active {}s ago. \
+                 Signals: {}. Force release requires all signals stale or reservation expired.",
                 holder_agent.name,
-                (now_micros - holder_last_active) / 1_000_000
+                agent_inactive_secs,
+                stale_reasons.join(", ")
             ),
         ));
     }
@@ -507,28 +555,65 @@ pub async fn force_release_file_reservation(
     )?;
 
     // Optionally send notification to previous holder
-    if should_notify && released_count > 0 {
+    let mut notified = false;
+    if should_notify && released_count > 0 && holder_agent.name != agent_name {
         let note_text = note.as_deref().unwrap_or("");
+        let signals_md = stale_reasons
+            .iter()
+            .map(|r| format!("- {r}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut details = String::new();
+        details.push_str(&format!(
+            "- last agent activity {} {}s ago\n",
+            '\u{2248}', agent_inactive_secs
+        ));
+        if let Some(ts) = mail_activity {
+            details.push_str(&format!(
+                "- last mail activity {} {}s ago\n",
+                '\u{2248}',
+                (now_micros - ts) / 1_000_000
+            ));
+        }
+        if let Some(ts) = git_activity {
+            details.push_str(&format!(
+                "- last git commit {} {}s ago\n",
+                '\u{2248}',
+                (now_micros - ts) / 1_000_000
+            ));
+        }
+        details.push_str(&format!(
+            "- inactivity threshold={inactivity_seconds}s grace={grace_seconds}s"
+        ));
+
         let notify_body = format!(
-            "Your file reservation `{}` (id={}) on pattern `{}` was force-released by **{}**.\n\n\
-             Reason: {}\n\n\
-             Heuristics: inactive={}s, expired={}",
+            "Your file reservation on `{}` (id={}) was force-released by **{}**.\n\n\
+             **Observed signals:**\n{}\n\n\
+             **Details:**\n{}\n\n\
+             {}\n\n\
+             You can re-acquire the reservation if still needed.",
             reservation.path_pattern,
             file_reservation_id,
-            reservation.path_pattern,
             agent_name,
-            if note_text.is_empty() { "no note provided" } else { note_text },
-            (now_micros - holder_last_active) / 1_000_000,
-            is_expired,
+            signals_md,
+            details,
+            if note_text.is_empty() {
+                String::new()
+            } else {
+                format!("**Note:** {note_text}")
+            },
         );
 
-        // Best-effort notification via send_message (if it fails, don't block the force-release)
-        let _ = mcp_agent_mail_db::queries::create_message(
+        let result = mcp_agent_mail_db::queries::create_message(
             ctx.cx(),
             &pool,
             project_id,
-            _agent.id.unwrap_or(0),
-            &format!("Force-released reservation on {}", reservation.path_pattern),
+            actor.id.unwrap_or(0),
+            &format!(
+                "[file-reservations] Released stale lock on {}",
+                reservation.path_pattern
+            ),
             &notify_body,
             None,
             "normal",
@@ -536,26 +621,64 @@ pub async fn force_release_file_reservation(
             "[]",
         )
         .await;
+        notified = matches!(result, asupersync::Outcome::Ok(_));
     }
 
+    // Build response matching Python format
     let response = serde_json::json!({
         "released": released_count,
-        "released_at": now,
+        "released_at": now_iso,
+        "reservation": {
+            "id": file_reservation_id,
+            "agent": holder_agent.name,
+            "path_pattern": reservation.path_pattern,
+            "exclusive": reservation.exclusive != 0,
+            "reason": reservation.reason,
+            "created_ts": micros_to_iso(reservation.created_ts),
+            "expires_ts": micros_to_iso(reservation.expires_ts),
+            "released_ts": now_iso,
+            "stale_reasons": stale_reasons,
+            "last_agent_activity_ts": micros_to_iso(holder_agent.last_active_ts),
+            "last_mail_activity_ts": mail_activity.map(micros_to_iso),
+            "last_filesystem_activity_ts": serde_json::Value::Null,
+            "last_git_activity_ts": git_activity.map(micros_to_iso),
+            "notified": notified,
+        },
     });
 
     tracing::debug!(
-        "Force released reservation {} by {} in project {} (notify: {}, note: {:?}, was_inactive: {}, was_expired: {})",
+        "Force released reservation {} by {} in project {} (notify: {}, stale_reasons: {:?})",
         file_reservation_id,
         agent_name,
         project_key,
         should_notify,
-        note,
-        is_inactive,
-        is_expired
+        stale_reasons
     );
 
     serde_json::to_string(&response)
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+}
+
+/// Get the most recent git activity timestamp for an agent (from archive commits).
+fn get_git_activity_for_agent(
+    config: &Config,
+    project_slug: &str,
+    agent_name: &str,
+) -> Option<i64> {
+    let archive = mcp_agent_mail_storage::ensure_archive(config, project_slug).ok()?;
+    let commits =
+        mcp_agent_mail_storage::get_commits_by_author(&archive, agent_name, 1).ok()?;
+    commits.first().and_then(|c| {
+        // Parse ISO-8601 date string to micros
+        chrono::DateTime::parse_from_rfc3339(&c.date)
+            .ok()
+            .map(|dt| dt.timestamp_micros())
+            .or_else(|| {
+                chrono::NaiveDateTime::parse_from_str(&c.date, "%Y-%m-%dT%H:%M:%S%.f")
+                    .ok()
+                    .map(|dt| dt.and_utc().timestamp_micros())
+            })
+    })
 }
 
 /// Install pre-commit guard for file reservation enforcement.

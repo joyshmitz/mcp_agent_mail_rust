@@ -1697,6 +1697,112 @@ pub async fn get_product_by_uid(
 }
 
 /// List projects linked to a product.
+/// Force-release a single file reservation by ID regardless of owner.
+///
+/// Returns the number of rows affected (0 if already released or not found).
+pub async fn force_release_reservation(
+    cx: &Cx,
+    pool: &DbPool,
+    reservation_id: i64,
+) -> Outcome<usize, DbError> {
+    let now = now_micros();
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let sql = "UPDATE file_reservations SET released_ts = ? WHERE id = ? AND released_ts IS NULL";
+    let params = [Value::BigInt(now), Value::BigInt(reservation_id)];
+
+    let out = map_sql_outcome(raw_execute(cx, &*conn, sql, &params).await);
+    match out {
+        Outcome::Ok(n) => usize::try_from(n).map_or_else(
+            |_| {
+                Outcome::Err(DbError::invalid(
+                    "row_count",
+                    "row count exceeds usize::MAX",
+                ))
+            },
+            Outcome::Ok,
+        ),
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// Get the most recent mail activity timestamp for an agent.
+///
+/// Checks:
+/// - Messages sent by the agent (created_ts)
+/// - Messages acknowledged by the agent (ack_ts)
+/// - Messages read by the agent (read_ts)
+///
+/// Returns the maximum of all these timestamps, or `None` if no activity found.
+pub async fn get_agent_last_mail_activity(
+    cx: &Cx,
+    pool: &DbPool,
+    agent_id: i64,
+    project_id: i64,
+) -> Outcome<Option<i64>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    // Check messages sent
+    let sql_sent = "SELECT MAX(created_ts) as max_ts FROM messages WHERE sender_id = ? AND project_id = ?";
+    let params = [Value::BigInt(agent_id), Value::BigInt(project_id)];
+    let sent_ts = match map_sql_outcome(raw_query(cx, &*conn, sql_sent, &params).await) {
+        Outcome::Ok(rows) => rows
+            .first()
+            .and_then(|r| r.get(0).and_then(|v| match v {
+                Value::BigInt(n) => Some(*n),
+                Value::Int(n) => Some(i64::from(*n)),
+                _ => None,
+            })),
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    // Check message reads/acks by this agent
+    let sql_read = "SELECT MAX(COALESCE(read_ts, 0)), MAX(COALESCE(ack_ts, 0)) FROM message_recipients WHERE agent_id = ?";
+    let params2 = [Value::BigInt(agent_id)];
+    let (read_ts, ack_ts) = match map_sql_outcome(raw_query(cx, &*conn, sql_read, &params2).await) {
+        Outcome::Ok(rows) => {
+            let row = rows.first();
+            let read = row.and_then(|r| r.get(0).and_then(|v| match v {
+                Value::BigInt(n) if *n > 0 => Some(*n),
+                Value::Int(n) if *n > 0 => Some(i64::from(*n)),
+                _ => None,
+            }));
+            let ack = row.and_then(|r| r.get(1).and_then(|v| match v {
+                Value::BigInt(n) if *n > 0 => Some(*n),
+                Value::Int(n) if *n > 0 => Some(i64::from(*n)),
+                _ => None,
+            }));
+            (read, ack)
+        }
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    // Return the maximum of all timestamps
+    let max_ts = [sent_ts, read_ts, ack_ts]
+        .into_iter()
+        .flatten()
+        .max();
+
+    Outcome::Ok(max_ts)
+}
+
 pub async fn list_product_projects(
     cx: &Cx,
     pool: &DbPool,
