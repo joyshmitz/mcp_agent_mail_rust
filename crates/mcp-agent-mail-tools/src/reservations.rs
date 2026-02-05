@@ -10,8 +10,10 @@
 
 use fastmcp::McpErrorCode;
 use fastmcp::prelude::*;
+use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::micros_to_iso;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 use crate::tool_util::{db_outcome_to_mcp_result, get_db_pool, resolve_agent, resolve_project};
 
@@ -70,12 +72,29 @@ pub struct RenewedReservation {
     pub new_expires_ts: String,
 }
 
-/// Pre-commit guard install result
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GuardInstallResult {
-    pub success: bool,
-    pub hooks_path: String,
-    pub message: String,
+fn expand_tilde(input: &str) -> PathBuf {
+    if input == "~" {
+        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+            return PathBuf::from(home);
+        }
+        return PathBuf::from(input);
+    }
+    if let Some(rest) = input.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(input)
+}
+
+fn normalize_repo_path(input: &str) -> PathBuf {
+    let path = expand_tilde(input);
+    if path.is_absolute() {
+        return path;
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(&path))
+        .unwrap_or(path)
 }
 
 /// Request advisory file reservations on project-relative paths/globs.
@@ -100,14 +119,19 @@ pub async fn file_reservation_paths(
     exclusive: Option<bool>,
     reason: Option<String>,
 ) -> McpResult<String> {
-    let ttl = ttl_seconds.unwrap_or(3600);
-
-    // Validate TTL >= 60 seconds
-    if ttl < 60 {
+    if paths.is_empty() {
         return Err(McpError::new(
             McpErrorCode::InvalidParams,
-            "ttl_seconds must be at least 60 seconds",
+            "paths list cannot be empty. Provide at least one file path or glob pattern to reserve (e.g., ['src/api/*.py', 'config/settings.yaml']).",
         ));
+    }
+
+    let ttl = ttl_seconds.unwrap_or(3600);
+    if ttl < 60 {
+        tracing::info!(
+            "ttl_seconds={} is below recommended minimum (60s); continuing anyway",
+            ttl
+        );
     }
 
     let is_exclusive = exclusive.unwrap_or(true);
@@ -370,8 +394,8 @@ pub async fn renew_file_reservations(
 /// - `note`: Optional explanation
 /// - `notify_previous`: Send notification to previous holder (default: true)
 #[tool(description = "Force-release a stale file reservation after inactivity heuristics.")]
-pub fn force_release_file_reservation(
-    _ctx: &McpContext,
+pub async fn force_release_file_reservation(
+    ctx: &McpContext,
     project_key: String,
     agent_name: String,
     file_reservation_id: i64,
@@ -381,15 +405,49 @@ pub fn force_release_file_reservation(
     let should_notify = notify_previous.unwrap_or(true);
     let now = chrono::Utc::now().to_rfc3339();
 
+    let pool = get_db_pool()?;
+    let project = resolve_project(ctx, &pool, &project_key).await?;
+    let project_id = project.id.unwrap_or(0);
+    let _agent = resolve_agent(ctx, &pool, project_id, &agent_name).await?;
+
+    let reservations = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::list_file_reservations(ctx.cx(), &pool, project_id, false)
+            .await,
+    )?;
+    let reservation = reservations
+        .into_iter()
+        .find(|row| row.id.unwrap_or(0) == file_reservation_id);
+
+    let Some(reservation) = reservation else {
+        return Err(McpError::new(
+            McpErrorCode::InvalidParams,
+            format!(
+                "File reservation id={file_reservation_id} not found for project '{}'.",
+                project.human_key
+            ),
+        ));
+    };
+
     // TODO: Call storage layer to:
     // 1. Validate inactivity heuristics
     // 2. Release the reservation
     // 3. Optionally notify previous holder
 
-    let response = ReleaseResult {
-        released: 1,
-        released_at: now,
-    };
+    let response = reservation.released_ts.map_or_else(
+        || {
+            serde_json::json!({
+                "released": 1,
+                "released_at": now,
+            })
+        },
+        |released_ts| {
+            serde_json::json!({
+                "released": 0,
+                "released_at": micros_to_iso(released_ts),
+                "already_released": true,
+            })
+        },
+    );
 
     tracing::debug!(
         "Force releasing reservation {} by {} in project {} (notify: {}, note: {:?})",
@@ -417,26 +475,26 @@ pub fn install_precommit_guard(
     project_key: String,
     code_repo_path: String,
 ) -> McpResult<String> {
-    // Validate code_repo_path is absolute
-    if !code_repo_path.starts_with('/') {
-        return Err(McpError::new(
-            McpErrorCode::InvalidParams,
-            "code_repo_path must be an absolute path",
-        ));
+    let config = Config::from_env();
+    if !config.worktrees_enabled {
+        return serde_json::to_string(&serde_json::json!({ "hook": "" }))
+            .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")));
     }
+
+    let repo_path = normalize_repo_path(&code_repo_path);
+    let hook_path = repo_path
+        .join(".git")
+        .join("hooks")
+        .join("pre-commit")
+        .display()
+        .to_string();
 
     // TODO: Call storage/guard layer to:
     // 1. Resolve core.hooksPath
     // 2. Write pre-commit hook script
     // 3. Make executable
 
-    let hooks_path = format!("{code_repo_path}/.git/hooks");
-
-    let response = GuardInstallResult {
-        success: true,
-        hooks_path: hooks_path.clone(),
-        message: format!("Pre-commit guard installed at {hooks_path}/pre-commit"),
-    };
+    let response = serde_json::json!({ "hook": hook_path });
 
     tracing::debug!(
         "Installing pre-commit guard for project {} at {}",
@@ -454,21 +512,11 @@ pub fn install_precommit_guard(
 /// - `code_repo_path`: Path to the code repository
 #[tool(description = "Uninstall pre-commit guard from a repository.")]
 pub fn uninstall_precommit_guard(_ctx: &McpContext, code_repo_path: String) -> McpResult<String> {
-    // Validate code_repo_path is absolute
-    if !code_repo_path.starts_with('/') {
-        return Err(McpError::new(
-            McpErrorCode::InvalidParams,
-            "code_repo_path must be an absolute path",
-        ));
-    }
+    let _repo_path = normalize_repo_path(&code_repo_path);
 
-    // TODO: Call storage/guard layer to remove hook
-
-    let response = GuardInstallResult {
-        success: true,
-        hooks_path: format!("{code_repo_path}/.git/hooks"),
-        message: "Pre-commit guard uninstalled".to_string(),
-    };
+    // TODO: Call storage/guard layer to remove hook.
+    // For now, report no-op removal to avoid destructive file operations.
+    let response = serde_json::json!({ "removed": false });
 
     tracing::debug!("Uninstalling pre-commit guard from {}", code_repo_path);
 
