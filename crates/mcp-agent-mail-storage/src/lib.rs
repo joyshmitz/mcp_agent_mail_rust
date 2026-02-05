@@ -1932,6 +1932,213 @@ fn commit_touches_path(repo: &Repository, commit: &git2::Commit<'_>, path_prefix
     false
 }
 
+/// Find the commit that introduced a specific file path.
+///
+/// Walks the git log and returns the first commit where the file appeared.
+/// Used by mailbox-with-commits views to map messages to their commits.
+pub fn find_commit_for_path(
+    archive: &ProjectArchive,
+    rel_path_str: &str,
+) -> Result<Option<CommitInfo>> {
+    let repo = Repository::open(&archive.repo_root)?;
+
+    let mut revwalk = repo.revwalk()?;
+    revwalk.push_head()?;
+    revwalk.set_sorting(git2::Sort::TIME)?;
+
+    for oid_result in revwalk {
+        let oid = oid_result?;
+        let commit = repo.find_commit(oid)?;
+
+        if commit_touches_path(&repo, &commit, rel_path_str) {
+            let author = commit.author();
+            return Ok(Some(CommitInfo {
+                sha: oid.to_string(),
+                short_sha: oid.to_string()[..7.min(oid.to_string().len())].to_string(),
+                author: author.name().unwrap_or("unknown").to_string(),
+                email: author.email().unwrap_or("").to_string(),
+                date: {
+                    let time = author.when();
+                    let secs = time.seconds();
+                    DateTime::from_timestamp(secs, 0)
+                        .unwrap_or_default()
+                        .to_rfc3339()
+                },
+                summary: commit.summary().unwrap_or("").to_string(),
+            }));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Get recent commits filtered by author name.
+///
+/// Used by `whois(include_recent_commits=true)` to show an agent's
+/// recent archive activity.
+pub fn get_commits_by_author(
+    archive: &ProjectArchive,
+    author_name: &str,
+    limit: usize,
+) -> Result<Vec<CommitInfo>> {
+    let repo = Repository::open(&archive.repo_root)?;
+
+    let mut revwalk = repo.revwalk()?;
+    revwalk.push_head()?;
+    revwalk.set_sorting(git2::Sort::TIME)?;
+
+    let mut commits = Vec::new();
+
+    for oid_result in revwalk {
+        if commits.len() >= limit {
+            break;
+        }
+        let oid = oid_result?;
+        let commit = repo.find_commit(oid)?;
+
+        let author = commit.author();
+        let name = author.name().unwrap_or("");
+
+        if name == author_name {
+            commits.push(CommitInfo {
+                sha: oid.to_string(),
+                short_sha: oid.to_string()[..7.min(oid.to_string().len())].to_string(),
+                author: name.to_string(),
+                email: author.email().unwrap_or("").to_string(),
+                date: {
+                    let time = author.when();
+                    let secs = time.seconds();
+                    DateTime::from_timestamp(secs, 0)
+                        .unwrap_or_default()
+                        .to_rfc3339()
+                },
+                summary: commit.summary().unwrap_or("").to_string(),
+            });
+        }
+    }
+
+    Ok(commits)
+}
+
+/// Get commit metadata for a message's canonical path.
+///
+/// Convenience wrapper: given the archive paths for a message,
+/// returns the commit that introduced its canonical file.
+pub fn get_commit_for_message(
+    archive: &ProjectArchive,
+    message_paths: &MessageArchivePaths,
+) -> Result<Option<CommitInfo>> {
+    let canonical_rel = rel_path(&archive.repo_root, &message_paths.canonical)?;
+    find_commit_for_path(archive, &canonical_rel)
+}
+
+/// Read a message file from the archive and parse its frontmatter.
+///
+/// Returns `(frontmatter_json, body_markdown)`.
+pub fn read_message_file(path: &Path) -> Result<(serde_json::Value, String)> {
+    let content = fs::read_to_string(path)?;
+
+    // Parse ---json frontmatter
+    if let Some(rest) = content.strip_prefix("---json\n") {
+        if let Some(end_idx) = rest.find("\n---\n") {
+            let json_str = &rest[..end_idx];
+            let body = rest[end_idx + 5..].trim().to_string();
+            let frontmatter = serde_json::from_str(json_str)?;
+            return Ok((frontmatter, body));
+        }
+    }
+
+    // No frontmatter - treat entire content as body
+    Ok((serde_json::Value::Null, content))
+}
+
+/// List all message files in a directory (inbox, outbox, or canonical).
+///
+/// Returns paths sorted by modification time (newest first).
+pub fn list_message_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut files = Vec::new();
+    walk_md_files(dir, &mut files)?;
+
+    // Sort by modification time descending (newest first)
+    files.sort_by(|a, b| {
+        let a_time = fs::metadata(a).and_then(|m| m.modified()).ok();
+        let b_time = fs::metadata(b).and_then(|m| m.modified()).ok();
+        b_time.cmp(&a_time)
+    });
+
+    Ok(files)
+}
+
+/// Recursively collect .md files from a directory tree.
+fn walk_md_files(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            walk_md_files(&path, files)?;
+        } else if path.extension().is_some_and(|e| e == "md") {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// Get inbox message files for a specific agent.
+pub fn list_agent_inbox(archive: &ProjectArchive, agent_name: &str) -> Result<Vec<PathBuf>> {
+    let inbox_dir = archive.root.join("agents").join(agent_name).join("inbox");
+    list_message_files(&inbox_dir)
+}
+
+/// Get outbox message files for a specific agent.
+pub fn list_agent_outbox(archive: &ProjectArchive, agent_name: &str) -> Result<Vec<PathBuf>> {
+    let outbox_dir = archive.root.join("agents").join(agent_name).join("outbox");
+    list_message_files(&outbox_dir)
+}
+
+/// List all agents with profiles in the archive.
+pub fn list_archive_agents(archive: &ProjectArchive) -> Result<Vec<String>> {
+    let agents_dir = archive.root.join("agents");
+    if !agents_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut agents = Vec::new();
+    for entry in fs::read_dir(&agents_dir)? {
+        let entry = entry?;
+        if entry.path().is_dir() {
+            let profile = entry.path().join("profile.json");
+            if profile.exists() {
+                if let Some(name) = entry.file_name().to_str() {
+                    agents.push(name.to_string());
+                }
+            }
+        }
+    }
+    agents.sort();
+    Ok(agents)
+}
+
+/// Read an agent's profile from the archive.
+pub fn read_agent_profile(
+    archive: &ProjectArchive,
+    agent_name: &str,
+) -> Result<Option<serde_json::Value>> {
+    let profile_path = archive.root.join("agents").join(agent_name).join("profile.json");
+    if !profile_path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(&profile_path)?;
+    let value = serde_json::from_str(&content)?;
+    Ok(Some(value))
+}
+
 /// Check if a tree has any entry with the given path prefix.
 fn tree_contains_prefix(tree: &git2::Tree<'_>, prefix: &str) -> bool {
     for entry in tree.iter() {
@@ -2795,5 +3002,138 @@ mod tests {
         assert_eq!(EmbedPolicy::from_str_policy("auto"), EmbedPolicy::Auto);
         assert_eq!(EmbedPolicy::from_str_policy("INLINE"), EmbedPolicy::Inline);
         assert_eq!(EmbedPolicy::from_str_policy("whatever"), EmbedPolicy::Auto);
+    }
+
+    // -----------------------------------------------------------------------
+    // Read helper tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_find_commit_for_path() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "read-proj").unwrap();
+
+        // Write agent profile (creates a commit)
+        let agent = serde_json::json!({"name": "ReadAgent", "program": "test"});
+        write_agent_profile_with_config(&archive, &config, &agent).unwrap();
+
+        let rel = format!(
+            "projects/read-proj/agents/ReadAgent/profile.json"
+        );
+        let commit = find_commit_for_path(&archive, &rel).unwrap();
+        assert!(commit.is_some());
+        let commit = commit.unwrap();
+        assert!(commit.summary.contains("agent: profile ReadAgent"));
+    }
+
+    #[test]
+    fn test_get_commits_by_author() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "author-proj").unwrap();
+
+        // Write something to create commits
+        let agent = serde_json::json!({"name": "AuthorAgent", "program": "test"});
+        write_agent_profile_with_config(&archive, &config, &agent).unwrap();
+
+        let commits = get_commits_by_author(&archive, &config.git_author_name, 10).unwrap();
+        assert!(!commits.is_empty());
+    }
+
+    #[test]
+    fn test_read_message_file() {
+        let tmp = TempDir::new().unwrap();
+
+        // Create a message file with frontmatter
+        let msg_path = tmp.path().join("test_msg.md");
+        let content = "---json\n{\"id\": 1, \"subject\": \"Hello\"}\n---\n\nThis is the body.\n";
+        fs::write(&msg_path, content).unwrap();
+
+        let (frontmatter, body) = read_message_file(&msg_path).unwrap();
+        assert_eq!(frontmatter["id"], 1);
+        assert_eq!(frontmatter["subject"], "Hello");
+        assert_eq!(body, "This is the body.");
+    }
+
+    #[test]
+    fn test_read_message_file_no_frontmatter() {
+        let tmp = TempDir::new().unwrap();
+        let msg_path = tmp.path().join("plain.md");
+        fs::write(&msg_path, "Just plain text.").unwrap();
+
+        let (frontmatter, body) = read_message_file(&msg_path).unwrap();
+        assert!(frontmatter.is_null());
+        assert_eq!(body, "Just plain text.");
+    }
+
+    #[test]
+    fn test_list_agent_inbox_outbox() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "list-proj").unwrap();
+
+        // Write a message to create inbox/outbox
+        let message = serde_json::json!({
+            "id": 10,
+            "subject": "Inbox Test",
+            "created_ts": "2026-01-20T12:00:00Z",
+        });
+        write_message_bundle(
+            &archive,
+            &config,
+            &message,
+            "Test body",
+            "Sender",
+            &["Recipient".to_string()],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let inbox = list_agent_inbox(&archive, "Recipient").unwrap();
+        assert_eq!(inbox.len(), 1);
+
+        let outbox = list_agent_outbox(&archive, "Sender").unwrap();
+        assert_eq!(outbox.len(), 1);
+
+        // Non-existent agent should return empty
+        let empty = list_agent_inbox(&archive, "Nobody").unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn test_list_archive_agents() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "agents-proj").unwrap();
+
+        let agent1 = serde_json::json!({"name": "Alice", "program": "test"});
+        let agent2 = serde_json::json!({"name": "Bob", "program": "test"});
+        write_agent_profile_with_config(&archive, &config, &agent1).unwrap();
+        write_agent_profile_with_config(&archive, &config, &agent2).unwrap();
+
+        let agents = list_archive_agents(&archive).unwrap();
+        assert_eq!(agents, vec!["Alice", "Bob"]);
+    }
+
+    #[test]
+    fn test_read_agent_profile() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "profile-proj").unwrap();
+
+        let agent = serde_json::json!({"name": "ProfAgent", "program": "claude", "model": "opus"});
+        write_agent_profile_with_config(&archive, &config, &agent).unwrap();
+
+        let profile = read_agent_profile(&archive, "ProfAgent").unwrap();
+        assert!(profile.is_some());
+        let profile = profile.unwrap();
+        assert_eq!(profile["name"], "ProfAgent");
+        assert_eq!(profile["program"], "claude");
+
+        // Non-existent agent
+        let missing = read_agent_profile(&archive, "Ghost").unwrap();
+        assert!(missing.is_none());
     }
 }
