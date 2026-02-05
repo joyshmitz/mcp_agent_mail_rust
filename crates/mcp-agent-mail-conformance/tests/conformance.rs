@@ -95,6 +95,79 @@ fn args_from_case(case: &Case) -> Option<Value> {
     }
 }
 
+/// Run all tool fixtures and return the storage root path for archive inspection.
+fn run_all_fixtures_and_return_storage_root() -> tempfile::TempDir {
+    let tmp = tempfile::TempDir::new().expect("failed to create tempdir");
+    let db_path = tmp.path().join("db.sqlite3");
+    let db_url = format!("sqlite://{}", db_path.display());
+    let storage_root = tmp.path().join("archive");
+    unsafe {
+        std::env::set_var("DATABASE_URL", db_url);
+        std::env::set_var("WORKTREES_ENABLED", "1");
+        std::env::set_var(
+            "STORAGE_ROOT",
+            storage_root
+                .to_str()
+                .expect("storage_root must be valid UTF-8"),
+        );
+    }
+
+    for repo_name in &["repo_install", "repo_uninstall"] {
+        let repo_dir = std::path::Path::new("/tmp/agent-mail-fixtures").join(repo_name);
+        std::fs::create_dir_all(&repo_dir).expect("create fixture repo dir");
+        if !repo_dir.join(".git").exists() {
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&repo_dir)
+                .status()
+                .expect("git init");
+        }
+    }
+
+    let fixtures = Fixtures::load_default().expect("failed to load fixtures");
+    let config = mcp_agent_mail_core::Config::from_env();
+    let router = mcp_agent_mail_server::build_server(&config).into_router();
+    let cx = Cx::for_testing();
+    let budget = Budget::INFINITE;
+    let mut req_id: u64 = 1;
+
+    // Run all tool fixtures (creates DB state + archive side effects)
+    for (tool_name, tool_fixture) in &fixtures.tools {
+        for case in &tool_fixture.cases {
+            let params = CallToolParams {
+                name: tool_name.clone(),
+                arguments: args_from_case(case),
+                meta: None,
+            };
+            let _result = router.handle_tools_call(
+                &cx,
+                req_id,
+                params,
+                &budget,
+                SessionState::new(),
+                None,
+                None,
+            );
+            req_id += 1;
+        }
+    }
+
+    tmp
+}
+
+/// Parse frontmatter from a message markdown file.
+/// Returns the JSON value from the `---json ... ---` block.
+fn parse_frontmatter(content: &str) -> Option<Value> {
+    let content = content.trim();
+    if !content.starts_with("---json") {
+        return None;
+    }
+    let after_start = &content["---json".len()..];
+    let end_idx = after_start.find("\n---")?;
+    let json_str = &after_start[..end_idx];
+    serde_json::from_str(json_str.trim()).ok()
+}
+
 #[test]
 fn load_and_validate_fixture_schema() {
     let fixtures = Fixtures::load_default().expect("failed to load fixtures");
@@ -131,8 +204,23 @@ fn run_fixtures_against_rust_server_router() {
         );
     }
 
+    // Create fixture directories that guard tools expect (git-init'd repos)
+    for repo_name in &["repo_install", "repo_uninstall"] {
+        let repo_dir = std::path::Path::new("/tmp/agent-mail-fixtures").join(repo_name);
+        std::fs::create_dir_all(&repo_dir).expect("create fixture repo dir");
+        // Initialize a bare git repo so git commands work
+        if !repo_dir.join(".git").exists() {
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&repo_dir)
+                .status()
+                .expect("git init");
+        }
+    }
+
     let fixtures = Fixtures::load_default().expect("failed to load fixtures");
-    let router = mcp_agent_mail_server::build_server().into_router();
+    let config = mcp_agent_mail_core::Config::from_env();
+    let router = mcp_agent_mail_server::build_server(&config).into_router();
 
     let cx = Cx::for_testing();
     let budget = Budget::INFINITE;
@@ -271,4 +359,245 @@ fn run_fixtures_against_rust_server_router() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Archive artifact conformance tests
+// ---------------------------------------------------------------------------
+
+/// Collect all files under a directory (excluding .git), returning paths relative to root.
+fn collect_archive_files(root: &std::path::Path) -> Vec<String> {
+    let mut files = Vec::new();
+    collect_files_recursive(root, root, &mut files);
+    files.sort();
+    files
+}
+
+fn collect_files_recursive(base: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == ".git" {
+            continue;
+        }
+        if path.is_dir() {
+            collect_files_recursive(base, &path, out);
+        } else if let Ok(rel) = path.strip_prefix(base) {
+            out.push(rel.to_string_lossy().to_string());
+        }
+    }
+}
+
+/// Single combined test for all archive artifact assertions.
+/// Must be a single test because all fixtures share process-wide env vars
+/// (DATABASE_URL, STORAGE_ROOT) which cannot safely run in parallel.
+#[test]
+fn archive_artifacts_after_fixtures() {
+    let tmp = run_all_fixtures_and_return_storage_root();
+    let storage_root = tmp.path().join("archive");
+    let files = collect_archive_files(&storage_root);
+
+    // Print all archive files for debugging
+    eprintln!(
+        "=== Archive files ({}) ===\n{}",
+        files.len(),
+        files.join("\n")
+    );
+
+    // --- .gitattributes ---
+    assert!(
+        storage_root.join(".gitattributes").exists(),
+        "expected .gitattributes at archive root"
+    );
+
+    // --- Agent profiles ---
+    let expected_profiles = [
+        "projects/abs-path-backend/agents/BlueLake/profile.json",
+        "projects/abs-path-backend/agents/GreenCastle/profile.json",
+        "projects/abs-path-backend/agents/OrangeFox/profile.json",
+    ];
+    for profile_rel in &expected_profiles {
+        assert!(
+            files.iter().any(|f| f == profile_rel),
+            "expected agent profile at {profile_rel}, found profiles:\n{}",
+            files
+                .iter()
+                .filter(|f| f.contains("profile.json"))
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let content = std::fs::read_to_string(storage_root.join(profile_rel))
+            .unwrap_or_else(|e| panic!("failed to read {profile_rel}: {e}"));
+        let parsed: Value = serde_json::from_str(&content)
+            .unwrap_or_else(|e| panic!("failed to parse JSON in {profile_rel}: {e}"));
+        assert!(
+            parsed.get("name").and_then(Value::as_str).is_some(),
+            "profile {profile_rel} missing 'name'"
+        );
+        assert!(
+            parsed.get("program").and_then(Value::as_str).is_some(),
+            "profile {profile_rel} missing 'program'"
+        );
+        assert!(
+            parsed.get("model").and_then(Value::as_str).is_some(),
+            "profile {profile_rel} missing 'model'"
+        );
+    }
+
+    // --- Canonical message files ---
+    let message_files: Vec<&String> = files
+        .iter()
+        .filter(|f| {
+            f.starts_with("projects/")
+                && f.contains("/messages/")
+                && f.ends_with(".md")
+                && !f.contains("/threads/")
+        })
+        .collect();
+    assert!(
+        message_files.len() >= 2,
+        "expected at least 2 canonical message files, found {}: {:?}",
+        message_files.len(),
+        message_files
+    );
+
+    // Verify frontmatter on each canonical
+    for msg_rel in &message_files {
+        let content = std::fs::read_to_string(storage_root.join(msg_rel))
+            .unwrap_or_else(|e| panic!("failed to read {msg_rel}: {e}"));
+        let fm = parse_frontmatter(&content).unwrap_or_else(|| {
+            panic!("message {msg_rel} has no valid ---json frontmatter:\n{content}")
+        });
+        assert!(
+            fm.get("from").and_then(Value::as_str).is_some(),
+            "message {msg_rel} frontmatter missing 'from'"
+        );
+        assert!(
+            fm.get("subject").and_then(Value::as_str).is_some(),
+            "message {msg_rel} frontmatter missing 'subject'"
+        );
+        assert!(
+            fm.get("to").and_then(Value::as_array).is_some(),
+            "message {msg_rel} frontmatter missing 'to' array"
+        );
+        assert!(
+            fm.get("id").is_some(),
+            "message {msg_rel} frontmatter missing 'id'"
+        );
+    }
+
+    // --- Inbox/outbox copies ---
+    let inbox_files: Vec<&String> = files
+        .iter()
+        .filter(|f| f.contains("/inbox/") && f.ends_with(".md"))
+        .collect();
+    let outbox_files: Vec<&String> = files
+        .iter()
+        .filter(|f| f.contains("/outbox/") && f.ends_with(".md"))
+        .collect();
+    assert!(!inbox_files.is_empty(), "expected at least one inbox copy");
+    assert!(
+        !outbox_files.is_empty(),
+        "expected at least one outbox copy"
+    );
+    // Each canonical should have a matching outbox copy (same filename)
+    for msg_rel in &message_files {
+        let filename = std::path::Path::new(msg_rel.as_str())
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
+        let has_outbox = outbox_files.iter().any(|f| f.ends_with(filename.as_ref()));
+        assert!(
+            has_outbox,
+            "canonical {msg_rel} has no matching outbox copy (filename: {filename})"
+        );
+    }
+
+    // --- File reservation artifacts ---
+    let reservation_files: Vec<&String> = files
+        .iter()
+        .filter(|f| f.contains("/file_reservations/") && f.ends_with(".json"))
+        .collect();
+    assert!(
+        !reservation_files.is_empty(),
+        "expected at least one file reservation JSON artifact"
+    );
+    for res_rel in &reservation_files {
+        let content = std::fs::read_to_string(storage_root.join(res_rel))
+            .unwrap_or_else(|e| panic!("failed to read {res_rel}: {e}"));
+        let parsed: Value = serde_json::from_str(&content)
+            .unwrap_or_else(|e| panic!("failed to parse JSON in {res_rel}: {e}"));
+        assert!(
+            parsed.get("path_pattern").and_then(Value::as_str).is_some(),
+            "reservation {res_rel} missing 'path_pattern'"
+        );
+        assert!(
+            parsed.get("agent").or(parsed.get("agent_name")).is_some(),
+            "reservation {res_rel} missing 'agent'/'agent_name'"
+        );
+        assert!(
+            parsed.get("exclusive").is_some(),
+            "reservation {res_rel} missing 'exclusive'"
+        );
+    }
+    assert!(
+        reservation_files.iter().any(|f| f.contains("/id-")),
+        "expected at least one id-<N>.json reservation file"
+    );
+
+    // --- Thread digest ---
+    let thread_files: Vec<&String> = files
+        .iter()
+        .filter(|f| f.contains("/messages/threads/") && f.ends_with(".md"))
+        .collect();
+    assert!(
+        !thread_files.is_empty(),
+        "expected at least one thread digest file"
+    );
+    for thread_rel in &thread_files {
+        let content = std::fs::read_to_string(storage_root.join(thread_rel))
+            .unwrap_or_else(|e| panic!("failed to read {thread_rel}: {e}"));
+        assert!(
+            content.starts_with("# Thread"),
+            "thread digest {thread_rel} should start with '# Thread', got: {}",
+            &content[..content.len().min(100)]
+        );
+        assert!(
+            content.contains("[View canonical]"),
+            "thread digest {thread_rel} should contain '[View canonical]' link"
+        );
+    }
+
+    // --- Frontmatter parity with Python for "Hello" message ---
+    let hello_candidates: Vec<&String> = files
+        .iter()
+        .filter(|f| f.contains("/messages/") && !f.contains("/threads/") && f.contains("__hello__"))
+        .collect();
+    assert!(
+        !hello_candidates.is_empty(),
+        "expected a 'hello' message canonical, found message files: {:?}",
+        message_files
+    );
+    let content = std::fs::read_to_string(storage_root.join(hello_candidates[0]))
+        .expect("failed to read hello message");
+    let fm = parse_frontmatter(&content).expect("hello message has no frontmatter");
+    assert_eq!(fm.get("from").and_then(Value::as_str), Some("BlueLake"));
+    assert_eq!(fm.get("subject").and_then(Value::as_str), Some("Hello"));
+    assert_eq!(
+        fm.get("to")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
+        Some(vec!["GreenCastle"])
+    );
+    assert_eq!(fm.get("importance").and_then(Value::as_str), Some("urgent"));
+    assert_eq!(fm.get("ack_required").and_then(Value::as_bool), Some(true));
+    // Verify body
+    let body_start = content.find("\n---\n").expect("no --- end marker");
+    let body = content[body_start + 5..].trim();
+    assert_eq!(body, "Test", "hello message body should be 'Test'");
 }

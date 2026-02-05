@@ -1,0 +1,10 @@
+{
+  "participants": ["BlueLake", "RedStone"],
+  "key_points": ["TODO align release notes", "Backend is green"],
+  "action_items": ["Ship release"],
+  "mentions": [{"name": "BlueLake", "count": 2}],
+  "code_references": ["src/main.rs"],
+  "total_messages": 4,
+  "open_actions": ["TODO align release notes"],
+  "done_actions": ["DONE: refactor auth"]
+}

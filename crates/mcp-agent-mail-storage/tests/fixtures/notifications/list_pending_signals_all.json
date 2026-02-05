@@ -1,0 +1,17 @@
+[
+  {
+    "timestamp": "2024-01-01T00:00:00+00:00",
+    "project": "proj1",
+    "agent": "Agent1"
+  },
+  {
+    "timestamp": "2024-01-01T00:00:00+00:00",
+    "project": "proj1",
+    "agent": "Agent2"
+  },
+  {
+    "project": "proj2",
+    "agent": "Agent3",
+    "error": "Failed to parse signal file"
+  }
+]

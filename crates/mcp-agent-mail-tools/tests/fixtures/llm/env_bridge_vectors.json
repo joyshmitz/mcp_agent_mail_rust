@@ -1,0 +1,52 @@
+{
+  "cases": [
+    {
+      "name": "gemini_alias_sets_google",
+      "env": {"GEMINI_API_KEY": "gem-123"},
+      "dotenv": {},
+      "expected_set": {"GOOGLE_API_KEY": "gem-123"}
+    },
+    {
+      "name": "grok_alias_sets_xai",
+      "env": {"GROK_API_KEY": "grok-abc"},
+      "dotenv": {},
+      "expected_set": {"XAI_API_KEY": "grok-abc"}
+    },
+    {
+      "name": "canonical_preserved_when_set",
+      "env": {"GOOGLE_API_KEY": "g1", "GEMINI_API_KEY": "g2"},
+      "dotenv": {},
+      "expected_set": {"GOOGLE_API_KEY": "g1"}
+    },
+    {
+      "name": "dotenv_used_when_env_missing",
+      "env": {},
+      "dotenv": {"OPENAI_API_KEY": "oa-1"},
+      "expected_set": {"OPENAI_API_KEY": "oa-1"}
+    },
+    {
+      "name": "dotenv_alias_used_when_env_missing",
+      "env": {},
+      "dotenv": {"GEMINI_API_KEY": "gem-9"},
+      "expected_set": {"GOOGLE_API_KEY": "gem-9"}
+    }
+  ],
+  "canonical_keys": [
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GROQ_API_KEY",
+    "XAI_API_KEY",
+    "GOOGLE_API_KEY",
+    "OPENROUTER_API_KEY",
+    "DEEPSEEK_API_KEY"
+  ],
+  "alias_map": {
+    "OPENAI_API_KEY": ["OPENAI_API_KEY"],
+    "ANTHROPIC_API_KEY": ["ANTHROPIC_API_KEY"],
+    "GROQ_API_KEY": ["GROQ_API_KEY"],
+    "XAI_API_KEY": ["XAI_API_KEY", "GROK_API_KEY"],
+    "GOOGLE_API_KEY": ["GOOGLE_API_KEY", "GEMINI_API_KEY"],
+    "OPENROUTER_API_KEY": ["OPENROUTER_API_KEY"],
+    "DEEPSEEK_API_KEY": ["DEEPSEEK_API_KEY"]
+  }
+}

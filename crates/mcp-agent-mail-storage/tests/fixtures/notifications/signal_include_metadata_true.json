@@ -1,0 +1,11 @@
+{
+  "timestamp": "2024-01-01T00:00:00+00:00",
+  "project": "test_project",
+  "agent": "TestAgent",
+  "message": {
+    "id": 123,
+    "from": "Sender",
+    "subject": "Hello",
+    "importance": "high"
+  }
+}

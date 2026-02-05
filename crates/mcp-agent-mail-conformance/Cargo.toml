@@ -15,4 +15,5 @@ mcp-agent-mail-server = { path = "../mcp-agent-mail-server" }
 insta = { version = "1.38", features = ["json"] }
 fastmcp.workspace = true
 fastmcp-core.workspace = true
+mcp-agent-mail-core.workspace = true
 tempfile.workspace = true
