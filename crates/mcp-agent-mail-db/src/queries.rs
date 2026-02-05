@@ -921,7 +921,16 @@ pub async fn mark_message_read(
     ];
     let out = map_sql_outcome(raw_execute(cx, &*conn, sql, &params).await);
     match out {
-        Outcome::Ok(_) => Outcome::Ok(now),
+        Outcome::Ok(rows) => {
+            if rows == 0 {
+                Outcome::Err(DbError::not_found(
+                    "MessageRecipient",
+                    format!("{agent_id}:{message_id}"),
+                ))
+            } else {
+                Outcome::Ok(now)
+            }
+        }
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -956,7 +965,16 @@ pub async fn acknowledge_message(
     ];
     let out = map_sql_outcome(raw_execute(cx, &*conn, sql, &params).await);
     match out {
-        Outcome::Ok(_) => Outcome::Ok((now, now)),
+        Outcome::Ok(rows) => {
+            if rows == 0 {
+                Outcome::Err(DbError::not_found(
+                    "MessageRecipient",
+                    format!("{agent_id}:{message_id}"),
+                ))
+            } else {
+                Outcome::Ok((now, now))
+            }
+        }
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -1737,9 +1755,9 @@ pub async fn force_release_reservation(
 /// Get the most recent mail activity timestamp for an agent.
 ///
 /// Checks:
-/// - Messages sent by the agent (created_ts)
-/// - Messages acknowledged by the agent (ack_ts)
-/// - Messages read by the agent (read_ts)
+/// - Messages sent by the agent (`created_ts`)
+/// - Messages acknowledged by the agent (`ack_ts`)
+/// - Messages read by the agent (`read_ts`)
 ///
 /// Returns the maximum of all these timestamps, or `None` if no activity found.
 pub async fn get_agent_last_mail_activity(
@@ -1756,37 +1774,45 @@ pub async fn get_agent_last_mail_activity(
     };
 
     // Check messages sent
-    let sql_sent = "SELECT MAX(created_ts) as max_ts FROM messages WHERE sender_id = ? AND project_id = ?";
+    let sql_sent =
+        "SELECT MAX(created_ts) as max_ts FROM messages WHERE sender_id = ? AND project_id = ?";
     let params = [Value::BigInt(agent_id), Value::BigInt(project_id)];
     let sent_ts = match map_sql_outcome(raw_query(cx, &*conn, sql_sent, &params).await) {
-        Outcome::Ok(rows) => rows
-            .first()
-            .and_then(|r| r.get(0).and_then(|v| match v {
+        Outcome::Ok(rows) => rows.first().and_then(|r| {
+            r.get(0).and_then(|v| match v {
                 Value::BigInt(n) => Some(*n),
                 Value::Int(n) => Some(i64::from(*n)),
                 _ => None,
-            })),
+            })
+        }),
         Outcome::Err(e) => return Outcome::Err(e),
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
     // Check message reads/acks by this agent
-    let sql_read = "SELECT MAX(COALESCE(read_ts, 0)), MAX(COALESCE(ack_ts, 0)) FROM message_recipients WHERE agent_id = ?";
-    let params2 = [Value::BigInt(agent_id)];
+    let sql_read = "SELECT MAX(COALESCE(r.read_ts, 0)), MAX(COALESCE(r.ack_ts, 0)) \
+                    FROM message_recipients r \
+                    JOIN messages m ON m.id = r.message_id \
+                    WHERE r.agent_id = ? AND m.project_id = ?";
+    let params2 = [Value::BigInt(agent_id), Value::BigInt(project_id)];
     let (read_ts, ack_ts) = match map_sql_outcome(raw_query(cx, &*conn, sql_read, &params2).await) {
         Outcome::Ok(rows) => {
             let row = rows.first();
-            let read = row.and_then(|r| r.get(0).and_then(|v| match v {
-                Value::BigInt(n) if *n > 0 => Some(*n),
-                Value::Int(n) if *n > 0 => Some(i64::from(*n)),
-                _ => None,
-            }));
-            let ack = row.and_then(|r| r.get(1).and_then(|v| match v {
-                Value::BigInt(n) if *n > 0 => Some(*n),
-                Value::Int(n) if *n > 0 => Some(i64::from(*n)),
-                _ => None,
-            }));
+            let read = row.and_then(|r| {
+                r.get(0).and_then(|v| match v {
+                    Value::BigInt(n) if *n > 0 => Some(*n),
+                    Value::Int(n) if *n > 0 => Some(i64::from(*n)),
+                    _ => None,
+                })
+            });
+            let ack = row.and_then(|r| {
+                r.get(1).and_then(|v| match v {
+                    Value::BigInt(n) if *n > 0 => Some(*n),
+                    Value::Int(n) if *n > 0 => Some(i64::from(*n)),
+                    _ => None,
+                })
+            });
             (read, ack)
         }
         Outcome::Err(e) => return Outcome::Err(e),
@@ -1795,10 +1821,7 @@ pub async fn get_agent_last_mail_activity(
     };
 
     // Return the maximum of all timestamps
-    let max_ts = [sent_ts, read_ts, ack_ts]
-        .into_iter()
-        .flatten()
-        .max();
+    let max_ts = [sent_ts, read_ts, ack_ts].into_iter().flatten().max();
 
     Outcome::Ok(max_ts)
 }

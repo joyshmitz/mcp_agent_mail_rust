@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
@@ -93,6 +93,15 @@ pub struct MessageArchivePaths {
     pub canonical: PathBuf,
     pub outbox: PathBuf,
     pub inbox: Vec<PathBuf>,
+}
+
+/// Metadata included in notification signal files when enabled.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationMessage {
+    pub id: Option<i64>,
+    pub from: Option<String>,
+    pub subject: Option<String>,
+    pub importance: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -207,8 +216,8 @@ impl FileLock {
                         50 * (1u64 << attempt.min(4))
                     };
                     let jitter = (base_ms / 4) as i64;
-                    let sleep_ms = base_ms as i64
-                        + (std::process::id() as i64 % (2 * jitter + 1)) - jitter;
+                    let sleep_ms =
+                        base_ms as i64 + (std::process::id() as i64 % (2 * jitter + 1)) - jitter;
                     let sleep_ms = sleep_ms.max(10) as u64;
                     std::thread::sleep(Duration::from_millis(sleep_ms));
                 }
@@ -275,21 +284,15 @@ impl FileLock {
             None
         };
 
-        let owner_alive = meta
-            .as_ref()
-            .map(|m| pid_alive(m.pid))
-            .unwrap_or(false);
+        let owner_alive = meta.as_ref().map(|m| pid_alive(m.pid)).unwrap_or(false);
 
-        let age = meta
-            .as_ref()
-            .map(|m| now - m.created_ts)
-            .or_else(|| {
-                fs::metadata(&self.path)
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| now - d.as_secs_f64())
-            });
+        let age = meta.as_ref().map(|m| now - m.created_ts).or_else(|| {
+            fs::metadata(&self.path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| now - d.as_secs_f64())
+        });
 
         let is_stale = if !owner_alive {
             true
@@ -713,9 +716,7 @@ pub fn commit_paths_with_retry(
                 last_err_msg = Some(git_err.message().to_string());
 
                 if attempt >= MAX_INDEX_LOCK_RETRIES {
-                    if !did_last_resort_clean
-                        && try_clean_stale_git_lock(repo_root, 60.0)
-                    {
+                    if !did_last_resort_clean && try_clean_stale_git_lock(repo_root, 60.0) {
                         did_last_resort_clean = true;
                         continue;
                     }
@@ -779,8 +780,7 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
                 result.locks_scanned += 1;
 
                 // Check if stale using zero-timeout lock
-                let lock = FileLock::new(path.clone())
-                    .with_stale_timeout(Duration::ZERO);
+                let lock = FileLock::new(path.clone()).with_stale_timeout(Duration::ZERO);
                 if lock.cleanup_if_stale().unwrap_or(false) {
                     result.locks_removed.push(path.display().to_string());
                 }
@@ -953,10 +953,7 @@ fn ensure_repo(root: &Path, config: &Config) -> Result<bool> {
 // ---------------------------------------------------------------------------
 
 /// Write an agent's profile.json to the archive and commit it.
-pub fn write_agent_profile(
-    archive: &ProjectArchive,
-    agent: &serde_json::Value,
-) -> Result<()> {
+pub fn write_agent_profile(archive: &ProjectArchive, agent: &serde_json::Value) -> Result<()> {
     let name = agent
         .get("name")
         .and_then(serde_json::Value::as_str)
@@ -1002,12 +999,7 @@ pub fn write_agent_profile_with_config(
 
     let rel = rel_path(&archive.repo_root, &profile_path)?;
     let repo = Repository::open(&archive.repo_root)?;
-    commit_paths(
-        &repo,
-        config,
-        &format!("agent: profile {name}"),
-        &[&rel],
-    )?;
+    commit_paths(&repo, config, &format!("agent: profile {name}"), &[&rel])?;
 
     Ok(())
 }
@@ -1126,6 +1118,23 @@ fn subject_slug_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"[^a-zA-Z0-9._-]+").expect("valid regex"))
 }
 
+fn sanitize_thread_id(thread_id: &str) -> String {
+    let raw = subject_slug_re().replace_all(thread_id, "-");
+    let trimmed = raw
+        .trim_matches(|c: char| c == '-' || c == '_')
+        .to_lowercase();
+    let truncated = if trimmed.len() > 120 {
+        trimmed[..120].to_string()
+    } else {
+        trimmed
+    };
+    if truncated.is_empty() {
+        "thread".to_string()
+    } else {
+        truncated
+    }
+}
+
 /// Compute message archive paths for canonical, outbox, and inbox copies.
 pub fn message_paths(
     archive: &ProjectArchive,
@@ -1141,7 +1150,9 @@ pub fn message_paths(
 
     let slug = {
         let raw = subject_slug_re().replace_all(subject, "-");
-        let trimmed = raw.trim_matches(|c: char| c == '-' || c == '_').to_lowercase();
+        let trimmed = raw
+            .trim_matches(|c: char| c == '-' || c == '_')
+            .to_lowercase();
         let truncated = if trimmed.len() > 80 {
             trimmed[..80].to_string()
         } else {
@@ -1160,7 +1171,12 @@ pub fn message_paths(
         format!("{iso}__{slug}.md")
     };
 
-    let canonical = archive.root.join("messages").join(&y).join(&m).join(&filename);
+    let canonical = archive
+        .root
+        .join("messages")
+        .join(&y)
+        .join(&m)
+        .join(&filename);
     let outbox = archive
         .root
         .join("agents")
@@ -1254,10 +1270,7 @@ pub fn write_message_bundle(
     }
 
     // Thread digest
-    if let Some(thread_id) = message
-        .get("thread_id")
-        .and_then(serde_json::Value::as_str)
-    {
+    if let Some(thread_id) = message.get("thread_id").and_then(serde_json::Value::as_str) {
         let thread_id = thread_id.trim();
         if !thread_id.is_empty() {
             let canonical_rel = rel_path(&archive.repo_root, &paths.canonical)?;
@@ -1334,9 +1347,7 @@ pub fn write_message_bundle(
 
 /// Parse a message timestamp from the JSON value.
 fn parse_message_timestamp(message: &serde_json::Value) -> DateTime<Utc> {
-    let ts = message
-        .get("created")
-        .or_else(|| message.get("created_ts"));
+    let ts = message.get("created").or_else(|| message.get("created_ts"));
 
     if let Some(serde_json::Value::String(s)) = ts {
         let s = s.trim();
@@ -1353,6 +1364,17 @@ fn parse_message_timestamp(message: &serde_json::Value) -> DateTime<Utc> {
             // Try ISO 8601 without offset
             if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
                 return naive.and_utc();
+            }
+        }
+    }
+    if let Some(serde_json::Value::Number(n)) = ts {
+        if let Some(raw) = n.as_i64() {
+            if raw > 0 {
+                let secs = raw / 1_000_000;
+                let micros = raw % 1_000_000;
+                if let Some(dt) = DateTime::from_timestamp(secs, (micros * 1000) as u32) {
+                    return dt;
+                }
             }
         }
     }
@@ -1375,7 +1397,8 @@ fn update_thread_digest(
     let digest_dir = archive.root.join("messages").join("threads");
     fs::create_dir_all(&digest_dir)?;
 
-    let digest_path = digest_dir.join(format!("{thread_id}.md"));
+    let safe_thread_id = sanitize_thread_id(thread_id);
+    let digest_path = digest_dir.join(format!("{safe_thread_id}.md"));
     let recipients_str = recipients.join(", ");
 
     let header = format!("## {timestamp} \u{2014} {sender} \u{2192} {recipients_str}\n\n");
@@ -1527,9 +1550,8 @@ pub fn store_attachment(
     let mut rel_paths = Vec::new();
 
     // Convert to WebP
-    let img = image::load_from_memory(&original_bytes).map_err(|e| {
-        StorageError::InvalidPath(format!("Failed to decode image: {e}"))
-    })?;
+    let img = image::load_from_memory(&original_bytes)
+        .map_err(|e| StorageError::InvalidPath(format!("Failed to decode image: {e}")))?;
     let (width, height) = img.dimensions();
 
     let webp_filename = format!("{digest}.webp");
@@ -1703,7 +1725,8 @@ pub fn process_markdown_images(
 
     for (full_match, alt, path) in matches {
         // Skip data URIs and URLs
-        if path.starts_with("data:") || path.starts_with("http://") || path.starts_with("https://") {
+        if path.starts_with("data:") || path.starts_with("http://") || path.starts_with("https://")
+        {
             continue;
         }
 
@@ -1742,103 +1765,171 @@ pub fn process_markdown_images(
 }
 
 // ---------------------------------------------------------------------------
-// Notification signals
+// Notification signals (legacy parity)
 // ---------------------------------------------------------------------------
 
-/// Emit a notification signal file for a project event.
+static SIGNAL_DEBOUNCE: OnceLock<Mutex<HashMap<(String, String), u128>>> = OnceLock::new();
+
+fn signal_debounce() -> &'static Mutex<HashMap<(String, String), u128>> {
+    SIGNAL_DEBOUNCE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Emit a notification signal file for a project/agent.
+///
+/// Returns `true` if a signal was emitted, `false` if disabled, debounced, or failed.
 pub fn emit_notification_signal(
     config: &Config,
     project_slug: &str,
-    event: &str,
-    payload: &serde_json::Value,
-) -> Result<()> {
-    let signal_dir = config
-        .storage_root
-        .join("signals")
-        .join(project_slug);
-    fs::create_dir_all(&signal_dir)?;
+    agent_name: &str,
+    message_metadata: Option<&NotificationMessage>,
+) -> bool {
+    if !config.notifications_enabled {
+        return false;
+    }
 
-    let ts = SystemTime::now()
+    let debounce_ms = config.notifications_debounce_ms as u128;
+    let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
 
-    let signal_path = signal_dir.join(format!("{event}_{ts}.json"));
-    write_json(&signal_path, payload)?;
-    Ok(())
-}
-
-/// Clear notification signals for a project/event.
-pub fn clear_notification_signal(
-    config: &Config,
-    project_slug: &str,
-    event: &str,
-) -> Result<usize> {
-    let signal_dir = config
-        .storage_root
-        .join("signals")
-        .join(project_slug);
-
-    if !signal_dir.exists() {
-        return Ok(0);
+    let key = (project_slug.to_string(), agent_name.to_string());
+    {
+        let mut map = match signal_debounce().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let last = map.get(&key).copied().unwrap_or(0);
+        if debounce_ms > 0 && now_ms.saturating_sub(last) < debounce_ms {
+            return false;
+        }
+        map.insert(key, now_ms);
     }
 
-    let mut removed = 0;
-    for entry in fs::read_dir(&signal_dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if name_str.starts_with(event) && name_str.ends_with(".json") {
-            fs::remove_file(entry.path())?;
-            removed += 1;
+    let signal_path = config
+        .notifications_signals_dir
+        .join("projects")
+        .join(project_slug)
+        .join("agents")
+        .join(format!("{agent_name}.signal"));
+
+    let mut signal_data = serde_json::json!({
+        "timestamp": Utc::now().to_rfc3339(),
+        "project": project_slug,
+        "agent": agent_name,
+    });
+
+    if config.notifications_include_metadata {
+        if let Some(meta) = message_metadata {
+            let importance = meta
+                .importance
+                .clone()
+                .unwrap_or_else(|| "normal".to_string());
+            signal_data["message"] = serde_json::json!({
+                "id": meta.id,
+                "from": meta.from,
+                "subject": meta.subject,
+                "importance": importance,
+            });
         }
     }
 
-    Ok(removed)
+    write_json(&signal_path, &signal_data).is_ok()
+}
+
+/// Clear notification signal for a project/agent.
+///
+/// Returns `true` if a signal was removed, `false` otherwise.
+pub fn clear_notification_signal(config: &Config, project_slug: &str, agent_name: &str) -> bool {
+    if !config.notifications_enabled {
+        return false;
+    }
+
+    let signal_path = config
+        .notifications_signals_dir
+        .join("projects")
+        .join(project_slug)
+        .join("agents")
+        .join(format!("{agent_name}.signal"));
+
+    if !signal_path.exists() {
+        return false;
+    }
+
+    fs::remove_file(&signal_path).is_ok()
 }
 
 /// List pending notification signals.
 pub fn list_pending_signals(
     config: &Config,
     project_slug: Option<&str>,
-) -> Result<Vec<serde_json::Value>> {
-    let signals_root = config.storage_root.join("signals");
-    if !signals_root.exists() {
-        return Ok(Vec::new());
+) -> Vec<serde_json::Value> {
+    if !config.notifications_enabled {
+        return Vec::new();
+    }
+
+    let projects_root = config.notifications_signals_dir.join("projects");
+    if !projects_root.exists() {
+        return Vec::new();
     }
 
     let mut results = Vec::new();
     let dirs: Vec<PathBuf> = if let Some(slug) = project_slug {
-        let d = signals_root.join(slug);
+        let d = projects_root.join(slug);
         if d.exists() { vec![d] } else { vec![] }
     } else {
-        fs::read_dir(&signals_root)?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.is_dir())
-            .collect()
+        match fs::read_dir(&projects_root) {
+            Ok(iter) => iter
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.is_dir())
+                .collect(),
+            Err(_) => return Vec::new(),
+        }
     };
 
-    for dir in dirs {
-        let slug = dir
+    for proj_dir in dirs {
+        let slug = proj_dir
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
-            if entry.path().extension().is_some_and(|e| e == "json") {
-                let content = fs::read_to_string(entry.path())?;
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                    results.push(serde_json::json!({
-                        "project": slug,
-                        "file": entry.file_name().to_string_lossy(),
-                        "payload": val,
-                    }));
+        let agents_dir = proj_dir.join("agents");
+        if !agents_dir.exists() {
+            continue;
+        }
+        let entries = match fs::read_dir(&agents_dir) {
+            Ok(iter) => iter,
+            Err(_) => continue,
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            if entry.path().extension().is_some_and(|e| e == "signal") {
+                let content = match fs::read_to_string(entry.path()) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                match serde_json::from_str::<serde_json::Value>(&content) {
+                    Ok(val) => results.push(val),
+                    Err(_) => {
+                        let agent = entry
+                            .path()
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        results.push(serde_json::json!({
+                            "project": slug,
+                            "agent": agent,
+                            "error": "Failed to parse signal file",
+                        }));
+                    }
                 }
             }
         }
     }
 
-    Ok(results)
+    results
 }
 
 // ---------------------------------------------------------------------------
@@ -2130,7 +2221,11 @@ pub fn read_agent_profile(
     archive: &ProjectArchive,
     agent_name: &str,
 ) -> Result<Option<serde_json::Value>> {
-    let profile_path = archive.root.join("agents").join(agent_name).join("profile.json");
+    let profile_path = archive
+        .root
+        .join("agents")
+        .join(agent_name)
+        .join("profile.json");
     if !profile_path.exists() {
         return Ok(None);
     }
@@ -2240,10 +2335,7 @@ fn commit_paths(
         // git2 expects forward-slash paths on all platforms
         let p = Path::new(path);
         // Only add if the file exists on disk
-        let full = repo
-            .workdir()
-            .ok_or(StorageError::NotInitialized)?
-            .join(p);
+        let full = repo.workdir().ok_or(StorageError::NotInitialized)?.join(p);
         if full.exists() {
             index.add_path(p)?;
         }
@@ -2347,7 +2439,10 @@ pub fn resolve_archive_relative_path(archive: &ProjectArchive, raw_path: &str) -
     }
 
     let safe_rel = normalized.trim_start_matches('/');
-    let root = archive.root.canonicalize().unwrap_or_else(|_| archive.root.clone());
+    let root = archive
+        .root
+        .canonicalize()
+        .unwrap_or_else(|_| archive.root.clone());
     let candidate = archive
         .root
         .join(safe_rel)
@@ -2397,9 +2492,10 @@ mod tests {
     use tempfile::TempDir;
 
     fn test_config(root: &Path) -> Config {
-        let mut config = Config::default();
-        config.storage_root = root.to_path_buf();
-        config
+        Config {
+            storage_root: root.to_path_buf(),
+            ..Config::default()
+        }
     }
 
     #[test]
@@ -2539,6 +2635,20 @@ mod tests {
     }
 
     #[test]
+    fn test_sanitize_thread_id() {
+        assert_eq!(sanitize_thread_id("TKT-1"), "tkt-1");
+        assert_eq!(sanitize_thread_id("../etc/passwd"), "etc-passwd");
+        assert_eq!(sanitize_thread_id(""), "thread");
+    }
+
+    #[test]
+    fn test_parse_message_timestamp_numeric() {
+        let message = serde_json::json!({ "created_ts": 1_700_000_000_000_000_i64 });
+        let ts = parse_message_timestamp(&message);
+        assert_eq!(ts.timestamp(), 1_700_000_000);
+    }
+
+    #[test]
     fn test_append_trailers() {
         let msg = "mail: Agent1 -> Agent2 | Hello";
         let result = append_trailers(msg);
@@ -2557,23 +2667,31 @@ mod tests {
     #[test]
     fn test_notification_signals() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(tmp.path());
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_signals_dir = tmp.path().join("signals");
 
-        emit_notification_signal(
-            &config,
-            "proj",
-            "message",
-            &serde_json::json!({"type": "new_message"}),
-        )
-        .unwrap();
+        let meta = NotificationMessage {
+            id: Some(123),
+            from: Some("Sender".to_string()),
+            subject: Some("Hello".to_string()),
+            importance: Some("high".to_string()),
+        };
+        assert!(emit_notification_signal(&config, "proj", "Agent", Some(&meta)));
 
-        let signals = list_pending_signals(&config, Some("proj")).unwrap();
+        let signals = list_pending_signals(&config, Some("proj"));
         assert_eq!(signals.len(), 1);
+        let signal = &signals[0];
+        assert_eq!(signal["project"], "proj");
+        assert_eq!(signal["agent"], "Agent");
+        assert!(signal["timestamp"].as_str().is_some());
+        assert_eq!(signal["message"]["id"], 123);
+        assert_eq!(signal["message"]["importance"], "high");
 
-        let cleared = clear_notification_signal(&config, "proj", "message").unwrap();
-        assert_eq!(cleared, 1);
+        let cleared = clear_notification_signal(&config, "proj", "Agent");
+        assert!(cleared);
 
-        let signals2 = list_pending_signals(&config, Some("proj")).unwrap();
+        let signals2 = list_pending_signals(&config, Some("proj"));
         assert!(signals2.is_empty());
     }
 
@@ -2798,15 +2916,9 @@ mod tests {
     /// Create a minimal valid PNG image for testing.
     fn create_test_png(path: &Path) {
         use image::{ImageBuffer, Rgba};
-        let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
-            ImageBuffer::from_fn(4, 4, |x, y| {
-                Rgba([
-                    (x * 64) as u8,
-                    (y * 64) as u8,
-                    128,
-                    255,
-                ])
-            });
+        let img: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_fn(4, 4, |x, y| {
+            Rgba([(x * 64) as u8, (y * 64) as u8, 128, 255])
+        });
         img.save(path).unwrap();
     }
 
@@ -2820,13 +2932,7 @@ mod tests {
         let img_path = archive.root.join("test_image.png");
         create_test_png(&img_path);
 
-        let stored = store_attachment(
-            &archive,
-            &config,
-            &img_path,
-            EmbedPolicy::File,
-        )
-        .unwrap();
+        let stored = store_attachment(&archive, &config, &img_path, EmbedPolicy::File).unwrap();
 
         assert_eq!(stored.meta.kind, "file");
         assert_eq!(stored.meta.media_type, "image/webp");
@@ -2859,13 +2965,7 @@ mod tests {
         let img_path = archive.root.join("small_image.png");
         create_test_png(&img_path);
 
-        let stored = store_attachment(
-            &archive,
-            &config,
-            &img_path,
-            EmbedPolicy::Inline,
-        )
-        .unwrap();
+        let stored = store_attachment(&archive, &config, &img_path, EmbedPolicy::Inline).unwrap();
 
         assert_eq!(stored.meta.kind, "inline");
         assert!(stored.meta.data_base64.is_some());
@@ -2937,10 +3037,7 @@ mod tests {
         let (meta, rel_paths) = process_attachments(
             &archive,
             &config,
-            &[
-                img1.display().to_string(),
-                img2.display().to_string(),
-            ],
+            &[img1.display().to_string(), img2.display().to_string()],
             EmbedPolicy::File,
         )
         .unwrap();
@@ -2960,13 +3057,8 @@ mod tests {
         create_test_png(&img_path);
 
         let body = "Check this: ![diagram](diagram.png) and text.";
-        let (new_body, meta, rel_paths) = process_markdown_images(
-            &archive,
-            &config,
-            body,
-            EmbedPolicy::Inline,
-        )
-        .unwrap();
+        let (new_body, meta, rel_paths) =
+            process_markdown_images(&archive, &config, body, EmbedPolicy::Inline).unwrap();
 
         assert_eq!(meta.len(), 1);
         assert!(!rel_paths.is_empty());
@@ -2982,13 +3074,8 @@ mod tests {
         let archive = ensure_archive(&config, "url-proj").unwrap();
 
         let body = "Remote: ![photo](https://example.com/img.png) and local ref.";
-        let (new_body, meta, _) = process_markdown_images(
-            &archive,
-            &config,
-            body,
-            EmbedPolicy::File,
-        )
-        .unwrap();
+        let (new_body, meta, _) =
+            process_markdown_images(&archive, &config, body, EmbedPolicy::File).unwrap();
 
         // URL should be left unchanged
         assert_eq!(new_body, body);
@@ -3018,9 +3105,7 @@ mod tests {
         let agent = serde_json::json!({"name": "ReadAgent", "program": "test"});
         write_agent_profile_with_config(&archive, &config, &agent).unwrap();
 
-        let rel = format!(
-            "projects/read-proj/agents/ReadAgent/profile.json"
-        );
+        let rel = "projects/read-proj/agents/ReadAgent/profile.json".to_string();
         let commit = find_commit_for_path(&archive, &rel).unwrap();
         assert!(commit.is_some());
         let commit = commit.unwrap();

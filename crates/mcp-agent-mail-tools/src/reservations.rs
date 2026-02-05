@@ -546,12 +546,8 @@ pub async fn force_release_file_reservation(
 
     // Actually release the reservation in DB
     let released_count = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::force_release_reservation(
-            ctx.cx(),
-            &pool,
-            file_reservation_id,
-        )
-        .await,
+        mcp_agent_mail_db::queries::force_release_reservation(ctx.cx(), &pool, file_reservation_id)
+            .await,
     )?;
 
     // Optionally send notification to previous holder
@@ -666,8 +662,7 @@ fn get_git_activity_for_agent(
     agent_name: &str,
 ) -> Option<i64> {
     let archive = mcp_agent_mail_storage::ensure_archive(config, project_slug).ok()?;
-    let commits =
-        mcp_agent_mail_storage::get_commits_by_author(&archive, agent_name, 1).ok()?;
+    let commits = mcp_agent_mail_storage::get_commits_by_author(&archive, agent_name, 1).ok()?;
     commits.first().and_then(|c| {
         // Parse ISO-8601 date string to micros
         chrono::DateTime::parse_from_rfc3339(&c.date)
@@ -723,13 +718,12 @@ pub fn install_precommit_guard(
     })?;
 
     // Resolve the actual hook path (honors core.hooksPath, worktrees, etc.)
-    let hooks_dir =
-        mcp_agent_mail_guard::resolve_hooks_dir(&repo_path).map_err(|e| {
-            McpError::new(
-                McpErrorCode::InternalError,
-                format!("Failed to resolve hooks dir: {e}"),
-            )
-        })?;
+    let hooks_dir = mcp_agent_mail_guard::resolve_hooks_dir(&repo_path).map_err(|e| {
+        McpError::new(
+            McpErrorCode::InternalError,
+            format!("Failed to resolve hooks dir: {e}"),
+        )
+    })?;
 
     let hook_path = hooks_dir.join("pre-commit").display().to_string();
     let response = serde_json::json!({ "hook": hook_path });
