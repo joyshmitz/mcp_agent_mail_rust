@@ -11,6 +11,8 @@ serde_json.workspace = true
 regex.workspace = true
 thiserror.workspace = true
 git2.workspace = true
+globset.workspace = true
+chrono.workspace = true
 mcp-agent-mail-core = { workspace = true }
 
 [dev-dependencies]
