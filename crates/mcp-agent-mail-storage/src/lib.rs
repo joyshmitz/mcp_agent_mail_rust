@@ -2704,6 +2704,199 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Notification signal fixture-driven tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_signal_payload_full_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_include_metadata = true;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        config.notifications_debounce_ms = 0; // disable debounce for tests
+
+        let meta = NotificationMessage {
+            id: Some(123),
+            from: Some("SenderAgent".to_string()),
+            subject: Some("Hello World".to_string()),
+            importance: Some("high".to_string()),
+        };
+        assert!(emit_notification_signal(&config, "test_project", "TestAgent", Some(&meta)));
+
+        let signals = list_pending_signals(&config, Some("test_project"));
+        assert_eq!(signals.len(), 1);
+        let signal = &signals[0];
+        assert_eq!(signal["project"], "test_project");
+        assert_eq!(signal["agent"], "TestAgent");
+        assert!(signal["timestamp"].as_str().is_some());
+        assert_eq!(signal["message"]["id"], 123);
+        assert_eq!(signal["message"]["from"], "SenderAgent");
+        assert_eq!(signal["message"]["subject"], "Hello World");
+        assert_eq!(signal["message"]["importance"], "high");
+    }
+
+    #[test]
+    fn test_signal_payload_importance_defaults_to_normal() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_include_metadata = true;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        config.notifications_debounce_ms = 0;
+
+        let meta = NotificationMessage {
+            id: Some(456),
+            from: Some("Sender2".to_string()),
+            subject: Some("No importance field".to_string()),
+            importance: None, // should default to "normal"
+        };
+        assert!(emit_notification_signal(&config, "proj1", "Agent1", Some(&meta)));
+
+        let signals = list_pending_signals(&config, Some("proj1"));
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0]["message"]["importance"], "normal");
+        assert_eq!(signals[0]["message"]["from"], "Sender2");
+    }
+
+    #[test]
+    fn test_signal_payload_sparse_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_include_metadata = true;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        config.notifications_debounce_ms = 0;
+
+        let meta = NotificationMessage {
+            id: Some(789),
+            from: None,
+            subject: None,
+            importance: None,
+        };
+        assert!(emit_notification_signal(&config, "proj1", "Agent2", Some(&meta)));
+
+        let signals = list_pending_signals(&config, Some("proj1"));
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0]["message"]["id"], 789);
+        assert!(signals[0]["message"]["from"].is_null());
+        assert!(signals[0]["message"]["subject"].is_null());
+        assert_eq!(signals[0]["message"]["importance"], "normal");
+    }
+
+    #[test]
+    fn test_signal_payload_metadata_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_include_metadata = false;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        config.notifications_debounce_ms = 0;
+
+        let meta = NotificationMessage {
+            id: Some(123),
+            from: Some("Sender".to_string()),
+            subject: Some("Hello".to_string()),
+            importance: Some("high".to_string()),
+        };
+        assert!(emit_notification_signal(&config, "test_project", "TestAgent", Some(&meta)));
+
+        let signals = list_pending_signals(&config, Some("test_project"));
+        assert_eq!(signals.len(), 1);
+        assert!(signals[0].get("message").is_none());
+        assert_eq!(signals[0]["project"], "test_project");
+        assert_eq!(signals[0]["agent"], "TestAgent");
+    }
+
+    #[test]
+    fn test_signal_payload_null_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_include_metadata = true;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        config.notifications_debounce_ms = 0;
+
+        assert!(emit_notification_signal(&config, "test_project", "TestAgent", None));
+
+        let signals = list_pending_signals(&config, Some("test_project"));
+        assert_eq!(signals.len(), 1);
+        assert!(signals[0].get("message").is_none());
+    }
+
+    #[test]
+    fn test_signal_notifications_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = false;
+        config.notifications_signals_dir = tmp.path().join("signals");
+
+        assert!(!emit_notification_signal(&config, "proj", "Agent", None));
+        let signals = list_pending_signals(&config, None);
+        assert!(signals.is_empty());
+    }
+
+    #[test]
+    fn test_signal_list_multiple_projects_and_agents() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_include_metadata = false;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        config.notifications_debounce_ms = 0;
+
+        // Emit signals across 2 projects and 2 agents
+        assert!(emit_notification_signal(&config, "proj1", "Agent1", None));
+        assert!(emit_notification_signal(&config, "proj1", "Agent2", None));
+        assert!(emit_notification_signal(&config, "proj2", "Agent1", None));
+
+        // All signals
+        let all = list_pending_signals(&config, None);
+        assert_eq!(all.len(), 3);
+
+        // Filter by project
+        let proj1 = list_pending_signals(&config, Some("proj1"));
+        assert_eq!(proj1.len(), 2);
+
+        let proj2 = list_pending_signals(&config, Some("proj2"));
+        assert_eq!(proj2.len(), 1);
+        assert_eq!(proj2[0]["agent"], "Agent1");
+    }
+
+    #[test]
+    fn test_signal_clear_and_relist() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_include_metadata = false;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        config.notifications_debounce_ms = 0;
+
+        assert!(emit_notification_signal(&config, "proj", "Agent1", None));
+        assert!(emit_notification_signal(&config, "proj", "Agent2", None));
+
+        // Clear Agent1
+        assert!(clear_notification_signal(&config, "proj", "Agent1"));
+        let signals = list_pending_signals(&config, Some("proj"));
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0]["agent"], "Agent2");
+
+        // Clear nonexistent returns false
+        assert!(!clear_notification_signal(&config, "proj", "NonExistent"));
+    }
+
+    #[test]
+    fn test_signal_empty_dir() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_signals_dir = tmp.path().join("signals");
+
+        let signals = list_pending_signals(&config, None);
+        assert!(signals.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
     // Advisory file lock tests
     // -----------------------------------------------------------------------
 

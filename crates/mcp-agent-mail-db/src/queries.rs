@@ -17,40 +17,275 @@ use crate::pool::DbPool;
 use crate::timestamps::now_micros;
 use asupersync::Outcome;
 use sqlmodel::prelude::*;
-use sqlmodel_core::Error as SqlError;
-use sqlmodel_core::Value;
+use sqlmodel_core::{Connection, Dialect, Error as SqlError, IsolationLevel, PreparedStatement};
+use sqlmodel_core::{Row as SqlRow, TransactionOps, Value};
 use sqlmodel_query::{raw_execute, raw_query};
 
 // =============================================================================
 // Tracked query wrappers
 // =============================================================================
 
-/// Execute a raw query with timing instrumentation.
-async fn traw_query(
-    cx: &Cx,
-    conn: &sqlmodel_sqlite::SqliteConnection,
-    sql: &str,
-    params: &[Value],
-) -> Outcome<Vec<sqlmodel_core::Row>, SqlError> {
-    let start = crate::tracking::query_timer();
-    let result = raw_query(cx, conn, sql, params).await;
-    let elapsed = crate::tracking::elapsed_us(start);
-    crate::QUERY_TRACKER.record(sql, elapsed);
-    result
+struct TrackedConnection<'conn> {
+    inner: &'conn sqlmodel_sqlite::SqliteConnection,
 }
 
-/// Execute a raw statement with timing instrumentation.
+impl<'conn> TrackedConnection<'conn> {
+    fn new(inner: &'conn sqlmodel_sqlite::SqliteConnection) -> Self {
+        Self { inner }
+    }
+}
+
+struct TrackedTransaction<'conn> {
+    inner: sqlmodel_sqlite::SqliteTransaction<'conn>,
+}
+
+impl TransactionOps for TrackedTransaction<'_> {
+    fn query(
+        &self,
+        cx: &Cx,
+        sql: &str,
+        params: &[Value],
+    ) -> impl Future<Output = Outcome<Vec<SqlRow>, SqlError>> + Send {
+        let start = crate::tracking::query_timer();
+        let fut = self.inner.query(cx, sql, params);
+        async move {
+            let result = fut.await;
+            let elapsed = crate::tracking::elapsed_us(start);
+            crate::tracking::record_query(sql, elapsed);
+            result
+        }
+    }
+
+    fn query_one(
+        &self,
+        cx: &Cx,
+        sql: &str,
+        params: &[Value],
+    ) -> impl Future<Output = Outcome<Option<SqlRow>, SqlError>> + Send {
+        let start = crate::tracking::query_timer();
+        let fut = self.inner.query_one(cx, sql, params);
+        async move {
+            let result = fut.await;
+            let elapsed = crate::tracking::elapsed_us(start);
+            crate::tracking::record_query(sql, elapsed);
+            result
+        }
+    }
+
+    fn execute(
+        &self,
+        cx: &Cx,
+        sql: &str,
+        params: &[Value],
+    ) -> impl Future<Output = Outcome<u64, SqlError>> + Send {
+        let start = crate::tracking::query_timer();
+        let fut = self.inner.execute(cx, sql, params);
+        async move {
+            let result = fut.await;
+            let elapsed = crate::tracking::elapsed_us(start);
+            crate::tracking::record_query(sql, elapsed);
+            result
+        }
+    }
+
+    fn savepoint(&self, cx: &Cx, name: &str) -> impl Future<Output = Outcome<(), SqlError>> + Send {
+        self.inner.savepoint(cx, name)
+    }
+
+    fn rollback_to(
+        &self,
+        cx: &Cx,
+        name: &str,
+    ) -> impl Future<Output = Outcome<(), SqlError>> + Send {
+        self.inner.rollback_to(cx, name)
+    }
+
+    fn release(&self, cx: &Cx, name: &str) -> impl Future<Output = Outcome<(), SqlError>> + Send {
+        self.inner.release(cx, name)
+    }
+
+    fn commit(self, cx: &Cx) -> impl Future<Output = Outcome<(), SqlError>> + Send {
+        self.inner.commit(cx)
+    }
+
+    fn rollback(self, cx: &Cx) -> impl Future<Output = Outcome<(), SqlError>> + Send {
+        self.inner.rollback(cx)
+    }
+}
+
+impl Connection for TrackedConnection<'_> {
+    type Tx<'conn>
+        = TrackedTransaction<'conn>
+    where
+        Self: 'conn;
+
+    fn dialect(&self) -> Dialect {
+        Dialect::Sqlite
+    }
+
+    fn query(
+        &self,
+        cx: &Cx,
+        sql: &str,
+        params: &[Value],
+    ) -> impl Future<Output = Outcome<Vec<SqlRow>, SqlError>> + Send {
+        let start = crate::tracking::query_timer();
+        let fut = self.inner.query(cx, sql, params);
+        async move {
+            let result = fut.await;
+            let elapsed = crate::tracking::elapsed_us(start);
+            crate::tracking::record_query(sql, elapsed);
+            result
+        }
+    }
+
+    fn query_one(
+        &self,
+        cx: &Cx,
+        sql: &str,
+        params: &[Value],
+    ) -> impl Future<Output = Outcome<Option<SqlRow>, SqlError>> + Send {
+        let start = crate::tracking::query_timer();
+        let fut = self.inner.query_one(cx, sql, params);
+        async move {
+            let result = fut.await;
+            let elapsed = crate::tracking::elapsed_us(start);
+            crate::tracking::record_query(sql, elapsed);
+            result
+        }
+    }
+
+    fn execute(
+        &self,
+        cx: &Cx,
+        sql: &str,
+        params: &[Value],
+    ) -> impl Future<Output = Outcome<u64, SqlError>> + Send {
+        let start = crate::tracking::query_timer();
+        let fut = self.inner.execute(cx, sql, params);
+        async move {
+            let result = fut.await;
+            let elapsed = crate::tracking::elapsed_us(start);
+            crate::tracking::record_query(sql, elapsed);
+            result
+        }
+    }
+
+    fn insert(
+        &self,
+        cx: &Cx,
+        sql: &str,
+        params: &[Value],
+    ) -> impl Future<Output = Outcome<i64, SqlError>> + Send {
+        let start = crate::tracking::query_timer();
+        let fut = self.inner.insert(cx, sql, params);
+        async move {
+            let result = fut.await;
+            let elapsed = crate::tracking::elapsed_us(start);
+            crate::tracking::record_query(sql, elapsed);
+            result
+        }
+    }
+
+    fn batch(
+        &self,
+        cx: &Cx,
+        statements: &[(String, Vec<Value>)],
+    ) -> impl Future<Output = Outcome<Vec<u64>, SqlError>> + Send {
+        let statements = statements.to_vec();
+        async move {
+            let mut results = Vec::with_capacity(statements.len());
+            for (sql, params) in statements {
+                let start = crate::tracking::query_timer();
+                let out = self.inner.execute(cx, &sql, &params).await;
+                let elapsed = crate::tracking::elapsed_us(start);
+                crate::tracking::record_query(&sql, elapsed);
+                match out {
+                    Outcome::Ok(n) => results.push(n),
+                    Outcome::Err(e) => return Outcome::Err(e),
+                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => return Outcome::Panicked(p),
+                }
+            }
+            Outcome::Ok(results)
+        }
+    }
+
+    fn begin(&self, cx: &Cx) -> impl Future<Output = Outcome<Self::Tx<'_>, SqlError>> + Send {
+        self.begin_with(cx, IsolationLevel::default())
+    }
+
+    fn begin_with(
+        &self,
+        cx: &Cx,
+        isolation: IsolationLevel,
+    ) -> impl Future<Output = Outcome<Self::Tx<'_>, SqlError>> + Send {
+        let fut = self.inner.begin_with(cx, isolation);
+        async move {
+            match fut.await {
+                Outcome::Ok(tx) => Outcome::Ok(TrackedTransaction { inner: tx }),
+                Outcome::Err(e) => Outcome::Err(e),
+                Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                Outcome::Panicked(p) => Outcome::Panicked(p),
+            }
+        }
+    }
+
+    fn prepare(
+        &self,
+        cx: &Cx,
+        sql: &str,
+    ) -> impl Future<Output = Outcome<PreparedStatement, SqlError>> + Send {
+        self.inner.prepare(cx, sql)
+    }
+
+    fn query_prepared(
+        &self,
+        cx: &Cx,
+        stmt: &PreparedStatement,
+        params: &[Value],
+    ) -> impl Future<Output = Outcome<Vec<SqlRow>, SqlError>> + Send {
+        self.query(cx, stmt.sql(), params)
+    }
+
+    fn execute_prepared(
+        &self,
+        cx: &Cx,
+        stmt: &PreparedStatement,
+        params: &[Value],
+    ) -> impl Future<Output = Outcome<u64, SqlError>> + Send {
+        self.execute(cx, stmt.sql(), params)
+    }
+
+    fn ping(&self, cx: &Cx) -> impl Future<Output = Outcome<(), SqlError>> + Send {
+        self.inner.ping(cx)
+    }
+
+    async fn close(self, _cx: &Cx) -> sqlmodel_core::Result<()> {
+        // TrackedConnection borrows the underlying connection; closing is a
+        // no-op because we don't own the connection.
+        Ok(())
+    }
+}
+
+/// Execute a raw query using the tracked connection.
+async fn traw_query(
+    cx: &Cx,
+    conn: &TrackedConnection<'_>,
+    sql: &str,
+    params: &[Value],
+) -> Outcome<Vec<SqlRow>, SqlError> {
+    raw_query(cx, conn, sql, params).await
+}
+
+/// Execute a raw statement using the tracked connection.
 async fn traw_execute(
     cx: &Cx,
-    conn: &sqlmodel_sqlite::SqliteConnection,
+    conn: &TrackedConnection<'_>,
     sql: &str,
     params: &[Value],
 ) -> Outcome<u64, SqlError> {
-    let start = crate::tracking::query_timer();
-    let result = raw_execute(cx, conn, sql, params).await;
-    let elapsed = crate::tracking::elapsed_us(start);
-    crate::QUERY_TRACKER.record(sql, elapsed);
-    result
+    raw_execute(cx, conn, sql, params).await
 }
 
 // =============================================================================
@@ -100,6 +335,10 @@ async fn acquire_conn(
     map_sql_outcome(pool.acquire(cx).await)
 }
 
+fn tracked(conn: &sqlmodel_sqlite::SqliteConnection) -> TrackedConnection<'_> {
+    TrackedConnection::new(conn)
+}
+
 /// Ensure a project exists, creating if necessary.
 ///
 /// Returns the project row (existing or newly created).
@@ -125,18 +364,20 @@ pub async fn ensure_project(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     // Match legacy semantics: slug is the stable identity; `human_key` is informative.
     let existing = map_sql_outcome(
         select!(ProjectRow)
             .filter(Expr::col("slug").eq(slug.as_str()))
-            .first(cx, &*conn)
+            .first(cx, &tracked)
             .await,
     );
     match existing {
         Outcome::Ok(Some(row)) => Outcome::Ok(row),
         Outcome::Ok(None) => {
             let mut row = ProjectRow::new(slug, human_key.to_string());
-            let id_out = map_sql_outcome(insert!(&row).execute(cx, &*conn).await);
+            let id_out = map_sql_outcome(insert!(&row).execute(cx, &tracked).await);
             match id_out {
                 Outcome::Ok(id) => {
                     row.id = Some(id);
@@ -166,10 +407,12 @@ pub async fn get_project_by_slug(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     match map_sql_outcome(
         select!(ProjectRow)
             .filter(Expr::col("slug").eq(slug))
-            .first(cx, &*conn)
+            .first(cx, &tracked)
             .await,
     ) {
         Outcome::Ok(Some(row)) => Outcome::Ok(row),
@@ -193,10 +436,12 @@ pub async fn get_project_by_human_key(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     match map_sql_outcome(
         select!(ProjectRow)
             .filter(Expr::col("human_key").eq(human_key))
-            .first(cx, &*conn)
+            .first(cx, &tracked)
             .await,
     ) {
         Outcome::Ok(Some(row)) => Outcome::Ok(row),
@@ -216,7 +461,9 @@ pub async fn list_projects(cx: &Cx, pool: &DbPool) -> Outcome<Vec<ProjectRow>, D
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
-    map_sql_outcome(select!(ProjectRow).all(cx, &*conn).await)
+    let tracked = tracked(&*conn);
+
+    map_sql_outcome(select!(ProjectRow).all(cx, &tracked).await)
 }
 
 // =============================================================================
@@ -252,12 +499,14 @@ pub async fn register_agent(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     // Check for existing agent (project_id, name) unique.
     let existing = map_sql_outcome(
         select!(AgentRow)
             .filter(Expr::col("project_id").eq(project_id))
             .filter(Expr::col("name").eq(name))
-            .first(cx, &*conn)
+            .first(cx, &tracked)
             .await,
     );
 
@@ -270,7 +519,7 @@ pub async fn register_agent(
             row.attachments_policy = attachments_policy.unwrap_or("auto").to_string();
 
             // Keep inception_ts stable.
-            let updated = map_sql_outcome(update!(&row).execute(cx, &*conn).await);
+            let updated = map_sql_outcome(update!(&row).execute(cx, &tracked).await);
             match updated {
                 Outcome::Ok(_) => Outcome::Ok(row),
                 Outcome::Err(e) => Outcome::Err(e),
@@ -292,7 +541,7 @@ pub async fn register_agent(
                 contact_policy: "auto".to_string(),
             };
 
-            let id_out = map_sql_outcome(insert!(&row).execute(cx, &*conn).await);
+            let id_out = map_sql_outcome(insert!(&row).execute(cx, &tracked).await);
             match id_out {
                 Outcome::Ok(id) => {
                     row.id = Some(id);
@@ -323,11 +572,13 @@ pub async fn get_agent(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     match map_sql_outcome(
         select!(AgentRow)
             .filter(Expr::col("project_id").eq(project_id))
             .filter(Expr::col("name").eq(name))
-            .first(cx, &*conn)
+            .first(cx, &tracked)
             .await,
     ) {
         Outcome::Ok(Some(row)) => Outcome::Ok(row),
@@ -349,10 +600,12 @@ pub async fn get_agent_by_id(cx: &Cx, pool: &DbPool, agent_id: i64) -> Outcome<A
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     match map_sql_outcome(
         select!(AgentRow)
             .filter(Expr::col("id").eq(agent_id))
-            .first(cx, &*conn)
+            .first(cx, &tracked)
             .await,
     ) {
         Outcome::Ok(Some(row)) => Outcome::Ok(row),
@@ -376,10 +629,12 @@ pub async fn list_agents(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     map_sql_outcome(
         select!(AgentRow)
             .filter(Expr::col("project_id").eq(project_id))
-            .all(cx, &*conn)
+            .all(cx, &tracked)
             .await,
     )
 }
@@ -393,10 +648,12 @@ pub async fn touch_agent(cx: &Cx, pool: &DbPool, agent_id: i64) -> Outcome<(), D
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     let now = now_micros();
     let sql = "UPDATE agents SET last_active_ts = ? WHERE id = ?";
     let params = [Value::BigInt(now), Value::BigInt(agent_id)];
-    match map_sql_outcome(traw_execute(cx, &*conn, sql, &params).await) {
+    match map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await) {
         Outcome::Ok(_) => Outcome::Ok(()),
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
@@ -418,6 +675,8 @@ pub async fn set_agent_contact_policy(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     let now = now_micros();
     let sql = "UPDATE agents SET contact_policy = ?, last_active_ts = ? WHERE id = ?";
     let params = [
@@ -425,7 +684,7 @@ pub async fn set_agent_contact_policy(
         Value::BigInt(now),
         Value::BigInt(agent_id),
     ];
-    let out = map_sql_outcome(traw_execute(cx, &*conn, sql, &params).await);
+    let out = map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await);
 
     match out {
         Outcome::Ok(_) => {
@@ -433,7 +692,7 @@ pub async fn set_agent_contact_policy(
             match map_sql_outcome(
                 select!(AgentRow)
                     .filter(Expr::col("id").eq(agent_id))
-                    .first(cx, &*conn)
+                    .first(cx, &tracked)
                     .await,
             ) {
                 Outcome::Ok(Some(row)) => Outcome::Ok(row),
@@ -494,6 +753,8 @@ pub async fn create_message(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     let mut row = MessageRow {
         id: None,
         project_id,
@@ -507,7 +768,7 @@ pub async fn create_message(
         attachments: attachments.to_string(),
     };
 
-    let id_out = map_sql_outcome(insert!(&row).execute(cx, &*conn).await);
+    let id_out = map_sql_outcome(insert!(&row).execute(cx, &tracked).await);
     match id_out {
         Outcome::Ok(id) => {
             row.id = Some(id);
@@ -540,6 +801,8 @@ pub async fn list_thread_messages(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     let mut sql = String::from(
         "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
                 m.importance, m.ack_required, m.created_ts, m.attachments, a.name as from_name \
@@ -571,7 +834,7 @@ pub async fn list_thread_messages(
         params.push(Value::BigInt(limit_i64));
     }
 
-    let rows_out = map_sql_outcome(traw_query(cx, &*conn, &sql, &params).await);
+    let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
     match rows_out {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
@@ -660,6 +923,8 @@ pub async fn list_message_recipient_names_for_messages(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     let placeholders = placeholders(message_ids.len());
     let sql = format!(
         "SELECT DISTINCT a.name \
@@ -675,7 +940,7 @@ pub async fn list_message_recipient_names_for_messages(
         params.push(Value::BigInt(*id));
     }
 
-    let rows_out = map_sql_outcome(traw_query(cx, &*conn, &sql, &params).await);
+    let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
     match rows_out {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
@@ -703,10 +968,12 @@ pub async fn get_message(cx: &Cx, pool: &DbPool, message_id: i64) -> Outcome<Mes
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     match map_sql_outcome(
         select!(MessageRow)
             .filter(Expr::col("id").eq(message_id))
-            .first(cx, &*conn)
+            .first(cx, &tracked)
             .await,
     ) {
         Outcome::Ok(Some(row)) => Outcome::Ok(row),
@@ -743,6 +1010,8 @@ pub async fn fetch_inbox(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     let mut sql = String::from(
         "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
                 m.importance, m.ack_required, m.created_ts, m.attachments, r.kind, s.name as sender_name, r.ack_ts \
@@ -768,7 +1037,7 @@ pub async fn fetch_inbox(
     sql.push_str(" ORDER BY m.created_ts DESC LIMIT ?");
     params.push(Value::BigInt(limit_i64));
 
-    let rows_out = map_sql_outcome(traw_query(cx, &*conn, &sql, &params).await);
+    let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
     match rows_out {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
@@ -1020,7 +1289,7 @@ fn like_escape(term: &str) -> String {
 /// Builds `subject LIKE '%term%' OR body_md LIKE '%term%'` for each term.
 async fn run_like_fallback(
     cx: &Cx,
-    conn: &sqlmodel_sqlite::SqliteConnection,
+    conn: &TrackedConnection<'_>,
     project_id: i64,
     terms: &[String],
     limit: i64,
@@ -1064,6 +1333,8 @@ pub async fn search_messages(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     let Ok(limit_i64) = i64::try_from(limit) else {
         return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
     };
@@ -1085,7 +1356,7 @@ pub async fn search_messages(
             Value::Text(fts_query.clone()),
             Value::BigInt(limit_i64),
         ];
-        let fts_result = traw_query(cx, &*conn, sql, &params).await;
+        let fts_result = traw_query(cx, &tracked, sql, &params).await;
 
         // On FTS failure, fall back to LIKE with extracted terms
         match &fts_result {
@@ -1095,7 +1366,7 @@ pub async fn search_messages(
                 if terms.is_empty() {
                     Outcome::Ok(Vec::new())
                 } else {
-                    run_like_fallback(cx, &*conn, project_id, &terms, limit_i64).await
+                    run_like_fallback(cx, &tracked, project_id, &terms, limit_i64).await
                 }
             }
             _ => map_sql_outcome(fts_result),
@@ -1173,6 +1444,8 @@ pub async fn add_recipients(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     for (agent_id, kind) in recipients {
         let row = MessageRecipientRow {
             message_id,
@@ -1182,7 +1455,7 @@ pub async fn add_recipients(
             ack_ts: None,
         };
 
-        let out = map_sql_outcome(insert!(&row).execute(cx, &*conn).await);
+        let out = map_sql_outcome(insert!(&row).execute(cx, &tracked).await);
         match out {
             Outcome::Ok(_) => {}
             Outcome::Err(e) => return Outcome::Err(e),
@@ -1210,6 +1483,8 @@ pub async fn mark_message_read(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     // Idempotent: only set read_ts if currently NULL.
     let sql = "UPDATE message_recipients SET read_ts = COALESCE(read_ts, ?) WHERE agent_id = ? AND message_id = ?";
     let params = [
@@ -1217,7 +1492,7 @@ pub async fn mark_message_read(
         Value::BigInt(agent_id),
         Value::BigInt(message_id),
     ];
-    let out = map_sql_outcome(traw_execute(cx, &*conn, sql, &params).await);
+    let out = map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await);
     match out {
         Outcome::Ok(rows) => {
             if rows == 0 {
@@ -1251,6 +1526,8 @@ pub async fn acknowledge_message(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     // Idempotent: set read_ts if NULL; set ack_ts if NULL.
     let sql = "UPDATE message_recipients \
                SET read_ts = COALESCE(read_ts, ?), ack_ts = COALESCE(ack_ts, ?) \
@@ -1261,7 +1538,7 @@ pub async fn acknowledge_message(
         Value::BigInt(agent_id),
         Value::BigInt(message_id),
     ];
-    let out = map_sql_outcome(traw_execute(cx, &*conn, sql, &params).await);
+    let out = map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await);
     match out {
         Outcome::Ok(rows) => {
             if rows == 0 {
@@ -1305,6 +1582,8 @@ pub async fn create_file_reservations(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     let mut out: Vec<FileReservationRow> = Vec::with_capacity(paths.len());
     for path in paths {
         let mut row = FileReservationRow {
@@ -1319,7 +1598,7 @@ pub async fn create_file_reservations(
             released_ts: None,
         };
 
-        let id_out = map_sql_outcome(insert!(&row).execute(cx, &*conn).await);
+        let id_out = map_sql_outcome(insert!(&row).execute(cx, &tracked).await);
         match id_out {
             Outcome::Ok(id) => {
                 row.id = Some(id);
@@ -1349,12 +1628,14 @@ pub async fn get_active_reservations(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     map_sql_outcome(
         select!(FileReservationRow)
             .filter(Expr::col("project_id").eq(project_id))
             .filter(Expr::col("released_ts").is_null())
             .filter(Expr::col("expires_ts").gt(now))
-            .all(cx, &*conn)
+            .all(cx, &tracked)
             .await,
     )
 }
@@ -1376,6 +1657,8 @@ pub async fn release_reservations(
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
+
+    let tracked = tracked(&*conn);
 
     let mut sql = String::from(
         "UPDATE file_reservations SET released_ts = ? \
@@ -1415,7 +1698,7 @@ pub async fn release_reservations(
         }
     }
 
-    let out = map_sql_outcome(traw_execute(cx, &*conn, &sql, &params).await);
+    let out = map_sql_outcome(traw_execute(cx, &tracked, &sql, &params).await);
     match out {
         Outcome::Ok(n) => usize::try_from(n).map_or_else(
             |_| {
@@ -1452,6 +1735,8 @@ pub async fn renew_reservations(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     // Fetch candidate reservations first (so tools can report old/new expiry).
     let mut sql = String::from(
         "SELECT * FROM file_reservations \
@@ -1487,7 +1772,7 @@ pub async fn renew_reservations(
         }
     }
 
-    let rows_out = map_sql_outcome(traw_query(cx, &*conn, &sql, &params).await);
+    let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
     let mut reservations: Vec<FileReservationRow> = match rows_out {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
@@ -1515,7 +1800,7 @@ pub async fn renew_reservations(
 
         let sql = "UPDATE file_reservations SET expires_ts = ? WHERE id = ?";
         let params = [Value::BigInt(row.expires_ts), Value::BigInt(id)];
-        let updated = map_sql_outcome(traw_execute(cx, &*conn, sql, &params).await);
+        let updated = map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await);
         match updated {
             Outcome::Ok(_) => {}
             Outcome::Err(e) => return Outcome::Err(e),
@@ -1541,6 +1826,8 @@ pub async fn list_file_reservations(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     let (sql, params) = if active_only {
         let now = now_micros();
         (
@@ -1554,7 +1841,7 @@ pub async fn list_file_reservations(
         )
     };
 
-    let rows_out = map_sql_outcome(traw_query(cx, &*conn, &sql, &params).await);
+    let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
     match rows_out {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
@@ -1645,6 +1932,8 @@ pub async fn request_contact(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     // Try existing link first (unique on (a_project_id, a_agent_id, b_project_id, b_agent_id)).
     let existing = map_sql_outcome(
         select!(AgentLinkRow)
@@ -1652,7 +1941,7 @@ pub async fn request_contact(
             .filter(Expr::col("a_agent_id").eq(from_agent_id))
             .filter(Expr::col("b_project_id").eq(to_project_id))
             .filter(Expr::col("b_agent_id").eq(to_agent_id))
-            .first(cx, &*conn)
+            .first(cx, &tracked)
             .await,
     );
 
@@ -1662,7 +1951,7 @@ pub async fn request_contact(
             row.reason = reason.to_string();
             row.updated_ts = now;
             row.expires_ts = expires;
-            let out = map_sql_outcome(update!(&row).execute(cx, &*conn).await);
+            let out = map_sql_outcome(update!(&row).execute(cx, &tracked).await);
             match out {
                 Outcome::Ok(_) => Outcome::Ok(row),
                 Outcome::Err(e) => Outcome::Err(e),
@@ -1683,7 +1972,7 @@ pub async fn request_contact(
                 updated_ts: now,
                 expires_ts: expires,
             };
-            let id_out = map_sql_outcome(insert!(&row).execute(cx, &*conn).await);
+            let id_out = map_sql_outcome(insert!(&row).execute(cx, &tracked).await);
             match id_out {
                 Outcome::Ok(id) => {
                     row.id = Some(id);
@@ -1727,13 +2016,15 @@ pub async fn respond_contact(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     let existing = map_sql_outcome(
         select!(AgentLinkRow)
             .filter(Expr::col("a_project_id").eq(from_project_id))
             .filter(Expr::col("a_agent_id").eq(from_agent_id))
             .filter(Expr::col("b_project_id").eq(to_project_id))
             .filter(Expr::col("b_agent_id").eq(to_agent_id))
-            .first(cx, &*conn)
+            .first(cx, &tracked)
             .await,
     );
 
@@ -1742,7 +2033,7 @@ pub async fn respond_contact(
             row.status = status.to_string();
             row.updated_ts = now;
             row.expires_ts = expires;
-            let out = map_sql_outcome(update!(&row).execute(cx, &*conn).await);
+            let out = map_sql_outcome(update!(&row).execute(cx, &tracked).await);
             match out {
                 Outcome::Ok(n) => usize::try_from(n).map_or_else(
                     |_| {
@@ -1784,12 +2075,14 @@ pub async fn list_contacts(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     // Outgoing: links where this agent is "a" side
     let outgoing = map_sql_outcome(
         select!(AgentLinkRow)
             .filter(Expr::col("a_project_id").eq(project_id))
             .filter(Expr::col("a_agent_id").eq(agent_id))
-            .all(cx, &*conn)
+            .all(cx, &tracked)
             .await,
     );
 
@@ -1805,7 +2098,7 @@ pub async fn list_contacts(
         select!(AgentLinkRow)
             .filter(Expr::col("b_project_id").eq(project_id))
             .filter(Expr::col("b_agent_id").eq(agent_id))
-            .all(cx, &*conn)
+            .all(cx, &tracked)
             .await,
     );
 
@@ -1836,6 +2129,8 @@ pub async fn list_approved_contact_ids(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     let placeholders = placeholders(candidate_ids.len());
     let sql = format!(
         "SELECT b_agent_id FROM agent_links \
@@ -1851,7 +2146,7 @@ pub async fn list_approved_contact_ids(
         params.push(Value::BigInt(*id));
     }
 
-    let rows_out = map_sql_outcome(traw_query(cx, &*conn, &sql, &params).await);
+    let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
     match rows_out {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
@@ -1890,6 +2185,8 @@ pub async fn list_recent_contact_agent_ids(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     let placeholders = placeholders(candidate_ids.len());
     let sql_sent = format!(
         "SELECT DISTINCT r.agent_id \
@@ -1921,8 +2218,8 @@ pub async fn list_recent_contact_agent_ids(
         params_recv.push(Value::BigInt(*id));
     }
 
-    let sent_rows = map_sql_outcome(traw_query(cx, &*conn, &sql_sent, &params_sent).await);
-    let recv_rows = map_sql_outcome(traw_query(cx, &*conn, &sql_recv, &params_recv).await);
+    let sent_rows = map_sql_outcome(traw_query(cx, &tracked, &sql_sent, &params_sent).await);
+    let recv_rows = map_sql_outcome(traw_query(cx, &tracked, &sql_recv, &params_recv).await);
 
     match (sent_rows, recv_rows) {
         (Outcome::Ok(sent), Outcome::Ok(recv)) => {
@@ -1969,6 +2266,8 @@ pub async fn is_contact_allowed(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     // Check if there's an approved link in either direction
     let link = map_sql_outcome(
         select!(AgentLinkRow)
@@ -1977,7 +2276,7 @@ pub async fn is_contact_allowed(
             .filter(Expr::col("b_project_id").eq(to_project_id))
             .filter(Expr::col("b_agent_id").eq(to_agent_id))
             .filter(Expr::col("status").eq("approved"))
-            .first(cx, &*conn)
+            .first(cx, &tracked)
             .await,
     );
 
@@ -1997,7 +2296,7 @@ pub async fn is_contact_allowed(
             .filter(Expr::col("b_project_id").eq(from_project_id))
             .filter(Expr::col("b_agent_id").eq(from_agent_id))
             .filter(Expr::col("status").eq("approved"))
-            .first(cx, &*conn)
+            .first(cx, &tracked)
             .await,
     );
 
@@ -2014,7 +2313,7 @@ pub async fn is_contact_allowed(
         select!(AgentRow)
             .filter(Expr::col("project_id").eq(to_project_id))
             .filter(Expr::col("id").eq(to_agent_id))
-            .first(cx, &*conn)
+            .first(cx, &tracked)
             .await,
     );
 
@@ -2049,11 +2348,13 @@ pub async fn ensure_product(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     // Check if product already exists
     let existing = map_sql_outcome(
         select!(ProductRow)
             .filter(Expr::col("product_uid").eq(uid.as_str()))
-            .first(cx, &*conn)
+            .first(cx, &tracked)
             .await,
     );
 
@@ -2067,7 +2368,7 @@ pub async fn ensure_product(
                 created_at: now,
             };
 
-            let id_out = map_sql_outcome(insert!(&row).execute(cx, &*conn).await);
+            let id_out = map_sql_outcome(insert!(&row).execute(cx, &tracked).await);
             match id_out {
                 Outcome::Ok(id) => {
                     row.id = Some(id);
@@ -2098,6 +2399,8 @@ pub async fn link_product_to_projects(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     let mut linked = 0usize;
     let now = now_micros();
     for &project_id in project_ids {
@@ -2108,7 +2411,7 @@ pub async fn link_product_to_projects(
             Value::BigInt(project_id),
             Value::BigInt(now),
         ];
-        let out = map_sql_outcome(traw_execute(cx, &*conn, sql, &params).await);
+        let out = map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await);
 
         match out {
             Outcome::Ok(n) => {
@@ -2138,10 +2441,12 @@ pub async fn get_product_by_uid(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     match map_sql_outcome(
         select!(ProductRow)
             .filter(Expr::col("product_uid").eq(product_uid))
-            .first(cx, &*conn)
+            .first(cx, &tracked)
             .await,
     ) {
         Outcome::Ok(Some(row)) => Outcome::Ok(row),
@@ -2170,10 +2475,12 @@ pub async fn force_release_reservation(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     let sql = "UPDATE file_reservations SET released_ts = ? WHERE id = ? AND released_ts IS NULL";
     let params = [Value::BigInt(now), Value::BigInt(reservation_id)];
 
-    let out = map_sql_outcome(traw_execute(cx, &*conn, sql, &params).await);
+    let out = map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await);
     match out {
         Outcome::Ok(n) => usize::try_from(n).map_or_else(
             |_| {
@@ -2211,11 +2518,13 @@ pub async fn get_agent_last_mail_activity(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     // Check messages sent
     let sql_sent =
         "SELECT MAX(created_ts) as max_ts FROM messages WHERE sender_id = ? AND project_id = ?";
     let params = [Value::BigInt(agent_id), Value::BigInt(project_id)];
-    let sent_ts = match map_sql_outcome(traw_query(cx, &*conn, sql_sent, &params).await) {
+    let sent_ts = match map_sql_outcome(traw_query(cx, &tracked, sql_sent, &params).await) {
         Outcome::Ok(rows) => rows.first().and_then(|r| {
             r.get(0).and_then(|v| match v {
                 Value::BigInt(n) => Some(*n),
@@ -2234,7 +2543,7 @@ pub async fn get_agent_last_mail_activity(
                     JOIN messages m ON m.id = r.message_id \
                     WHERE r.agent_id = ? AND m.project_id = ?";
     let params2 = [Value::BigInt(agent_id), Value::BigInt(project_id)];
-    let (read_ts, ack_ts) = match map_sql_outcome(traw_query(cx, &*conn, sql_read, &params2).await)
+    let (read_ts, ack_ts) = match map_sql_outcome(traw_query(cx, &tracked, sql_read, &params2).await)
     {
         Outcome::Ok(rows) => {
             let row = rows.first();
@@ -2277,12 +2586,14 @@ pub async fn list_product_projects(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
+    let tracked = tracked(&*conn);
+
     let sql = "SELECT p.* FROM projects p \
                JOIN product_project_links ppl ON ppl.project_id = p.id \
                WHERE ppl.product_id = ?";
     let params = [Value::BigInt(product_id)];
 
-    let rows_out = map_sql_outcome(traw_query(cx, &*conn, sql, &params).await);
+    let rows_out = map_sql_outcome(traw_query(cx, &tracked, sql, &params).await);
     match rows_out {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());

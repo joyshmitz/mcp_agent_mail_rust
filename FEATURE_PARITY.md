@@ -79,7 +79,7 @@
 | Lock status diagnostics | Implemented | `crates/mcp-agent-mail-storage/src/lib.rs` |
 | Thread digest (append-only) | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` |
 | Storage-to-tools wiring | Verified (Tests) | identity.rs, messaging.rs, reservations.rs, resources.rs |
-| Query tracking + slow queries | Implemented | `crates/mcp-agent-mail-db/src/tracking.rs` (6 tests), `crates/mcp-agent-mail-db/src/queries.rs` (all calls instrumented), `crates/mcp-agent-mail-server/src/lib.rs` (auto-enable) |
+| Query tracking + slow queries | Verified (Tests) | `crates/mcp-agent-mail-db/src/tracking.rs` (11 tests, 40 fixture vectors), `crates/mcp-agent-mail-db/src/queries.rs` (TrackedConnection, all calls instrumented), `crates/mcp-agent-mail-server/src/lib.rs` (auto-enable) |
 
 ## CLI & Ops
 | Feature | Status | Evidence |
@@ -108,4 +108,7 @@
 | Python fixture generator | Verified (Tests) | `crates/mcp-agent-mail-conformance/tests/conformance/python_reference/generate_fixtures.py` |
 | Rust conformance tests (23 tools) | Verified (Tests) | `crates/mcp-agent-mail-conformance/tests/conformance.rs` |
 | All resources (23+) | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/resources.rs` |
+| Tool filter conformance (6 profiles) | Verified (Tests) | `crates/mcp-agent-mail-conformance/tests/conformance.rs` |
+| Notification signal tests (9 tests) | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` |
+| Instrumentation fixture tests (40 vectors) | Verified (Tests) | `crates/mcp-agent-mail-db/src/tracking.rs` |
 | Benchmark suite | Verified (Tests) | `crates/mcp-agent-mail/benches/benchmarks.rs` |
