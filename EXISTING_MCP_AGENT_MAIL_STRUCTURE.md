@@ -2322,3 +2322,202 @@ See `crates/mcp-agent-mail-storage/tests/fixtures/notifications/` for:
 - `list_scenarios.json`: directory layouts with expected list results
 
 *Notifications spec added by CoralBadger | 2026-02-05*
+
+---
+
+## LLM Integration
+
+### Overview
+
+Optional LLM integration for enriching thread summaries and project discovery. Uses LiteLLM in Python for provider-agnostic API calls. Every LLM call has a heuristic-only fallback path — LLM features enhance but never gate core functionality.
+
+### Environment Variables
+
+| Variable | Default | Type | Description |
+|----------|---------|------|-------------|
+| `LLM_ENABLED` | `"true"` | bool | Master switch for LLM features |
+| `LLM_DEFAULT_MODEL` | `"gpt-4o-mini"` | str | Default LiteLLM model identifier |
+| `LLM_TEMPERATURE` | `"0.2"` | float | Temperature for generation |
+| `LLM_MAX_TOKENS` | `"512"` | int | Max tokens for completions |
+| `LLM_CACHE_ENABLED` | `"true"` | bool | Enable response caching |
+| `LLM_CACHE_BACKEND` | `"memory"` | str | Cache type: `"memory"` or `"redis"` |
+| `LLM_CACHE_REDIS_URL` | `""` | str | Redis URL when cache_backend=redis |
+| `LLM_COST_LOGGING_ENABLED` | `"true"` | bool | Log API costs and token usage |
+
+### LlmSettings
+
+```
+LlmSettings:
+  enabled: bool               # default: true
+  default_model: str           # default: "gpt-4o-mini"
+  temperature: f64             # default: 0.2
+  max_tokens: u32              # default: 512
+  cache_enabled: bool          # default: true
+  cache_backend: str           # default: "memory" ("memory"|"redis")
+  cache_redis_url: str         # default: ""
+  cost_logging_enabled: bool   # default: true
+```
+
+### Provider Environment Bridge
+
+Maps synonym env vars to canonical keys used by LiteLLM. Only set canonical if not already present in environment:
+
+| Synonym (Source) | Canonical (Target) |
+|------------------|--------------------|
+| `GEMINI_API_KEY` | `GOOGLE_API_KEY` |
+| `GROK_API_KEY` | `XAI_API_KEY` |
+
+**Logic**: For each mapping, check if source is set and target is not set. If so, copy source → target in os.environ.
+
+### Model Selection
+
+**`_choose_best_available_model()`** — picks model based on which API key is available, checked in order:
+
+| Priority | Env Var | Model |
+|----------|---------|-------|
+| 1 | `OPENAI_API_KEY` | `gpt-4o-mini` |
+| 2 | `GOOGLE_API_KEY` | `gemini-1.5-flash` |
+| 3 | `ANTHROPIC_API_KEY` | `claude-3-haiku-20240307` |
+| 4 | `GROQ_API_KEY` | `groq/llama-3.1-8b-instant` |
+| 5 | `DEEPSEEK_API_KEY` | `deepseek/deepseek-chat` |
+| 6 | `XAI_API_KEY` | `xai/grok-2-mini` |
+| 7 | `OPENROUTER_API_KEY` | `openrouter/meta-llama/llama-3.1-8b-instruct` |
+
+If no key is found, returns `"gpt-4o-mini"` (LiteLLM's default).
+
+**`_resolve_model_alias()`** — maps placeholder names:
+- `"best"` → `_choose_best_available_model()`
+- `"auto"` → `_choose_best_available_model()`
+- Otherwise → use model name as-is
+
+### LlmOutput
+
+```
+LlmOutput:
+  content: str                    # Response text
+  model: str                      # Model that actually ran
+  provider: Optional[str]         # Provider name (openai, anthropic, etc.)
+  estimated_cost_usd: Optional[f64>  # Cost if reported by LiteLLM
+```
+
+### complete_system_user
+
+```
+async fn complete_system_user(
+    system_prompt: str,
+    user_prompt: str,
+    model: Optional[str],       # None → settings.default_model
+    temperature: Optional[f64], # None → settings.temperature
+    max_tokens: Optional[u32>,  # None → settings.max_tokens
+) -> LlmOutput
+```
+
+**Flow**:
+1. Call `_ensure_initialized()` (bridges env, sets up cache + callbacks)
+2. Resolve model alias (`"best"` / `"auto"` → auto-select)
+3. Build message array: `[{"role": "system", "content": system}, {"role": "user", "content": user}]`
+4. Call `litellm.acompletion()` with model, messages, temperature, max_tokens
+5. Extract response: `content = response.choices[0].message.content`, `model = response.model`, `provider` from model prefix
+6. **On failure**: Try fallback model from `_choose_best_available_model()` (only if different from primary)
+7. **On total failure**: Raise exception (caller must handle)
+
+### _parse_json_safely
+
+Parses JSON from LLM responses with three fallback strategies:
+
+1. **Direct parse**: `json.loads(text)` — works if response is clean JSON
+2. **Fenced code block**: Extract content between ` ```json ` and ` ``` ` delimiters, then parse
+3. **Brace slice**: Find outermost `{` and `}`, extract substring, then parse
+
+Returns parsed dict on success, `None` on total failure.
+
+### Thread Summarization (summarize_thread tool)
+
+#### Heuristic Summarization (_summarize_messages)
+
+Always runs first, regardless of LLM mode:
+
+- **Participants**: Extract unique sender names
+- **Mentions**: Scan body for `@name` patterns, count occurrences
+- **Code references**: Extract backtick-quoted identifiers
+- **Action items**: Detect keywords (`TODO`, `ACTION`, `FIXME`, `NEXT`, `BLOCKED`) in body text, classify as items
+- **Checkboxes**: Parse `- [ ]` (open) and `- [x]` (done) markdown checkboxes
+- **Output**: `{participants, key_points, action_items, mentions, code_references, total_messages, open_actions, done_actions}`
+
+#### Single-Thread LLM Refinement
+
+Conditions: `llm_mode=True` AND `settings.llm.enabled=True`
+
+1. Take first 15 messages, truncate each body to 800 chars
+2. **System prompt**: "You are a senior engineer. Produce a concise JSON summary with keys: `participants[]`, `key_points[]`, `action_items[]`, `mentions[{name,count}]`, `code_references[]`, `total_messages`, `open_actions`, `done_actions`."
+3. **User prompt**: Formatted thread messages (id, from, subject, body excerpt)
+4. Call `complete_system_user()`
+5. Parse response with `_parse_json_safely()`
+6. **Merge strategy**:
+   - For each key in LLM response, overlay onto heuristic summary
+   - **Special merge for `key_points`**: Keep heuristic items containing action keywords (`TODO`, `ACTION`, `FIXME`, `NEXT`, `BLOCKED`), prepend them to LLM key_points, deduplicate, cap at 10
+7. On LLM failure: log `"thread_summary.llm_skipped"`, return heuristic-only
+
+#### Multi-Thread LLM Refinement
+
+Conditions: `llm_mode=True` AND `settings.llm.enabled=True`
+
+1. Per-thread: query messages (limit=`per_thread_limit`, default 50), run heuristic summarization
+2. Compose compact context: up to 8 threads, 6 key_points + 6 action items each
+3. **System prompt**: "You are a senior engineer producing a crisp digest across threads. Return JSON: `{ threads: [{thread_id, key_points[], actions[]}], aggregate: {top_mentions[], key_points[], action_items[]} }`."
+4. **User prompt**: Formatted per-thread summaries
+5. Call `complete_system_user()`
+6. Parse response with `_parse_json_safely()`
+7. **Merge strategy for aggregate**: LLM keys overlay heuristic aggregate
+8. **Optionally replace per-thread summaries** with LLM-refined versions if present in response
+9. On LLM failure: log `"summarize_thread.llm_skipped"`, return heuristic-only aggregate
+
+### Project Similarity Scoring
+
+Used in product discovery (`_score_project_pair`):
+
+1. Heuristic scoring based on path/git/repo similarity
+2. **If LLM enabled**: System prompt asks to score relationship 0.0 to 1.0 with rationale
+3. Parses response for `{score, rationale}`
+4. On failure: falls back to heuristic score
+
+### Cache Behavior
+
+- **Memory**: In-process LRU cache (LiteLLM's built-in)
+- **Redis**: Connect to `cache_redis_url`, DNS sanity check first
+  - On Redis connection failure: log warning, fall back to memory cache
+  - Log line on fallback: `"llm.cache_redis_fallback"`
+- Cache keyed by: model + messages + temperature + max_tokens
+
+### Cost Logging
+
+- Registered as LiteLLM success callback
+- Only logs when `response_cost > 0`
+- **If `log_rich_enabled`**: Renders Rich panel with cost, tokens, model info
+- **Otherwise**: Structlog with `model`, `cost`, `tokens` fields
+- Never crashes on logging errors (wrapped in try/except)
+
+### Config Fields in Rust
+
+```rust
+pub struct LlmSettings {
+    pub enabled: bool,                // default: true
+    pub default_model: String,        // default: "gpt-4o-mini"
+    pub temperature: f64,             // default: 0.2
+    pub max_tokens: u32,              // default: 512
+    pub cache_enabled: bool,          // default: true
+    pub cache_backend: String,        // default: "memory"
+    pub cache_redis_url: String,      // default: ""
+    pub cost_logging_enabled: bool,   // default: true
+}
+```
+
+### Test Vectors
+
+See `crates/mcp-agent-mail-tools/tests/fixtures/llm/` for:
+- `env_bridge.json`: provider env var mapping test cases
+- `model_selection.json`: API key presence → expected model selection
+- `json_parsing.json`: LLM response text → expected parsed output
+- `summarize_responses.json`: mock LLM responses for thread summarization
+
+*LLM spec added by CoralBadger | 2026-02-05*

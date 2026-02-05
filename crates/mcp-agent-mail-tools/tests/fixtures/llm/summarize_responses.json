@@ -1,0 +1,137 @@
+{
+  "_doc": "Mock LLM responses for thread summarization. Used to test the merge strategy between heuristic and LLM results.",
+  "single_thread": {
+    "system_prompt_pattern": "You are a senior engineer.*concise JSON summary",
+    "response_schema": {
+      "participants": ["string"],
+      "key_points": ["string"],
+      "action_items": ["string"],
+      "mentions": [{"name": "string", "count": "int"}],
+      "code_references": ["string"],
+      "total_messages": "int",
+      "open_actions": "int",
+      "done_actions": "int"
+    },
+    "vectors": [
+      {
+        "desc": "LLM returns full refinement",
+        "heuristic": {
+          "participants": ["Alice", "Bob"],
+          "key_points": ["TODO: deploy to staging", "discussed API changes"],
+          "action_items": ["TODO: deploy to staging"],
+          "total_messages": 5,
+          "open_actions": 1,
+          "done_actions": 0
+        },
+        "llm_response": "{\"participants\": [\"Alice\", \"Bob\"], \"key_points\": [\"API migration planned for next sprint\", \"Staging deployment needed before review\"], \"action_items\": [\"Deploy to staging\", \"Update API docs\"], \"mentions\": [{\"name\": \"Carol\", \"count\": 2}], \"code_references\": [\"api/v2/users\"], \"total_messages\": 5, \"open_actions\": 2, \"done_actions\": 0}",
+        "expected_merged": {
+          "participants": ["Alice", "Bob"],
+          "key_points": ["TODO: deploy to staging", "API migration planned for next sprint", "Staging deployment needed before review"],
+          "action_items": ["Deploy to staging", "Update API docs"],
+          "mentions": [{"name": "Carol", "count": 2}],
+          "code_references": ["api/v2/users"],
+          "total_messages": 5,
+          "open_actions": 2,
+          "done_actions": 0
+        },
+        "_note": "key_points: heuristic items with action keywords (TODO) kept + LLM items appended, deduped, capped at 10"
+      },
+      {
+        "desc": "LLM returns partial response (missing some keys)",
+        "heuristic": {
+          "participants": ["Alice"],
+          "key_points": ["FIXME: broken auth flow"],
+          "action_items": [],
+          "total_messages": 3,
+          "open_actions": 0,
+          "done_actions": 0
+        },
+        "llm_response": "{\"key_points\": [\"Authentication refactor in progress\", \"Need to update middleware\"]}",
+        "expected_merged": {
+          "participants": ["Alice"],
+          "key_points": ["FIXME: broken auth flow", "Authentication refactor in progress", "Need to update middleware"],
+          "action_items": [],
+          "total_messages": 3,
+          "open_actions": 0,
+          "done_actions": 0
+        },
+        "_note": "Only LLM keys present get merged; missing keys keep heuristic values"
+      },
+      {
+        "desc": "LLM fails: heuristic-only returned",
+        "heuristic": {
+          "participants": ["Alice"],
+          "key_points": ["BLOCKED: waiting on infra"],
+          "action_items": ["BLOCKED: waiting on infra"],
+          "total_messages": 2,
+          "open_actions": 1,
+          "done_actions": 0
+        },
+        "llm_response": null,
+        "expected_merged": {
+          "participants": ["Alice"],
+          "key_points": ["BLOCKED: waiting on infra"],
+          "action_items": ["BLOCKED: waiting on infra"],
+          "total_messages": 2,
+          "open_actions": 1,
+          "done_actions": 0
+        },
+        "_note": "LLM failure logged as thread_summary.llm_skipped; heuristic returned unmodified"
+      }
+    ]
+  },
+  "multi_thread": {
+    "system_prompt_pattern": "You are a senior engineer producing a crisp digest across threads",
+    "response_schema": {
+      "threads": [{"thread_id": "string", "key_points": ["string"], "actions": ["string"]}],
+      "aggregate": {
+        "top_mentions": ["string"],
+        "key_points": ["string"],
+        "action_items": ["string"]
+      }
+    },
+    "vectors": [
+      {
+        "desc": "Multi-thread LLM refinement",
+        "thread_ids": ["T-1", "T-2"],
+        "heuristic_aggregate": {
+          "top_mentions": [{"name": "Alice", "count": 3}],
+          "key_points": ["TODO: finalize API schema", "migration timeline discussed"],
+          "action_items": ["TODO: finalize API schema"]
+        },
+        "llm_response": "{\"threads\": [{\"thread_id\": \"T-1\", \"key_points\": [\"API v2 schema finalized\"], \"actions\": [\"Update OpenAPI spec\"]}, {\"thread_id\": \"T-2\", \"key_points\": [\"Migration to new DB\"], \"actions\": [\"Run migration script\"]}], \"aggregate\": {\"top_mentions\": [\"Alice\", \"Bob\"], \"key_points\": [\"API schema and DB migration are the two main workstreams\"], \"action_items\": [\"Update OpenAPI spec\", \"Run migration script\"]}}",
+        "expected_merged_aggregate": {
+          "top_mentions": ["Alice", "Bob"],
+          "key_points": ["API schema and DB migration are the two main workstreams"],
+          "action_items": ["Update OpenAPI spec", "Run migration script"]
+        },
+        "_note": "LLM aggregate overlays heuristic aggregate. Per-thread summaries may also be replaced."
+      },
+      {
+        "desc": "Multi-thread LLM failure: heuristic aggregate returned",
+        "thread_ids": ["T-1", "T-2"],
+        "heuristic_aggregate": {
+          "top_mentions": [{"name": "Alice", "count": 2}],
+          "key_points": ["NEXT: deploy Monday"],
+          "action_items": ["NEXT: deploy Monday"]
+        },
+        "llm_response": null,
+        "expected_merged_aggregate": {
+          "top_mentions": [{"name": "Alice", "count": 2}],
+          "key_points": ["NEXT: deploy Monday"],
+          "action_items": ["NEXT: deploy Monday"]
+        },
+        "_note": "LLM failure logged as summarize_thread.llm_skipped; heuristic returned unmodified"
+      }
+    ]
+  },
+  "action_keywords": ["TODO", "ACTION", "FIXME", "NEXT", "BLOCKED"],
+  "merge_rules": {
+    "key_points_cap": 10,
+    "message_truncation_chars": 800,
+    "max_messages_for_llm": 15,
+    "max_threads_for_context": 8,
+    "max_key_points_per_thread": 6,
+    "max_actions_per_thread": 6
+  }
+}

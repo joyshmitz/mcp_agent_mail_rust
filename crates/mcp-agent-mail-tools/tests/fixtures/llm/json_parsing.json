@@ -1,0 +1,71 @@
+{
+  "_doc": "_parse_json_safely test vectors. Three fallback strategies: direct parse, fenced code block extraction, brace-slice extraction.",
+  "vectors": [
+    {
+      "desc": "Clean JSON: direct parse succeeds",
+      "input": "{\"key_points\": [\"item1\"], \"action_items\": []}",
+      "expected": {"key_points": ["item1"], "action_items": []},
+      "strategy": "direct"
+    },
+    {
+      "desc": "JSON with leading/trailing whitespace",
+      "input": "  \n  {\"key_points\": [\"a\"]}  \n  ",
+      "expected": {"key_points": ["a"]},
+      "strategy": "direct"
+    },
+    {
+      "desc": "Fenced code block with json tag",
+      "input": "Here is the summary:\n```json\n{\"key_points\": [\"deploy API\"]}\n```\nLet me know if you need more.",
+      "expected": {"key_points": ["deploy API"]},
+      "strategy": "fenced"
+    },
+    {
+      "desc": "Fenced code block without json tag",
+      "input": "```\n{\"participants\": [\"Alice\"]}\n```",
+      "expected": {"participants": ["Alice"]},
+      "strategy": "fenced"
+    },
+    {
+      "desc": "Brace-slice: JSON embedded in prose",
+      "input": "The summary is: {\"total_messages\": 5, \"open_actions\": 2} based on the thread.",
+      "expected": {"total_messages": 5, "open_actions": 2},
+      "strategy": "brace_slice"
+    },
+    {
+      "desc": "Nested braces: outermost extracted",
+      "input": "Result: {\"data\": {\"inner\": true}, \"count\": 1}",
+      "expected": {"data": {"inner": true}, "count": 1},
+      "strategy": "brace_slice"
+    },
+    {
+      "desc": "No JSON at all: returns null",
+      "input": "I couldn't generate a summary for this thread.",
+      "expected": null,
+      "strategy": "none"
+    },
+    {
+      "desc": "Malformed JSON: returns null",
+      "input": "{key_points: [missing quotes]}",
+      "expected": null,
+      "strategy": "none"
+    },
+    {
+      "desc": "Empty string: returns null",
+      "input": "",
+      "expected": null,
+      "strategy": "none"
+    },
+    {
+      "desc": "JSON array (not object): direct parse succeeds",
+      "input": "[{\"id\": 1}, {\"id\": 2}]",
+      "expected": [{"id": 1}, {"id": 2}],
+      "strategy": "direct"
+    },
+    {
+      "desc": "Multiple fenced blocks: first json block used",
+      "input": "```json\n{\"first\": true}\n```\n\nAnd also:\n```json\n{\"second\": true}\n```",
+      "expected": {"first": true},
+      "strategy": "fenced"
+    }
+  ]
+}

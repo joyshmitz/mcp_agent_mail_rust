@@ -1,0 +1,34 @@
+{
+  "_doc": "Provider env var bridge mapping test cases. The bridge copies synonym -> canonical only if canonical is NOT already set.",
+  "mappings": [
+    {"synonym": "GEMINI_API_KEY", "canonical": "GOOGLE_API_KEY"},
+    {"synonym": "GROK_API_KEY", "canonical": "XAI_API_KEY"}
+  ],
+  "vectors": [
+    {
+      "desc": "GEMINI_API_KEY bridges to GOOGLE_API_KEY when not set",
+      "env_before": {"GEMINI_API_KEY": "AIza-test-key"},
+      "env_after": {"GEMINI_API_KEY": "AIza-test-key", "GOOGLE_API_KEY": "AIza-test-key"}
+    },
+    {
+      "desc": "GOOGLE_API_KEY already set: no overwrite",
+      "env_before": {"GEMINI_API_KEY": "new-key", "GOOGLE_API_KEY": "existing-key"},
+      "env_after": {"GEMINI_API_KEY": "new-key", "GOOGLE_API_KEY": "existing-key"}
+    },
+    {
+      "desc": "GROK_API_KEY bridges to XAI_API_KEY when not set",
+      "env_before": {"GROK_API_KEY": "xai-test-key"},
+      "env_after": {"GROK_API_KEY": "xai-test-key", "XAI_API_KEY": "xai-test-key"}
+    },
+    {
+      "desc": "Neither synonym set: no changes",
+      "env_before": {},
+      "env_after": {}
+    },
+    {
+      "desc": "Both synonyms set, both canonicals missing",
+      "env_before": {"GEMINI_API_KEY": "gem-key", "GROK_API_KEY": "grok-key"},
+      "env_after": {"GEMINI_API_KEY": "gem-key", "GOOGLE_API_KEY": "gem-key", "GROK_API_KEY": "grok-key", "XAI_API_KEY": "grok-key"}
+    }
+  ]
+}
