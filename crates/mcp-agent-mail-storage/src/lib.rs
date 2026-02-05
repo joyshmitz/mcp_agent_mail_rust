@@ -1412,6 +1412,336 @@ fn update_thread_digest(
 }
 
 // ---------------------------------------------------------------------------
+// Attachment pipeline
+// ---------------------------------------------------------------------------
+
+/// Metadata about a stored attachment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachmentMeta {
+    /// "inline" or "file"
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub media_type: String,
+    pub bytes: usize,
+    pub sha1: String,
+    pub width: u32,
+    pub height: u32,
+    /// Base64-encoded WebP data (only for inline type)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_base64: Option<String>,
+    /// Relative path to WebP file in archive (only for file type)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Relative path to original file (if keep_original_images is enabled)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_path: Option<String>,
+}
+
+/// Manifest written to `attachments/_manifests/{sha1}.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachmentManifest {
+    pub sha1: String,
+    pub webp_path: String,
+    pub bytes_webp: usize,
+    pub bytes_original: usize,
+    pub width: u32,
+    pub height: u32,
+    pub original_ext: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_path: Option<String>,
+}
+
+/// Result of storing a single attachment.
+pub struct StoredAttachment {
+    pub meta: AttachmentMeta,
+    /// Relative paths that were written (for git commit)
+    pub rel_paths: Vec<String>,
+}
+
+/// Embed policy for attachments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedPolicy {
+    /// Use server threshold to decide inline vs file
+    Auto,
+    /// Always inline (base64 embed)
+    Inline,
+    /// Always store as file reference
+    File,
+}
+
+impl EmbedPolicy {
+    pub fn from_str_policy(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "inline" => Self::Inline,
+            "file" => Self::File,
+            _ => Self::Auto,
+        }
+    }
+}
+
+/// Store an image attachment in the archive.
+///
+/// Converts to WebP, writes to `attachments/{sha1[:2]}/{sha1}.webp`,
+/// optionally keeps original, writes manifest and audit log.
+///
+/// Returns metadata and relative paths for git commit.
+pub fn store_attachment(
+    archive: &ProjectArchive,
+    config: &Config,
+    file_path: &Path,
+    embed_policy: EmbedPolicy,
+) -> Result<StoredAttachment> {
+    use base64::Engine;
+    use image::GenericImageView;
+
+    // Read original file
+    let original_bytes = fs::read(file_path)?;
+    if original_bytes.is_empty() {
+        return Err(StorageError::InvalidPath(
+            "Attachment file is empty".to_string(),
+        ));
+    }
+
+    // Compute SHA1 of original bytes
+    let digest = {
+        let mut hasher = sha1::Sha1::new();
+        hasher.update(&original_bytes);
+        hex::encode(hasher.finalize())
+    };
+
+    let prefix = &digest[..2.min(digest.len())];
+    let original_ext = file_path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()))
+        .unwrap_or_default();
+
+    // Ensure attachment directories
+    let attach_dir = archive.root.join("attachments");
+    let webp_dir = attach_dir.join(prefix);
+    let manifest_dir = attach_dir.join("_manifests");
+    let audit_dir = attach_dir.join("_audit");
+    fs::create_dir_all(&webp_dir)?;
+    fs::create_dir_all(&manifest_dir)?;
+    fs::create_dir_all(&audit_dir)?;
+
+    let mut rel_paths = Vec::new();
+
+    // Convert to WebP
+    let img = image::load_from_memory(&original_bytes).map_err(|e| {
+        StorageError::InvalidPath(format!("Failed to decode image: {e}"))
+    })?;
+    let (width, height) = img.dimensions();
+
+    let webp_filename = format!("{digest}.webp");
+    let webp_path = webp_dir.join(&webp_filename);
+
+    // Encode to WebP using the image crate
+    let mut webp_bytes = Vec::new();
+    let rgba = img.to_rgba8();
+    let encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut webp_bytes);
+    encoder
+        .encode(&rgba, width, height, image::ExtendedColorType::Rgba8)
+        .map_err(|e| StorageError::InvalidPath(format!("WebP encode error: {e}")))?;
+
+    fs::write(&webp_path, &webp_bytes)?;
+    let webp_rel = rel_path(&archive.repo_root, &webp_path)?;
+    rel_paths.push(webp_rel.clone());
+
+    // Optionally keep original
+    let original_rel = if config.keep_original_images {
+        let orig_dir = attach_dir.join("originals").join(prefix);
+        fs::create_dir_all(&orig_dir)?;
+        let orig_path = orig_dir.join(format!("{digest}{original_ext}"));
+        fs::write(&orig_path, &original_bytes)?;
+        let rel = rel_path(&archive.repo_root, &orig_path)?;
+        rel_paths.push(rel.clone());
+        Some(rel)
+    } else {
+        None
+    };
+
+    // Write manifest
+    let manifest = AttachmentManifest {
+        sha1: digest.clone(),
+        webp_path: webp_rel.clone(),
+        bytes_webp: webp_bytes.len(),
+        bytes_original: original_bytes.len(),
+        width,
+        height,
+        original_ext: original_ext.clone(),
+        original_path: original_rel.clone(),
+    };
+    let manifest_path = manifest_dir.join(format!("{digest}.json"));
+    write_json(&manifest_path, &serde_json::to_value(&manifest)?)?;
+    rel_paths.push(rel_path(&archive.repo_root, &manifest_path)?);
+
+    // Write audit log entry
+    let audit_path = audit_dir.join(format!("{digest}.log"));
+    let audit_entry = serde_json::json!({
+        "event": "stored",
+        "ts": Utc::now().to_rfc3339(),
+        "webp_path": webp_rel,
+        "bytes_webp": webp_bytes.len(),
+        "original_path": original_rel,
+        "bytes_original": original_bytes.len(),
+        "ext": original_ext,
+    });
+    let mut audit_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&audit_path)?;
+    audit_file.write_all(audit_entry.to_string().as_bytes())?;
+    audit_file.write_all(b"\n")?;
+    rel_paths.push(rel_path(&archive.repo_root, &audit_path)?);
+
+    // Decide inline vs file based on policy
+    let should_inline = match embed_policy {
+        EmbedPolicy::Inline => true,
+        EmbedPolicy::File => false,
+        EmbedPolicy::Auto => webp_bytes.len() <= config.inline_image_max_bytes,
+    };
+
+    let meta = if should_inline {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&webp_bytes);
+        AttachmentMeta {
+            kind: "inline".to_string(),
+            media_type: "image/webp".to_string(),
+            bytes: webp_bytes.len(),
+            sha1: digest,
+            width,
+            height,
+            data_base64: Some(encoded),
+            path: None,
+            original_path: original_rel,
+        }
+    } else {
+        AttachmentMeta {
+            kind: "file".to_string(),
+            media_type: "image/webp".to_string(),
+            bytes: webp_bytes.len(),
+            sha1: digest,
+            width,
+            height,
+            data_base64: None,
+            path: Some(webp_rel),
+            original_path: original_rel,
+        }
+    };
+
+    Ok(StoredAttachment { meta, rel_paths })
+}
+
+/// Process attachment paths and store them in the archive.
+///
+/// Returns a list of attachment metadata and all relative paths written.
+pub fn process_attachments(
+    archive: &ProjectArchive,
+    config: &Config,
+    attachment_paths: &[String],
+    embed_policy: EmbedPolicy,
+) -> Result<(Vec<AttachmentMeta>, Vec<String>)> {
+    let mut all_meta = Vec::new();
+    let mut all_rel_paths = Vec::new();
+
+    for path_str in attachment_paths {
+        let path = PathBuf::from(path_str);
+        let resolved = if path.is_absolute() {
+            path
+        } else {
+            resolve_archive_relative_path(archive, path_str)?
+        };
+
+        if !resolved.exists() {
+            return Err(StorageError::InvalidPath(format!(
+                "Attachment not found: {}",
+                resolved.display()
+            )));
+        }
+
+        let stored = store_attachment(archive, config, &resolved, embed_policy)?;
+        all_meta.push(stored.meta);
+        all_rel_paths.extend(stored.rel_paths);
+    }
+
+    Ok((all_meta, all_rel_paths))
+}
+
+/// Regex for matching Markdown image references: `![alt](path)`.
+fn image_pattern_re() -> &'static Regex {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"!\[(?P<alt>[^\]]*)\]\((?P<path>[^)]+)\)").expect("valid regex"))
+}
+
+/// Process inline image references in Markdown body.
+///
+/// Finds `![alt](path)` references and replaces them with either:
+/// - Inline base64 data URI: `![alt](data:image/webp;base64,...)`
+/// - Archive file path: `![alt](attachments/ab/ab1234...webp)`
+///
+/// Returns the modified body and any attachment metadata/paths.
+pub fn process_markdown_images(
+    archive: &ProjectArchive,
+    config: &Config,
+    body_md: &str,
+    embed_policy: EmbedPolicy,
+) -> Result<(String, Vec<AttachmentMeta>, Vec<String>)> {
+    let re = image_pattern_re();
+    let mut all_meta = Vec::new();
+    let mut all_rel_paths = Vec::new();
+    let mut result = body_md.to_string();
+
+    // Collect matches first to avoid borrow issues
+    let matches: Vec<(String, String, String)> = re
+        .captures_iter(body_md)
+        .map(|cap| {
+            let full = cap.get(0).unwrap().as_str().to_string();
+            let alt = cap.name("alt").unwrap().as_str().to_string();
+            let path = cap.name("path").unwrap().as_str().to_string();
+            (full, alt, path)
+        })
+        .collect();
+
+    for (full_match, alt, path) in matches {
+        // Skip data URIs and URLs
+        if path.starts_with("data:") || path.starts_with("http://") || path.starts_with("https://") {
+            continue;
+        }
+
+        // Resolve the path
+        let resolved = if Path::new(&path).is_absolute() {
+            PathBuf::from(&path)
+        } else {
+            match resolve_archive_relative_path(archive, &path) {
+                Ok(p) => p,
+                Err(_) => continue, // Skip unresolvable paths
+            }
+        };
+
+        if !resolved.exists() {
+            continue;
+        }
+
+        match store_attachment(archive, config, &resolved, embed_policy) {
+            Ok(stored) => {
+                let replacement = if let Some(ref b64) = stored.meta.data_base64 {
+                    format!("![{alt}](data:image/webp;base64,{b64})")
+                } else if let Some(ref file_path) = stored.meta.path {
+                    format!("![{alt}]({file_path})")
+                } else {
+                    continue;
+                };
+                result = result.replace(&full_match, &replacement);
+                all_rel_paths.extend(stored.rel_paths);
+                all_meta.push(stored.meta);
+            }
+            Err(_) => continue, // Skip failed conversions
+        }
+    }
+
+    Ok((result, all_meta, all_rel_paths))
+}
+
+// ---------------------------------------------------------------------------
 // Notification signals
 // ---------------------------------------------------------------------------
 
@@ -2252,5 +2582,218 @@ mod tests {
         let result = heal_archive_locks(&config).unwrap();
         assert_eq!(result.metadata_removed.len(), 1);
         assert!(!meta_path.exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // Attachment pipeline tests
+    // -----------------------------------------------------------------------
+
+    /// Create a minimal valid PNG image for testing.
+    fn create_test_png(path: &Path) {
+        use image::{ImageBuffer, Rgba};
+        let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
+            ImageBuffer::from_fn(4, 4, |x, y| {
+                Rgba([
+                    (x * 64) as u8,
+                    (y * 64) as u8,
+                    128,
+                    255,
+                ])
+            });
+        img.save(path).unwrap();
+    }
+
+    #[test]
+    fn test_store_attachment_file_mode() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "attach-proj").unwrap();
+
+        // Create a test image
+        let img_path = archive.root.join("test_image.png");
+        create_test_png(&img_path);
+
+        let stored = store_attachment(
+            &archive,
+            &config,
+            &img_path,
+            EmbedPolicy::File,
+        )
+        .unwrap();
+
+        assert_eq!(stored.meta.kind, "file");
+        assert_eq!(stored.meta.media_type, "image/webp");
+        assert_eq!(stored.meta.width, 4);
+        assert_eq!(stored.meta.height, 4);
+        assert!(stored.meta.data_base64.is_none());
+        assert!(stored.meta.path.is_some());
+        assert!(!stored.rel_paths.is_empty());
+
+        // Verify WebP file exists
+        let webp_path = archive.repo_root.join(stored.meta.path.unwrap());
+        assert!(webp_path.exists());
+
+        // Verify manifest exists
+        let manifest_dir = archive.root.join("attachments/_manifests");
+        assert!(manifest_dir.exists());
+        let manifest_files: Vec<_> = fs::read_dir(&manifest_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(manifest_files.len(), 1);
+    }
+
+    #[test]
+    fn test_store_attachment_inline_mode() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "inline-proj").unwrap();
+
+        let img_path = archive.root.join("small_image.png");
+        create_test_png(&img_path);
+
+        let stored = store_attachment(
+            &archive,
+            &config,
+            &img_path,
+            EmbedPolicy::Inline,
+        )
+        .unwrap();
+
+        assert_eq!(stored.meta.kind, "inline");
+        assert!(stored.meta.data_base64.is_some());
+        assert!(stored.meta.path.is_none());
+
+        // Base64 data should be valid
+        let b64 = stored.meta.data_base64.unwrap();
+        assert!(!b64.is_empty());
+    }
+
+    #[test]
+    fn test_store_attachment_auto_mode_small() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.inline_image_max_bytes = 1024 * 1024; // 1MiB threshold - our tiny test image should be inline
+        let archive = ensure_archive(&config, "auto-proj").unwrap();
+
+        let img_path = archive.root.join("tiny.png");
+        create_test_png(&img_path);
+
+        let stored = store_attachment(&archive, &config, &img_path, EmbedPolicy::Auto).unwrap();
+        // Our tiny 4x4 PNG -> WebP should be well under 1MiB
+        assert_eq!(stored.meta.kind, "inline");
+    }
+
+    #[test]
+    fn test_store_attachment_auto_mode_large() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.inline_image_max_bytes = 1; // 1 byte threshold - force file mode
+        let archive = ensure_archive(&config, "auto-large-proj").unwrap();
+
+        let img_path = archive.root.join("image.png");
+        create_test_png(&img_path);
+
+        let stored = store_attachment(&archive, &config, &img_path, EmbedPolicy::Auto).unwrap();
+        assert_eq!(stored.meta.kind, "file");
+    }
+
+    #[test]
+    fn test_store_attachment_keeps_original() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.keep_original_images = true;
+        let archive = ensure_archive(&config, "orig-proj").unwrap();
+
+        let img_path = archive.root.join("original.png");
+        create_test_png(&img_path);
+
+        let stored = store_attachment(&archive, &config, &img_path, EmbedPolicy::File).unwrap();
+        assert!(stored.meta.original_path.is_some());
+
+        let orig_rel = stored.meta.original_path.unwrap();
+        let orig_full = archive.repo_root.join(orig_rel);
+        assert!(orig_full.exists());
+    }
+
+    #[test]
+    fn test_process_attachments() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proc-proj").unwrap();
+
+        let img1 = archive.root.join("img1.png");
+        let img2 = archive.root.join("img2.png");
+        create_test_png(&img1);
+        create_test_png(&img2);
+
+        let (meta, rel_paths) = process_attachments(
+            &archive,
+            &config,
+            &[
+                img1.display().to_string(),
+                img2.display().to_string(),
+            ],
+            EmbedPolicy::File,
+        )
+        .unwrap();
+
+        assert_eq!(meta.len(), 2);
+        assert!(!rel_paths.is_empty());
+    }
+
+    #[test]
+    fn test_process_markdown_images() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "md-proj").unwrap();
+
+        // Create test image inside archive
+        let img_path = archive.root.join("diagram.png");
+        create_test_png(&img_path);
+
+        let body = "Check this: ![diagram](diagram.png) and text.";
+        let (new_body, meta, rel_paths) = process_markdown_images(
+            &archive,
+            &config,
+            body,
+            EmbedPolicy::Inline,
+        )
+        .unwrap();
+
+        assert_eq!(meta.len(), 1);
+        assert!(!rel_paths.is_empty());
+        // Should be replaced with data URI
+        assert!(new_body.contains("data:image/webp;base64,"));
+        assert!(!new_body.contains("diagram.png"));
+    }
+
+    #[test]
+    fn test_process_markdown_images_skips_urls() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "url-proj").unwrap();
+
+        let body = "Remote: ![photo](https://example.com/img.png) and local ref.";
+        let (new_body, meta, _) = process_markdown_images(
+            &archive,
+            &config,
+            body,
+            EmbedPolicy::File,
+        )
+        .unwrap();
+
+        // URL should be left unchanged
+        assert_eq!(new_body, body);
+        assert!(meta.is_empty());
+    }
+
+    #[test]
+    fn test_embed_policy_from_str() {
+        assert_eq!(EmbedPolicy::from_str_policy("inline"), EmbedPolicy::Inline);
+        assert_eq!(EmbedPolicy::from_str_policy("file"), EmbedPolicy::File);
+        assert_eq!(EmbedPolicy::from_str_policy("auto"), EmbedPolicy::Auto);
+        assert_eq!(EmbedPolicy::from_str_policy("INLINE"), EmbedPolicy::Inline);
+        assert_eq!(EmbedPolicy::from_str_policy("whatever"), EmbedPolicy::Auto);
     }
 }
