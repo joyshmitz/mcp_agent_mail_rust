@@ -2314,8 +2314,37 @@ pub async fn request_contact(
 
     let tracked = tracked(&*conn);
 
-    // Try existing link first (unique on (a_project_id, a_agent_id, b_project_id, b_agent_id)).
-    let existing = map_sql_outcome(
+    // Atomic upsert: INSERT OR IGNORE + UPDATE to avoid TOCTOU race under
+    // concurrent send_message auto-handshake (multiple agents requesting
+    // contact for the same pair simultaneously).
+    let upsert_sql = "INSERT INTO agent_links \
+        (a_project_id, a_agent_id, b_project_id, b_agent_id, status, reason, created_ts, updated_ts, expires_ts) \
+        VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?) \
+        ON CONFLICT(a_project_id, a_agent_id, b_project_id, b_agent_id) DO UPDATE SET \
+            status = 'pending', reason = excluded.reason, updated_ts = excluded.updated_ts, \
+            expires_ts = excluded.expires_ts";
+
+    let upsert_params: Vec<Value> = vec![
+        Value::BigInt(from_project_id),
+        Value::BigInt(from_agent_id),
+        Value::BigInt(to_project_id),
+        Value::BigInt(to_agent_id),
+        Value::Text(reason.to_string()),
+        Value::BigInt(now),
+        Value::BigInt(now),
+        expires.map_or(Value::Null, Value::BigInt),
+    ];
+
+    let upsert_out = map_sql_outcome(traw_execute(cx, &tracked, upsert_sql, &upsert_params).await);
+    match upsert_out {
+        Outcome::Ok(_) => {}
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    }
+
+    // Fetch the upserted row.
+    let fetch = map_sql_outcome(
         select!(AgentLinkRow)
             .filter(Expr::col("a_project_id").eq(from_project_id))
             .filter(Expr::col("a_agent_id").eq(from_agent_id))
@@ -2325,44 +2354,9 @@ pub async fn request_contact(
             .await,
     );
 
-    match existing {
-        Outcome::Ok(Some(mut row)) => {
-            row.status = "pending".to_string();
-            row.reason = reason.to_string();
-            row.updated_ts = now;
-            row.expires_ts = expires;
-            let out = map_sql_outcome(update!(&row).execute(cx, &tracked).await);
-            match out {
-                Outcome::Ok(_) => Outcome::Ok(row),
-                Outcome::Err(e) => Outcome::Err(e),
-                Outcome::Cancelled(r) => Outcome::Cancelled(r),
-                Outcome::Panicked(p) => Outcome::Panicked(p),
-            }
-        }
-        Outcome::Ok(None) => {
-            let mut row = AgentLinkRow {
-                id: None,
-                a_project_id: from_project_id,
-                a_agent_id: from_agent_id,
-                b_project_id: to_project_id,
-                b_agent_id: to_agent_id,
-                status: "pending".to_string(),
-                reason: reason.to_string(),
-                created_ts: now,
-                updated_ts: now,
-                expires_ts: expires,
-            };
-            let id_out = map_sql_outcome(insert!(&row).execute(cx, &tracked).await);
-            match id_out {
-                Outcome::Ok(id) => {
-                    row.id = Some(id);
-                    Outcome::Ok(row)
-                }
-                Outcome::Err(e) => Outcome::Err(e),
-                Outcome::Cancelled(r) => Outcome::Cancelled(r),
-                Outcome::Panicked(p) => Outcome::Panicked(p),
-            }
-        }
+    match fetch {
+        Outcome::Ok(Some(row)) => Outcome::Ok(row),
+        Outcome::Ok(None) => Outcome::Err(DbError::not_found("AgentLink", "upserted row")),
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
