@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::io::Write;
 
 use serde_json::Value;
 
@@ -116,7 +116,10 @@ impl TestEnv {
     fn base_env(&self) -> Vec<(String, String)> {
         vec![
             ("DATABASE_URL".to_string(), self.database_url()),
-            ("STORAGE_ROOT".to_string(), self.storage_root().display().to_string()),
+            (
+                "STORAGE_ROOT".to_string(),
+                self.storage_root().display().to_string(),
+            ),
             // Force server tool calls (products) to fail fast so we exercise local fallbacks.
             ("HTTP_HOST".to_string(), "127.0.0.1".to_string()),
             ("HTTP_PORT".to_string(), "1".to_string()),
@@ -332,6 +335,30 @@ fn seed_cli_json_db(db_path: &Path, root: &Path) -> (String, String) {
     ("abc123".to_string(), "GreenCastle".to_string())
 }
 
+fn seed_cli_json_db_product_only(db_path: &Path) -> String {
+    use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
+
+    let created_at_us = 1_704_067_200_000_000i64; // 2024-01-01T00:00:00Z
+
+    let conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+        .expect("open sqlite db");
+    conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
+        .expect("init schema");
+
+    conn.execute_sync(
+        "INSERT INTO products (id, product_uid, name, created_at) VALUES (?, ?, ?, ?)",
+        &[
+            SqlValue::BigInt(1),
+            SqlValue::Text("deadbeef".to_string()),
+            SqlValue::Text("Empty Product".to_string()),
+            SqlValue::BigInt(created_at_us),
+        ],
+    )
+    .unwrap();
+
+    "deadbeef".to_string()
+}
+
 fn seed_archive_fixture(root: &Path) {
     use zip::write::FileOptions;
 
@@ -435,25 +462,91 @@ fn assert_json_snapshot(env: &TestEnv, case: &str, cwd: Option<&Path>, args: &[&
 #[test]
 fn cli_json_snapshots() {
     // br-2ei.5.7.4: JSON output stability
-    let env = TestEnv::new();
-    let (product_key, agent_name) = seed_cli_json_db(&env.db_path, env.tmp.path());
-    seed_archive_fixture(env.tmp.path());
+    let env_seeded = TestEnv::new();
+    let (product_key, agent_name) = seed_cli_json_db(&env_seeded.db_path, env_seeded.tmp.path());
+    seed_archive_fixture(env_seeded.tmp.path());
 
-    let cases: Vec<(&str, Option<&Path>, Vec<String>)> = vec![
-        // Commands with explicit --json in legacy spec:
-        ("doctor_check", None, vec!["doctor", "check", "--json"].into_iter().map(String::from).collect()),
-        ("doctor_backups_empty", None, vec!["doctor", "backups", "--json"].into_iter().map(String::from).collect()),
-        ("list_projects", None, vec!["list-projects", "--include-agents", "--json"].into_iter().map(String::from).collect()),
-        // archive list uses detect_project_root(), so run from tmp root to avoid polluting repo.
-        ("archive_list", Some(env.tmp.path()), vec!["archive", "list", "--json"].into_iter().map(String::from).collect()),
-        // Products JSON flags are extra, but stable and useful for automation.
-        ("products_status", None, vec!["products", "status", &product_key, "--json"].into_iter().map(String::from).collect()),
-        ("products_search", None, vec!["products", "search", &product_key, "Unicorn", "--json"].into_iter().map(String::from).collect()),
-        ("products_inbox", None, vec!["products", "inbox", &product_key, &agent_name, "--json"].into_iter().map(String::from).collect()),
-    ];
+    let env_empty_archive = TestEnv::new();
 
-    for (case, cwd, args) in cases {
-        let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-        assert_json_snapshot(&env, case, cwd, &args_ref);
-    }
+    let env_product_only = TestEnv::new();
+    let empty_product_key = seed_cli_json_db_product_only(&env_product_only.db_path);
+
+    assert_json_snapshot(
+        &env_seeded,
+        "doctor_check",
+        None,
+        &["doctor", "check", "--json"],
+    );
+    assert_json_snapshot(
+        &env_seeded,
+        "doctor_backups_empty",
+        None,
+        &["doctor", "backups", "--json"],
+    );
+    assert_json_snapshot(
+        &env_seeded,
+        "list_projects",
+        None,
+        &["list-projects", "--include-agents", "--json"],
+    );
+
+    // archive list uses detect_project_root(), so run from a git-less tmp root.
+    assert_json_snapshot(
+        &env_empty_archive,
+        "archive_list_empty",
+        Some(env_empty_archive.tmp.path()),
+        &["archive", "list", "--json"],
+    );
+    assert_json_snapshot(
+        &env_seeded,
+        "archive_list",
+        Some(env_seeded.tmp.path()),
+        &["archive", "list", "--json"],
+    );
+
+    // Products JSON flags are extra (not in legacy CLI), but stable and useful for automation.
+    assert_json_snapshot(
+        &env_seeded,
+        "products_status",
+        None,
+        &["products", "status", &product_key, "--json"],
+    );
+    assert_json_snapshot(
+        &env_seeded,
+        "products_search",
+        None,
+        &["products", "search", &product_key, "Unicorn", "--json"],
+    );
+    assert_json_snapshot(
+        &env_seeded,
+        "products_inbox",
+        None,
+        &["products", "inbox", &product_key, &agent_name, "--json"],
+    );
+
+    // Empty-mode guarantees: when `--json` is set, output is still valid JSON.
+    assert_json_snapshot(
+        &env_product_only,
+        "products_search_empty",
+        None,
+        &[
+            "products",
+            "search",
+            &empty_product_key,
+            "Unicorn",
+            "--json",
+        ],
+    );
+    assert_json_snapshot(
+        &env_product_only,
+        "products_inbox_empty",
+        None,
+        &[
+            "products",
+            "inbox",
+            &empty_product_key,
+            "GreenCastle",
+            "--json",
+        ],
+    );
 }

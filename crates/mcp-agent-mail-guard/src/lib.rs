@@ -835,7 +835,11 @@ fn fnmatch_simple(name: &str, pattern: &str) -> bool {
                 }
                 // Try matching rest of pattern from every position
                 let remaining: String = name_chars.collect();
-                let slash_idx = if double_star { None } else { remaining.find('/') };
+                let slash_idx = if double_star {
+                    None
+                } else {
+                    remaining.find('/')
+                };
                 let mut positions: Vec<usize> = remaining.char_indices().map(|(i, _)| i).collect();
                 positions.push(remaining.len());
 
