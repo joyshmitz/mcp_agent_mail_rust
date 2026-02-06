@@ -217,6 +217,7 @@ Check that all parameters have valid values."
 ///
 /// # Returns
 /// Agent profile with all fields
+#[allow(clippy::too_many_lines)]
 #[tool(description = "Create or update an agent identity within a project.")]
 pub async fn register_agent(
     ctx: &McpContext,
@@ -228,6 +229,29 @@ pub async fn register_agent(
     attachments_policy: Option<String>,
 ) -> McpResult<String> {
     use mcp_agent_mail_core::models::{generate_agent_name, is_valid_agent_name};
+
+    // Validate program and model are non-empty
+    let program = program.trim().to_string();
+    if program.is_empty() {
+        return Err(legacy_tool_error(
+            "EMPTY_PROGRAM",
+            "program cannot be empty. Provide the name of your AI coding tool \
+             (e.g., 'claude-code', 'codex-cli', 'cursor', 'cline').",
+            true,
+            json!({ "provided": program }),
+        ));
+    }
+
+    let model = model.trim().to_string();
+    if model.is_empty() {
+        return Err(legacy_tool_error(
+            "EMPTY_MODEL",
+            "model cannot be empty. Provide the underlying model identifier \
+             (e.g., 'claude-opus-4.5', 'gpt-4-turbo', 'claude-sonnet-4').",
+            true,
+            json!({ "provided": model }),
+        ));
+    }
 
     let pool = get_db_pool()?;
 
@@ -348,6 +372,29 @@ pub async fn create_agent_identity(
     attachments_policy: Option<String>,
 ) -> McpResult<String> {
     use mcp_agent_mail_core::models::{generate_agent_name, is_valid_agent_name};
+
+    // Validate program and model are non-empty
+    let program = program.trim().to_string();
+    if program.is_empty() {
+        return Err(legacy_tool_error(
+            "EMPTY_PROGRAM",
+            "program cannot be empty. Provide the name of your AI coding tool \
+             (e.g., 'claude-code', 'codex-cli', 'cursor', 'cline').",
+            true,
+            json!({ "provided": program }),
+        ));
+    }
+
+    let model = model.trim().to_string();
+    if model.is_empty() {
+        return Err(legacy_tool_error(
+            "EMPTY_MODEL",
+            "model cannot be empty. Provide the underlying model identifier \
+             (e.g., 'claude-opus-4.5', 'gpt-4-turbo', 'claude-sonnet-4').",
+            true,
+            json!({ "provided": model }),
+        ));
+    }
 
     let pool = get_db_pool()?;
 

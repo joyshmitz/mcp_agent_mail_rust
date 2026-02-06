@@ -6,13 +6,12 @@
 //!   `{storage_root}/projects/{project_slug}/build_slots/{slot}/{agent__branch}.json`
 //! - Conflicts are detected by scanning active (non-expired) leases.
 
-use fastmcp::McpErrorCode;
 use fastmcp::prelude::*;
 use mcp_agent_mail_core::Config;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use crate::tool_util::{get_db_pool, resolve_project};
+use crate::tool_util::{get_db_pool, legacy_tool_error, resolve_project};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildSlotLease {
@@ -106,9 +105,11 @@ fn write_lease_json(path: &Path, lease: &BuildSlotLease) -> std::io::Result<()> 
 }
 
 fn worktrees_required() -> McpError {
-    McpError::new(
-        McpErrorCode::InvalidParams,
+    legacy_tool_error(
+        "FEATURE_DISABLED",
         "Build slots are disabled. Enable WORKTREES_ENABLED to use this tool.",
+        false,
+        serde_json::json!({ "feature": "worktrees", "env_var": "WORKTREES_ENABLED" }),
     )
 }
 

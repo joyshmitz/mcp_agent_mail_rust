@@ -6,12 +6,13 @@
 //! - `list_contacts`: List contact relationships
 //! - `set_contact_policy`: Configure agent contact policy
 
-use fastmcp::McpErrorCode;
 use fastmcp::prelude::*;
 use mcp_agent_mail_db::micros_to_iso;
 use serde::{Deserialize, Serialize};
 
-use crate::tool_util::{db_outcome_to_mcp_result, get_db_pool, resolve_agent, resolve_project};
+use crate::tool_util::{
+    db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_agent, resolve_project,
+};
 
 /// Contact link state (tool-facing).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,15 +126,19 @@ pub async fn request_contact(
                 return Err(e);
             }
             let program = program.ok_or_else(|| {
-                McpError::new(
-                    McpErrorCode::InvalidParams,
+                legacy_tool_error(
+                    "MISSING_FIELD",
                     "program is required when register_if_missing=true",
+                    true,
+                    serde_json::json!({ "field": "program" }),
                 )
             })?;
             let model = model.ok_or_else(|| {
-                McpError::new(
-                    McpErrorCode::InvalidParams,
+                legacy_tool_error(
+                    "MISSING_FIELD",
                     "model is required when register_if_missing=true",
+                    true,
+                    serde_json::json!({ "field": "model" }),
                 )
             })?;
 
@@ -215,7 +220,7 @@ pub async fn request_contact(
     };
 
     serde_json::to_string(&response)
-        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+        .map_err(|e| McpError::internal_error(format!("JSON serialization error: {e}")))
 }
 
 /// Approve or deny a contact request.
@@ -273,7 +278,7 @@ pub async fn respond_contact(
     };
 
     serde_json::to_string(&response)
-        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+        .map_err(|e| McpError::internal_error(format!("JSON serialization error: {e}")))
 }
 
 /// List contact links for an agent in a project.
@@ -339,7 +344,7 @@ pub async fn list_contacts(
     );
 
     serde_json::to_string(&contacts)
-        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+        .map_err(|e| McpError::internal_error(format!("JSON serialization error: {e}")))
 }
 
 /// Set contact policy for an agent.
@@ -394,5 +399,5 @@ pub async fn set_contact_policy(
     );
 
     serde_json::to_string(&response)
-        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+        .map_err(|e| McpError::internal_error(format!("JSON serialization error: {e}")))
 }

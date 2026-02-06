@@ -6,7 +6,6 @@
 //! - `macro_file_reservation_cycle`: Reserve and optionally release files
 //! - `macro_contact_handshake`: Request + approve + welcome message
 
-use fastmcp::McpErrorCode;
 use fastmcp::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -14,7 +13,7 @@ use crate::identity::{AgentResponse, ProjectResponse, WhoisResponse};
 use crate::messaging::InboxMessage;
 use crate::reservations::{ReleaseResult, ReservationResponse};
 use crate::search::{ExampleMessage, ThreadSummary};
-use crate::tool_util::{db_outcome_to_mcp_result, get_db_pool, resolve_project};
+use crate::tool_util::{db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_project};
 use mcp_agent_mail_db::micros_to_iso;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -61,12 +60,8 @@ pub struct HandshakeResponse {
 }
 
 fn parse_json<T: DeserializeOwned>(payload: String, label: &str) -> McpResult<T> {
-    serde_json::from_str(&payload).map_err(|e| {
-        McpError::new(
-            McpErrorCode::InternalError,
-            format!("{label} JSON error: {e}"),
-        )
-    })
+    serde_json::from_str(&payload)
+        .map_err(|e| McpError::internal_error(format!("{label} JSON parse error: {e}")))
 }
 
 /// Boot a project session: ensure project + register agent + reserve files + fetch inbox.
@@ -99,9 +94,11 @@ pub async fn macro_start_session(
 ) -> McpResult<String> {
     // Validate human_key is absolute
     if !human_key.starts_with('/') {
-        return Err(McpError::new(
-            McpErrorCode::InvalidParams,
-            "human_key must be an absolute path",
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "human_key must be an absolute path (e.g., '/data/projects/backend')",
+            true,
+            serde_json::json!({ "field": "human_key", "provided": human_key }),
         ));
     }
 
@@ -174,7 +171,7 @@ pub async fn macro_start_session(
     );
 
     serde_json::to_string(&response)
-        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+        .map_err(|e| McpError::internal_error(format!("JSON serialization error: {e}")))
 }
 
 /// Align with an existing thread: register + summarize + fetch inbox.
@@ -236,9 +233,11 @@ pub async fn macro_prepare_thread(
         parse_json(agent_json, "agent")?
     } else {
         let agent_name = agent_name.ok_or_else(|| {
-            McpError::new(
-                McpErrorCode::InvalidParams,
+            legacy_tool_error(
+                "MISSING_FIELD",
                 "agent_name is required when register_if_missing is false",
+                true,
+                serde_json::json!({ "field": "agent_name" }),
             )
         })?;
         let whois_json =
@@ -321,7 +320,7 @@ pub async fn macro_prepare_thread(
     }
 
     serde_json::to_string(&response)
-        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+        .map_err(|e| McpError::internal_error(format!("JSON serialization error: {e}")))
 }
 
 /// Reserve files and optionally release at the end.
@@ -352,9 +351,11 @@ pub async fn macro_file_reservation_cycle(
 
     // Validate TTL >= 60 seconds
     if ttl < 60 {
-        return Err(McpError::new(
-            McpErrorCode::InvalidParams,
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
             "ttl_seconds must be at least 60 seconds",
+            true,
+            serde_json::json!({ "field": "ttl_seconds", "provided": ttl, "min": 60 }),
         ));
     }
 
@@ -401,7 +402,7 @@ pub async fn macro_file_reservation_cycle(
     );
 
     serde_json::to_string(&response)
-        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+        .map_err(|e| McpError::internal_error(format!("JSON serialization error: {e}")))
 }
 
 /// Request contact + optionally auto-approve + optionally send welcome message.
@@ -445,16 +446,20 @@ pub async fn macro_contact_handshake(
 ) -> McpResult<String> {
     // Resolve agent names from aliases
     let from_agent = requester.or(agent_name).ok_or_else(|| {
-        McpError::new(
-            McpErrorCode::InvalidParams,
+        legacy_tool_error(
+            "MISSING_FIELD",
             "requester or agent_name is required",
+            true,
+            serde_json::json!({ "field": "requester" }),
         )
     })?;
 
     let target_agent = target.or(to_agent).ok_or_else(|| {
-        McpError::new(
-            McpErrorCode::InvalidParams,
+        legacy_tool_error(
+            "MISSING_FIELD",
             "target or to_agent is required",
+            true,
+            serde_json::json!({ "field": "target" }),
         )
     })?;
 
@@ -494,8 +499,14 @@ pub async fn macro_contact_handshake(
                     crate::tool_util::resolve_agent(ctx, &pool, project_id, &target_agent).await;
             }
         }
-        let to_row = to_row
-            .map_err(|_| McpError::new(McpErrorCode::InvalidParams, "target agent not found"))?;
+        let to_row = to_row.map_err(|_| {
+            legacy_tool_error(
+                "NOT_FOUND",
+                format!("Target agent not found: {target_agent}"),
+                true,
+                serde_json::json!({ "entity": "Agent", "identifier": target_agent }),
+            )
+        })?;
 
         let ttl = if ttl < 60 { 60 } else { ttl };
 
@@ -542,7 +553,7 @@ pub async fn macro_contact_handshake(
         };
 
         return serde_json::to_string(&response)
-            .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")));
+            .map_err(|e| McpError::internal_error(format!("JSON serialization error: {e}")));
     }
 
     let request_json = crate::contacts::request_contact(
@@ -642,7 +653,7 @@ pub async fn macro_contact_handshake(
     }
 
     serde_json::to_string(&response)
-        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+        .map_err(|e| McpError::internal_error(format!("JSON serialization error: {e}")))
 }
 
 // removed generate_slug (unused; slug derivation handled by ensure_project)

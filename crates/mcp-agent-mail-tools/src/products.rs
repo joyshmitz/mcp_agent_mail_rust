@@ -7,7 +7,6 @@
 //! - Cross-project search/inbox/thread summary operate across linked projects
 
 use asupersync::Cx;
-use fastmcp::McpErrorCode;
 use fastmcp::prelude::*;
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::{DbPool, ProductRow, micros_to_iso};
@@ -16,14 +15,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::messaging::InboxMessage;
 use crate::search::{ExampleMessage, SingleThreadResponse};
-use crate::tool_util::{db_outcome_to_mcp_result, get_db_pool, resolve_agent, resolve_project};
+use crate::tool_util::{
+    db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_agent, resolve_project,
+};
 
 static PRODUCT_UID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn worktrees_required() -> McpError {
-    McpError::new(
-        McpErrorCode::InvalidParams,
+    legacy_tool_error(
+        "FEATURE_DISABLED",
         "Product Bus is disabled. Enable WORKTREES_ENABLED to use this tool.",
+        false,
+        serde_json::json!({ "feature": "worktrees", "env_var": "WORKTREES_ENABLED" }),
     )
 }
 
@@ -113,9 +116,11 @@ pub async fn ensure_product(
         .unwrap_or("")
         .trim();
     if key_raw.is_empty() {
-        return Err(McpError::new(
-            McpErrorCode::InvalidParams,
+        return Err(legacy_tool_error(
+            "MISSING_FIELD",
             "Provide product_key or name.",
+            true,
+            serde_json::json!({ "field": "product_key" }),
         ));
     }
 
@@ -204,9 +209,11 @@ pub async fn products_link(
     let product = get_product_by_key(ctx.cx(), &pool, product_key.trim())
         .await?
         .ok_or_else(|| {
-            McpError::new(
-                McpErrorCode::InvalidParams,
-                format!("Product '{product_key}' not found."),
+            legacy_tool_error(
+                "NOT_FOUND",
+                format!("Product not found: {product_key}"),
+                true,
+                serde_json::json!({ "entity": "Product", "identifier": product_key }),
             )
         })?;
 
@@ -285,9 +292,11 @@ pub async fn search_messages_product(
     let product = get_product_by_key(ctx.cx(), &pool, product_key.trim())
         .await?
         .ok_or_else(|| {
-            McpError::new(
-                McpErrorCode::InvalidParams,
-                format!("Product '{product_key}' not found."),
+            legacy_tool_error(
+                "NOT_FOUND",
+                format!("Product not found: {product_key}"),
+                true,
+                serde_json::json!({ "entity": "Product", "identifier": product_key }),
             )
         })?;
     let product_id = product.id.unwrap_or(0);
@@ -346,9 +355,11 @@ pub async fn fetch_inbox_product(
     let product = get_product_by_key(ctx.cx(), &pool, product_key.trim())
         .await?
         .ok_or_else(|| {
-            McpError::new(
-                McpErrorCode::InvalidParams,
-                format!("Product '{product_key}' not found."),
+            legacy_tool_error(
+                "NOT_FOUND",
+                format!("Product not found: {product_key}"),
+                true,
+                serde_json::json!({ "entity": "Product", "identifier": product_key }),
             )
         })?;
     let product_id = product.id.unwrap_or(0);
@@ -441,9 +452,11 @@ pub async fn summarize_thread_product(
     let product = get_product_by_key(ctx.cx(), &pool, product_key.trim())
         .await?
         .ok_or_else(|| {
-            McpError::new(
-                McpErrorCode::InvalidParams,
-                format!("Product '{product_key}' not found."),
+            legacy_tool_error(
+                "NOT_FOUND",
+                format!("Product not found: {product_key}"),
+                true,
+                serde_json::json!({ "entity": "Product", "identifier": product_key }),
             )
         })?;
     let product_id = product.id.unwrap_or(0);

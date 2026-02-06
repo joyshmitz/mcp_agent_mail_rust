@@ -14,7 +14,7 @@ use fastmcp::prelude::*;
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::{iso_to_micros, micros_to_iso};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1882,9 +1882,9 @@ pub async fn product_details(ctx: &McpContext, key: String) -> McpResult<String>
 
         let sql = "SELECT * FROM products WHERE product_uid = ? OR name = ? LIMIT 1";
         let params = [Value::Text(key.to_string()), Value::Text(key.to_string())];
-    let rows = conn
-        .query_sync(sql, &params)
-        .map_err(|e| McpError::internal_error(e.to_string()))?;
+        let rows = conn
+            .query_sync(sql, &params)
+            .map_err(|e| McpError::internal_error(e.to_string()))?;
         let Some(row) = rows.into_iter().next() else {
             return Ok(None);
         };
@@ -2048,7 +2048,9 @@ pub async fn thread_details(ctx: &McpContext, thread_id: String) -> McpResult<St
     let (thread_id_str, query) = split_param_and_query(&thread_id);
 
     let project_key = query.get("project").cloned().unwrap_or_default();
-    let include_bodies = query.get("include_bodies").is_some_and(|v| parse_bool_param(v));
+    let include_bodies = query
+        .get("include_bodies")
+        .is_some_and(|v| parse_bool_param(v));
 
     if project_key.is_empty() {
         return Err(McpError::new(
@@ -2181,8 +2183,12 @@ pub async fn inbox(ctx: &McpContext, agent: String) -> McpResult<String> {
     let (agent_name, query) = split_param_and_query(&agent);
 
     let project_key = query.get("project").cloned().unwrap_or_default();
-    let include_bodies = query.get("include_bodies").is_some_and(|v| parse_bool_param(v));
-    let urgent_only = query.get("urgent_only").is_some_and(|v| parse_bool_param(v));
+    let include_bodies = query
+        .get("include_bodies")
+        .is_some_and(|v| parse_bool_param(v));
+    let urgent_only = query
+        .get("urgent_only")
+        .is_some_and(|v| parse_bool_param(v));
     let since_ts: Option<i64> = query.get("since_ts").and_then(|v| iso_to_micros(v));
     let limit = query
         .get("limit")
@@ -2623,7 +2629,9 @@ pub async fn outbox(ctx: &McpContext, agent: String) -> McpResult<String> {
         .get("limit")
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
-    let include_bodies = query.get("include_bodies").is_some_and(|v| parse_bool_param(v));
+    let include_bodies = query
+        .get("include_bodies")
+        .is_some_and(|v| parse_bool_param(v));
     let since_ts: Option<i64> = query.get("since_ts").and_then(|v| iso_to_micros(v));
 
     if project_key.is_empty() {
@@ -3216,55 +3224,6 @@ fn reservation_git_latest_activity_micros(repo_root: &Path, pathspecs: &[String]
     best
 }
 
-fn reservation_pathspec_has_ancestor_dir(spec: &str, kept_dirs: &HashSet<String>) -> bool {
-    let mut cur = spec;
-    while let Some((parent, _)) = cur.rsplit_once('/') {
-        if kept_dirs.contains(parent) {
-            return true;
-        }
-        cur = parent;
-    }
-    false
-}
-
-fn reservation_compress_git_pathspecs(specs: Vec<(String, bool)>) -> Vec<String> {
-    if specs.is_empty() {
-        return Vec::new();
-    }
-
-    // Dedupe and remember "is_dir" if any occurrence was a directory.
-    let mut by_spec: HashMap<String, bool> = HashMap::new();
-    for (spec, is_dir) in specs {
-        let spec = spec.trim().trim_end_matches('/').to_string();
-        if spec.is_empty() {
-            continue;
-        }
-        by_spec
-            .entry(spec)
-            .and_modify(|v| *v = *v || is_dir)
-            .or_insert(is_dir);
-    }
-
-    let mut entries: Vec<(String, bool)> = by_spec.into_iter().collect();
-    entries.sort_by_key(|(spec, _)| spec.len());
-
-    let mut kept_dirs: HashSet<String> = HashSet::new();
-    let mut out: Vec<String> = Vec::with_capacity(entries.len());
-
-    for (spec, is_dir) in entries {
-        if reservation_pathspec_has_ancestor_dir(&spec, &kept_dirs) {
-            continue;
-        }
-
-        if is_dir {
-            kept_dirs.insert(spec.clone());
-        }
-        out.push(spec);
-    }
-
-    out
-}
-
 fn reservation_compute_pattern_activity(
     workspace: Option<&Path>,
     repo_root: Option<&Path>,
@@ -3281,47 +3240,42 @@ fn reservation_compute_pattern_activity(
     }
 
     let want_git = repo_root.is_some() && workspace_rel.is_some();
-    let mut git_specs: Vec<(String, bool)> = Vec::new();
 
     let has_glob = reservation_contains_glob(&normalized);
     let mut matches = false;
     let mut fs_latest: Option<i64> = None;
 
     if has_glob {
-        let glob_pattern = workspace.join(&normalized).to_string_lossy().to_string();
-        if let Ok(iter) = glob::glob(&glob_pattern) {
-            for entry in iter {
-                let Ok(path) = entry else { continue };
-                matches = true;
+        // IMPORTANT: Do not expand globs by walking the filesystem. Broad patterns like `src/**`
+        // can explode to thousands of matches and stall the MCP server.
+        //
+        // Instead, treat "matched" as "base directory exists" and ask git for the latest commit
+        // affecting the pathspec via `:(glob)` magic (cheap and bounded).
+        let base_dir = {
+            let first_glob = normalized
+                .char_indices()
+                .find_map(|(idx, ch)| RESERVATION_GLOB_MARKERS.contains(&ch).then_some(idx))
+                .unwrap_or(0);
+            let prefix = &normalized[..first_glob];
+            if prefix.ends_with('/') {
+                prefix.trim_end_matches('/')
+            } else {
+                prefix
+                    .rsplit_once('/')
+                    .map_or("", |(dir, _)| dir.trim_end_matches('/'))
+            }
+        };
 
-                let mut is_dir = false;
-                if let Ok(meta) = std::fs::metadata(&path) {
-                    is_dir = meta.is_dir();
-                    if let Ok(modified) = meta.modified() {
-                        if let Some(ts) = reservation_system_time_to_micros(modified) {
-                            fs_latest = Some(fs_latest.map_or(ts, |prev| prev.max(ts)));
-                        }
-                    }
-                }
+        let base_path = if base_dir.is_empty() {
+            workspace.to_path_buf()
+        } else {
+            workspace.join(base_dir)
+        };
 
-                if want_git {
-                    if let Ok(rel_ws) = path.strip_prefix(workspace) {
-                        let rel_slash = reservation_path_to_slash_string(rel_ws);
-                        if rel_slash.is_empty() {
-                            // Edge case: glob yielded the workspace root itself.
-                            let mut spec = reservation_path_to_slash_string(workspace_rel.unwrap())
-                                .trim_end_matches('/')
-                                .to_string();
-                            if spec.is_empty() {
-                                spec = ".".to_string();
-                            }
-                            git_specs.push((spec, true));
-                        } else {
-                            let spec = reservation_git_pathspec(workspace_rel.unwrap(), &rel_slash);
-                            git_specs.push((spec, is_dir));
-                        }
-                    }
-                }
+        if let Ok(meta) = std::fs::metadata(&base_path) {
+            matches = true;
+            if let Ok(modified) = meta.modified() {
+                fs_latest = reservation_system_time_to_micros(modified);
             }
         }
     } else {
@@ -3329,24 +3283,22 @@ fn reservation_compute_pattern_activity(
         if candidate.exists() {
             matches = true;
 
-            let mut is_dir = false;
             if let Ok(meta) = std::fs::metadata(&candidate) {
-                is_dir = meta.is_dir();
                 if let Ok(modified) = meta.modified() {
                     fs_latest = reservation_system_time_to_micros(modified);
                 }
-            }
-
-            if want_git {
-                let spec = reservation_git_pathspec(workspace_rel.unwrap(), &normalized);
-                git_specs.push((spec, is_dir));
             }
         }
     }
 
     let git_activity = if matches && want_git {
-        let pathspecs = reservation_compress_git_pathspecs(git_specs);
-        reservation_git_latest_activity_micros(repo_root.unwrap(), &pathspecs)
+        let spec = reservation_git_pathspec(workspace_rel.unwrap(), &normalized);
+        let spec = if has_glob {
+            format!(":(glob){spec}")
+        } else {
+            spec
+        };
+        reservation_git_latest_activity_micros(repo_root.unwrap(), &[spec])
     } else {
         None
     };
@@ -3355,6 +3307,60 @@ fn reservation_compute_pattern_activity(
         matches,
         fs_activity_micros: fs_latest,
         git_activity_micros: git_activity,
+    }
+}
+
+#[cfg(test)]
+mod reservation_activity_tests {
+    use super::*;
+
+    fn run_git(repo_root: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run git {args:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn reservation_compute_pattern_activity_glob_uses_git_pathspec_magic() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        std::fs::create_dir_all(root.join("src")).expect("create src dir");
+        std::fs::write(root.join("src/lib.rs"), "fn main() {}\n").expect("write file");
+
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.email", "test@example.com"]);
+        run_git(root, &["config", "user.name", "Test User"]);
+        run_git(root, &["add", "."]);
+        run_git(root, &["commit", "-m", "init"]);
+
+        let (repo_root, workspace_rel) =
+            reservation_open_repo_root(root).expect("repo root discoverable");
+        let activity = reservation_compute_pattern_activity(
+            Some(root),
+            Some(repo_root.as_path()),
+            Some(workspace_rel.as_path()),
+            "src/**",
+        );
+        assert!(activity.matches);
+        assert!(activity.git_activity_micros.is_some());
+
+        let unmatched = reservation_compute_pattern_activity(
+            Some(root),
+            Some(repo_root.as_path()),
+            Some(workspace_rel.as_path()),
+            "nope/**",
+        );
+        assert!(!unmatched.matches);
+        assert!(unmatched.git_activity_micros.is_none());
     }
 }
 
@@ -3385,7 +3391,7 @@ pub struct FileReservationResourceEntry {
 )]
 pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<String> {
     let (slug_str, query) = split_param_and_query(&slug);
-    let active_only = query.get("active_only").is_none_or(|v| v != "false");
+    let active_only = query.get("active_only").is_none_or(|v| parse_bool_param(v));
 
     let pool = get_db_pool()?;
 

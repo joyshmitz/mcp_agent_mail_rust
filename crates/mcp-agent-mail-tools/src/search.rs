@@ -260,21 +260,20 @@ pub async fn search_messages(
     let max_results_raw = limit.unwrap_or(20);
     if max_results_raw < 1 {
         return Err(legacy_tool_error(
-            "INVALID_ARGUMENT",
-            "Invalid argument value: limit must be at least 1. Check that all parameters have valid values.",
+            "INVALID_LIMIT",
+            format!("limit must be at least 1, got {max_results_raw}. Use a positive integer."),
             true,
-            json!({"field":"limit","error_detail":max_results_raw}),
+            json!({"provided": max_results_raw, "min": 1, "max": 1000}),
         ));
     }
-    let max_results = usize::try_from(max_results_raw)
-        .map_err(|_| {
-            legacy_tool_error(
-                "INVALID_ARGUMENT",
-                "Invalid argument value: limit exceeds supported range. Check that all parameters have valid values.",
-                true,
-                json!({"field":"limit","error_detail":max_results_raw}),
-            )
-        })?;
+    let max_results = usize::try_from(max_results_raw).map_err(|_| {
+        legacy_tool_error(
+            "INVALID_LIMIT",
+            format!("limit exceeds supported range: {max_results_raw}"),
+            true,
+            json!({"provided": max_results_raw, "min": 1, "max": 1000}),
+        )
+    })?;
 
     // Validate query is not empty
     if query.trim().is_empty() {

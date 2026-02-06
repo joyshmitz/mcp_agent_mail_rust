@@ -15,9 +15,12 @@ use mcp_agent_mail_db::{DbError, micros_to_iso};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+use serde_json::json;
+
 use crate::pattern_overlap::CompiledPattern;
 use crate::tool_util::{
-    db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, resolve_agent, resolve_project,
+    db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_agent,
+    resolve_project,
 };
 
 /// Write a message bundle to the git archive (best-effort, non-blocking).
@@ -100,6 +103,20 @@ async fn resolve_or_register_agent(
             p.message()
         ))),
     }
+}
+
+/// Validate `thread_id` format: must start with alphanumeric and contain only
+/// letters, numbers, '.', '_', or '-'. Max 128 chars.
+fn is_valid_thread_id(tid: &str) -> bool {
+    if tid.is_empty() || tid.len() > 128 {
+        return false;
+    }
+    let first = tid.as_bytes()[0];
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    tid.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -264,9 +281,14 @@ pub async fn send_message(
 ) -> McpResult<String> {
     // Validate recipients
     if to.is_empty() {
-        return Err(McpError::new(
-            McpErrorCode::InvalidParams,
-            "At least one recipient (to) is required",
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "At least one recipient (to) is required. Provide agent names in the 'to' array.",
+            true,
+            json!({
+                "field": "to",
+                "error_detail": "empty recipient list",
+            }),
         ));
     }
 
@@ -284,10 +306,38 @@ pub async fn send_message(
     // Validate importance
     let importance_val = importance.unwrap_or_else(|| "normal".to_string());
     if !["low", "normal", "high", "urgent"].contains(&importance_val.as_str()) {
-        return Err(McpError::new(
-            McpErrorCode::InvalidParams,
-            format!("Invalid importance '{importance_val}'. Must be: low, normal, high, or urgent"),
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            format!(
+                "Invalid argument value: importance='{importance_val}'. \
+                 Must be: low, normal, high, or urgent. Check that all parameters have valid values."
+            ),
+            true,
+            json!({
+                "field": "importance",
+                "error_detail": importance_val,
+            }),
         ));
+    }
+
+    // Validate thread_id format if provided
+    if let Some(ref tid) = thread_id {
+        let tid = tid.trim();
+        if !tid.is_empty() && !is_valid_thread_id(tid) {
+            return Err(legacy_tool_error(
+                "INVALID_THREAD_ID",
+                format!(
+                    "Invalid thread_id: '{tid}'. Thread IDs must start with an alphanumeric character and \
+                     contain only letters, numbers, '.', '_', or '-' (max 128). \
+                     Examples: 'TKT-123', 'bd-42', 'feature-xyz'."
+                ),
+                true,
+                json!({
+                    "provided": tid,
+                    "examples": ["TKT-123", "bd-42", "feature-xyz"],
+                }),
+            ));
+        }
     }
 
     let config = Config::from_env();
@@ -550,9 +600,11 @@ pub async fn send_message(
                 continue;
             }
             if policy == "block_all" {
-                return Err(McpError::new(
-                    McpErrorCode::InvalidParams,
-                    "CONTACT_BLOCKED: Recipient is not accepting messages.",
+                return Err(legacy_tool_error(
+                    "CONTACT_BLOCKED",
+                    "Recipient is not accepting messages.",
+                    true,
+                    json!({}),
                 ));
             }
             let approved = approved_set.contains(&rec_id);
@@ -633,12 +685,31 @@ pub async fn send_message(
         }
 
         if !blocked.is_empty() {
-            return Err(McpError::new(
-                McpErrorCode::InvalidParams,
+            let blocked_sorted: Vec<String> = {
+                let mut v = blocked.clone();
+                v.sort();
+                v.dedup();
+                v
+            };
+            let recipient_list = blocked_sorted.join(", ");
+            let sample = blocked_sorted.first().cloned().unwrap_or_default();
+            return Err(legacy_tool_error(
+                "CONTACT_REQUIRED",
                 format!(
-                    "CONTACT_BLOCKED: Missing contact approval for {}",
-                    blocked.join(", ")
+                    "Contact approval required for recipients: {recipient_list}. \
+                     Before retrying, request approval with \
+                     `request_contact(project_key='{project_key}', from_agent='{sender_name}', \
+                     to_agent='{sample}')` or run \
+                     `macro_contact_handshake(project_key='{project_key}', \
+                     requester='{sender_name}', target='{sample}', auto_accept=True)`.",
+                    project_key = project.human_key,
+                    sender_name = sender.name,
                 ),
+                true,
+                json!({
+                    "blocked_recipients": blocked_sorted,
+                    "sample_target": sample,
+                }),
             ));
         }
     }
@@ -809,9 +880,14 @@ pub async fn reply_message(
         mcp_agent_mail_db::queries::get_message(ctx.cx(), &pool, message_id).await,
     )?;
     if original.project_id != project_id {
-        return Err(McpError::new(
-            McpErrorCode::InvalidParams,
-            "Message not found",
+        return Err(legacy_tool_error(
+            "NOT_FOUND",
+            format!("Message not found: {message_id}"),
+            true,
+            json!({
+                "entity": "Message",
+                "identifier": message_id,
+            }),
         ));
     }
 
@@ -995,6 +1071,7 @@ pub async fn reply_message(
 /// - `since_ts`: Only messages after this timestamp
 /// - `limit`: Max messages to return (default: 20)
 /// - `include_bodies`: Include full message bodies (default: false)
+#[allow(clippy::too_many_lines)]
 #[tool(description = "Retrieve recent messages for an agent without mutating state.")]
 pub async fn fetch_inbox(
     ctx: &McpContext,
@@ -1007,9 +1084,11 @@ pub async fn fetch_inbox(
 ) -> McpResult<String> {
     let mut msg_limit = limit.unwrap_or(20);
     if msg_limit < 1 {
-        return Err(McpError::new(
-            McpErrorCode::InvalidParams,
-            format!("limit must be at least 1, got {msg_limit}"),
+        return Err(legacy_tool_error(
+            "INVALID_LIMIT",
+            format!("limit must be at least 1, got {msg_limit}. Use a positive integer."),
+            true,
+            json!({ "provided": msg_limit, "min": 1, "max": 1000 }),
         ));
     }
     if msg_limit > 1000 {
@@ -1019,8 +1098,14 @@ pub async fn fetch_inbox(
         );
         msg_limit = 1000;
     }
-    let msg_limit = usize::try_from(msg_limit)
-        .map_err(|_| McpError::new(McpErrorCode::InvalidParams, "limit exceeds supported range"))?;
+    let msg_limit = usize::try_from(msg_limit).map_err(|_| {
+        legacy_tool_error(
+            "INVALID_LIMIT",
+            format!("limit exceeds supported range: {msg_limit}"),
+            true,
+            json!({ "provided": msg_limit, "min": 1, "max": 1000 }),
+        )
+    })?;
     let include_body = include_bodies.unwrap_or(false);
     let urgent = urgent_only.unwrap_or(false);
 
@@ -1034,9 +1119,19 @@ pub async fn fetch_inbox(
     // Parse since_ts if provided (ISO-8601 to micros)
     let since_micros: Option<i64> = if let Some(ts) = &since_ts {
         Some(mcp_agent_mail_db::iso_to_micros(ts).ok_or_else(|| {
-            McpError::new(
-                McpErrorCode::InvalidParams,
-                format!("Invalid since_ts format: {ts}"),
+            legacy_tool_error(
+                "INVALID_TIMESTAMP",
+                format!(
+                    "Invalid since_ts format: '{ts}'. \
+                     Expected ISO-8601 format like '2025-01-15T10:30:00+00:00' or '2025-01-15T10:30:00Z'. \
+                     Common mistakes: missing timezone (add +00:00 or Z), using slashes instead of dashes, \
+                     or using 12-hour format without AM/PM."
+                ),
+                true,
+                json!({
+                    "provided": ts,
+                    "expected_format": "YYYY-MM-DDTHH:MM:SS+HH:MM",
+                }),
             )
         })?)
     } else {

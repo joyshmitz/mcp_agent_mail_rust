@@ -144,6 +144,43 @@ pub(crate) mod tool_util {
                 false,
                 json!({ "error_detail": message }),
             ),
+            DbError::PoolExhausted {
+                message,
+                pool_size,
+                max_overflow,
+            } => legacy_tool_error(
+                "DATABASE_POOL_EXHAUSTED",
+                "Database connection pool exhausted. Reduce concurrency or increase pool settings.",
+                true,
+                json!({
+                    "error_detail": message,
+                    "pool_size": pool_size,
+                    "max_overflow": max_overflow,
+                }),
+            ),
+            DbError::ResourceBusy(message) => legacy_tool_error(
+                "RESOURCE_BUSY",
+                "Resource is temporarily busy. Wait a moment and try again.",
+                true,
+                json!({ "error_detail": message }),
+            ),
+            DbError::CircuitBreakerOpen {
+                message,
+                failures,
+                reset_after_secs,
+            } => legacy_tool_error(
+                "RESOURCE_BUSY",
+                format!(
+                    "Circuit breaker open: {message}. Database experiencing sustained failures. \
+                     Wait {reset_after_secs:.0}s before retrying."
+                ),
+                true,
+                json!({
+                    "error_detail": message,
+                    "failures": failures,
+                    "reset_after_secs": reset_after_secs,
+                }),
+            ),
         }
     }
 

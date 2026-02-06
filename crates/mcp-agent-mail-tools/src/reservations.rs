@@ -140,12 +140,12 @@ pub async fn file_reservation_paths(
 ) -> McpResult<String> {
     if paths.is_empty() {
         return Err(legacy_tool_error(
-            "INVALID_ARGUMENT",
-            "Invalid argument value: paths list cannot be empty. Provide at least one file path or glob pattern to reserve (e.g., ['src/api/*.py', 'config/settings.yaml']). Check that all parameters have valid values.",
+            "EMPTY_PATHS",
+            "paths list cannot be empty. Provide at least one file path or glob pattern \
+             to reserve (e.g., ['src/api/*.py', 'config/settings.yaml']).",
             true,
             json!({
-                "field": "paths",
-                "error_detail": "empty",
+                "provided": paths,
             }),
         ));
     }
@@ -594,15 +594,14 @@ pub async fn force_release_file_reservation(
     // Must be inactive (agent + all signals stale) OR expired to force-release
     let all_signals_stale = agent_inactive && mail_stale && git_stale;
     if !all_signals_stale && !is_expired {
-        return Err(McpError::new(
-            McpErrorCode::InvalidParams,
-            format!(
-                "Cannot force-release: heuristics do not indicate abandonment. Agent '{}' last active {}s ago. \
-                 Signals: {}. Force release requires all signals stale or reservation expired.",
-                holder_agent.name,
-                agent_inactive_secs,
-                stale_reasons.join(", ")
-            ),
+        return Err(legacy_tool_error(
+            "RESERVATION_ACTIVE",
+            "Reservation still shows recent activity; refusing forced release.",
+            true,
+            json!({
+                "file_reservation_id": file_reservation_id,
+                "stale_reasons": stale_reasons,
+            }),
         ));
     }
 
