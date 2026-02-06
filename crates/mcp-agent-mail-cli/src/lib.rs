@@ -614,18 +614,45 @@ fn execute(cli: Cli) -> CliResult<()> {
 fn handle_share(action: ShareCommand) -> CliResult<()> {
     match action {
         ShareCommand::Export(args) => {
-            let _preset = share::normalize_scrub_preset(&args.scrub_preset)?;
-            share::validate_thresholds(
-                args.inline_threshold,
-                args.detach_threshold,
-                args.chunk_threshold,
-                args.chunk_size,
-            )?;
+            let dry_run = resolve_bool(args.dry_run, args.no_dry_run, false);
+
+            let mut projects = args.projects;
+            let mut inline_threshold = args.inline_threshold;
+            let mut detach_threshold = args.detach_threshold;
+            let mut scrub_preset = args.scrub_preset;
+            let mut chunk_threshold = args.chunk_threshold;
+            let mut chunk_size = args.chunk_size;
+            let mut do_zip = resolve_bool(args.zip, args.no_zip, true);
+
             if args.interactive {
-                return Err(CliError::NotImplemented("share export --interactive"));
+                let wizard = share_export_wizard(ShareExportWizardDefaults {
+                    projects: projects.clone(),
+                    inline_threshold,
+                    detach_threshold,
+                    scrub_preset: scrub_preset.clone(),
+                    chunk_threshold,
+                    chunk_size,
+                    zip: do_zip,
+                })?;
+                projects = wizard.projects;
+                inline_threshold = wizard.inline_threshold;
+                detach_threshold = wizard.detach_threshold;
+                scrub_preset = wizard.scrub_preset;
+                chunk_threshold = wizard.chunk_threshold;
+                chunk_size = wizard.chunk_size;
+                do_zip = wizard.zip;
             }
-            let inline = args.inline_threshold.max(0) as usize;
-            let detach_raw = args.detach_threshold.max(0) as usize;
+
+            let preset = share::normalize_scrub_preset(&scrub_preset)?;
+            share::validate_thresholds(
+                inline_threshold,
+                detach_threshold,
+                chunk_threshold,
+                chunk_size,
+            )?;
+
+            let inline = inline_threshold.max(0) as usize;
+            let detach_raw = detach_threshold.max(0) as usize;
             let detach_adjusted = share::adjust_detach_threshold(inline, detach_raw);
             if detach_adjusted != detach_raw {
                 ftui_runtime::ftui_eprintln!(
@@ -633,16 +660,14 @@ fn handle_share(action: ShareCommand) -> CliResult<()> {
                     detach_adjusted
                 );
             }
-            let dry_run = resolve_bool(args.dry_run, args.no_dry_run, false);
-            let do_zip = resolve_bool(args.zip, args.no_zip, true);
             run_share_export(ShareExportParams {
                 output: args.output,
-                projects: args.projects,
+                projects,
                 inline_threshold: inline,
                 detach_threshold: detach_adjusted,
-                scrub_preset: _preset,
-                chunk_threshold: args.chunk_threshold.max(0) as usize,
-                chunk_size: args.chunk_size.max(1024) as usize,
+                scrub_preset: preset,
+                chunk_threshold: chunk_threshold.max(0) as usize,
+                chunk_size: chunk_size.max(1024) as usize,
                 dry_run,
                 zip: do_zip,
                 signing_key: args.signing_key,
@@ -1421,11 +1446,51 @@ fn handle_list_acks(project_key: &str, agent_name: &str, limit: i64) -> CliResul
     Ok(())
 }
 
+fn handle_migrate_with_database_url(database_url: &str) -> CliResult<()> {
+    use asupersync::runtime::RuntimeBuilder;
+    use mcp_agent_mail_db::schema;
+    use sqlmodel_sqlite::SqliteConnection;
+
+    let cfg = mcp_agent_mail_db::DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..mcp_agent_mail_db::DbPoolConfig::default()
+    };
+    let path = cfg
+        .sqlite_path()
+        .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
+
+    let conn = SqliteConnection::open_file(&path)
+        .map_err(|e| CliError::Other(format!("cannot open DB at {path}: {e}")))?;
+    conn.execute_raw(schema::PRAGMA_SETTINGS_SQL)
+        .map_err(|e| CliError::Other(format!("failed to apply PRAGMAs: {e}")))?;
+
+    let cx = asupersync::Cx::for_request();
+    let rt = RuntimeBuilder::current_thread()
+        .build()
+        .map_err(|e| CliError::Other(format!("failed to build runtime: {e}")))?;
+
+    let outcome = rt.block_on(async { schema::migrate_to_latest(&cx, &conn).await });
+
+    match outcome {
+        asupersync::Outcome::Ok(_) => {
+            // Legacy Python: `migrate` is an explicit schema-create command.
+            ftui_runtime::ftui_println!("✓ Database schema created from model definitions!");
+            ftui_runtime::ftui_println!(
+                "Note: To apply model changes, delete storage.sqlite3 and run this again."
+            );
+            Ok(())
+        }
+        asupersync::Outcome::Err(e) => Err(CliError::Other(format!("migrate failed: {e}"))),
+        asupersync::Outcome::Cancelled(r) => {
+            Err(CliError::Other(format!("migrate cancelled: {r:?}")))
+        }
+        asupersync::Outcome::Panicked(p) => Err(CliError::Other(format!("migrate panicked: {p}"))),
+    }
+}
+
 fn handle_migrate() -> CliResult<()> {
-    // Schema is idempotent — opening the DB runs init_schema_sql
-    let _conn = open_db_sync()?;
-    ftui_runtime::ftui_println!("Database schema is up to date.");
-    Ok(())
+    let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    handle_migrate_with_database_url(&cfg.database_url)
 }
 
 #[derive(Debug)]
@@ -2779,6 +2844,37 @@ mod tests {
     static ARCHIVE_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
+    #[test]
+    fn migrate_command_matches_legacy_output_lines() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        use ftui_runtime::stdio_capture::StdioCapture;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("migrate.db");
+        let url = format!("sqlite:///{}", db_path.display());
+
+        let capture = StdioCapture::install().unwrap();
+        let res = handle_migrate_with_database_url(&url);
+        let mut sink = Vec::new();
+        capture.drain(&mut sink).unwrap();
+        drop(capture);
+
+        res.unwrap();
+        let out = String::from_utf8_lossy(&sink);
+        assert!(
+            out.contains("✓ Database schema created from model definitions!"),
+            "stdout: {out}"
+        );
+        assert!(
+            out.contains(
+                "Note: To apply model changes, delete storage.sqlite3 and run this again."
+            ),
+            "stdout: {out}"
+        );
+    }
+
     struct CwdGuard {
         original: PathBuf,
     }
@@ -3777,6 +3873,230 @@ mod tests {
         assert_eq!(safe_component(""), "unknown");
         assert_eq!(safe_component("  "), "unknown");
     }
+
+    // ── docs insert-blurbs tests (br-2ei.5.10) ───────────────────────────
+
+    #[test]
+    fn clap_parses_docs_insert_blurbs_defaults() {
+        let cli = Cli::try_parse_from(["am", "docs", "insert-blurbs"])
+            .expect("failed to parse docs insert-blurbs");
+        match cli.command {
+            Commands::Docs { action } => match action {
+                DocsCommand::InsertBlurbs {
+                    scan_dir,
+                    yes,
+                    dry_run,
+                    max_depth,
+                } => {
+                    assert!(scan_dir.is_empty(), "default scan_dir should be empty");
+                    assert!(!yes, "default yes should be false");
+                    assert!(!dry_run, "default dry_run should be false");
+                    assert!(max_depth.is_none(), "default max_depth should be None");
+                }
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_docs_insert_blurbs_flags() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "docs",
+            "insert-blurbs",
+            "-d",
+            "/tmp/a",
+            "-d",
+            "/tmp/b",
+            "--yes",
+            "--dry-run",
+            "--max-depth",
+            "5",
+        ])
+        .expect("failed to parse docs insert-blurbs flags");
+        match cli.command {
+            Commands::Docs { action } => match action {
+                DocsCommand::InsertBlurbs {
+                    scan_dir,
+                    yes,
+                    dry_run,
+                    max_depth,
+                } => {
+                    assert_eq!(scan_dir.len(), 2);
+                    assert_eq!(scan_dir[0].to_str(), Some("/tmp/a"));
+                    assert_eq!(scan_dir[1].to_str(), Some("/tmp/b"));
+                    assert!(yes);
+                    assert!(dry_run);
+                    assert_eq!(max_depth, Some(5));
+                }
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scan_markdown_for_blurbs_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut files = 0u64;
+        let mut insertions = 0u64;
+        scan_markdown_for_blurbs(tmp.path(), 0, 3, true, &mut files, &mut insertions).unwrap();
+        assert_eq!(files, 0);
+        assert_eq!(insertions, 0);
+    }
+
+    #[test]
+    fn scan_markdown_for_blurbs_no_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("README.md"), "# Hello\nNo markers here.").unwrap();
+        let mut files = 0u64;
+        let mut insertions = 0u64;
+        scan_markdown_for_blurbs(tmp.path(), 0, 3, false, &mut files, &mut insertions).unwrap();
+        assert_eq!(files, 1);
+        assert_eq!(insertions, 0);
+    }
+
+    #[test]
+    fn scan_markdown_for_blurbs_marker_triggers_insertion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("AGENTS.md");
+        std::fs::write(&file, "# Agents\n<!-- am:blurb -->\nSome content").unwrap();
+        let mut files = 0u64;
+        let mut insertions = 0u64;
+        scan_markdown_for_blurbs(tmp.path(), 0, 3, false, &mut files, &mut insertions).unwrap();
+        assert_eq!(files, 1);
+        assert_eq!(insertions, 1);
+        // Verify the end marker was inserted.
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            content.contains("<!-- am:blurb:end -->"),
+            "end marker should be inserted"
+        );
+        assert!(
+            content.contains("<!-- am:blurb -->"),
+            "start marker should be preserved"
+        );
+    }
+
+    #[test]
+    fn scan_markdown_for_blurbs_dry_run_no_file_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("CLAUDE.md");
+        let original = "# Claude\n<!-- am:blurb -->\nContent";
+        std::fs::write(&file, original).unwrap();
+        let mut files = 0u64;
+        let mut insertions = 0u64;
+        scan_markdown_for_blurbs(tmp.path(), 0, 3, true, &mut files, &mut insertions).unwrap();
+        assert_eq!(insertions, 1, "dry run should count insertions");
+        // File should NOT be modified.
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(content, original, "dry run must not modify files");
+    }
+
+    #[test]
+    fn scan_markdown_for_blurbs_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("AGENTS.md");
+        std::fs::write(&file, "# Agents\n<!-- am:blurb -->\nContent").unwrap();
+
+        // First pass: insert.
+        let mut files = 0u64;
+        let mut insertions = 0u64;
+        scan_markdown_for_blurbs(tmp.path(), 0, 3, false, &mut files, &mut insertions).unwrap();
+        assert_eq!(insertions, 1);
+        let after_first = std::fs::read_to_string(&file).unwrap();
+
+        // Second pass: should be idempotent (no more insertions).
+        let mut files2 = 0u64;
+        let mut insertions2 = 0u64;
+        scan_markdown_for_blurbs(tmp.path(), 0, 3, false, &mut files2, &mut insertions2).unwrap();
+        assert_eq!(
+            insertions2, 0,
+            "second pass should not insert (already has end marker)"
+        );
+        let after_second = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(
+            after_first, after_second,
+            "file should not change on second pass"
+        );
+    }
+
+    #[test]
+    fn scan_markdown_for_blurbs_skips_already_complete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("README.md");
+        std::fs::write(
+            &file,
+            "# Hello\n<!-- am:blurb -->\nContent\n<!-- am:blurb:end -->\n",
+        )
+        .unwrap();
+        let mut files = 0u64;
+        let mut insertions = 0u64;
+        scan_markdown_for_blurbs(tmp.path(), 0, 3, false, &mut files, &mut insertions).unwrap();
+        assert_eq!(files, 1);
+        assert_eq!(
+            insertions, 0,
+            "already-complete file should not trigger insertion"
+        );
+    }
+
+    #[test]
+    fn scan_markdown_for_blurbs_respects_max_depth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deep = tmp.path().join("a").join("b").join("c").join("d");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("test.md"), "<!-- am:blurb -->\n").unwrap();
+
+        // max_depth=2 should not reach depth 4.
+        let mut files = 0u64;
+        let mut insertions = 0u64;
+        scan_markdown_for_blurbs(tmp.path(), 0, 2, true, &mut files, &mut insertions).unwrap();
+        assert_eq!(files, 0, "max_depth=2 should not find file at depth 4");
+
+        // max_depth=5 should find it.
+        let mut files2 = 0u64;
+        let mut insertions2 = 0u64;
+        scan_markdown_for_blurbs(tmp.path(), 0, 5, true, &mut files2, &mut insertions2).unwrap();
+        assert_eq!(files2, 1, "max_depth=5 should find file at depth 4");
+    }
+
+    #[test]
+    fn scan_markdown_for_blurbs_ignores_non_md_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("notes.txt"), "<!-- am:blurb -->").unwrap();
+        std::fs::write(tmp.path().join("data.json"), "<!-- am:blurb -->").unwrap();
+        let mut files = 0u64;
+        let mut insertions = 0u64;
+        scan_markdown_for_blurbs(tmp.path(), 0, 3, true, &mut files, &mut insertions).unwrap();
+        assert_eq!(files, 0, "non-.md files should be ignored");
+    }
+
+    #[test]
+    fn scan_markdown_for_blurbs_handles_subdirectories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("subdir");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("AGENTS.md"), "<!-- am:blurb -->\nHello").unwrap();
+        std::fs::write(tmp.path().join("ROOT.md"), "No markers").unwrap();
+
+        let mut files = 0u64;
+        let mut insertions = 0u64;
+        scan_markdown_for_blurbs(tmp.path(), 0, 3, true, &mut files, &mut insertions).unwrap();
+        assert_eq!(files, 2, "should count both .md files");
+        assert_eq!(insertions, 1, "only the file with marker should count");
+    }
+
+    #[test]
+    fn scan_markdown_for_blurbs_nonexistent_dir_no_error() {
+        let result = scan_markdown_for_blurbs(
+            Path::new("/nonexistent/path"),
+            0,
+            3,
+            true,
+            &mut 0u64,
+            &mut 0u64,
+        );
+        assert!(result.is_ok(), "nonexistent dir should not error");
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4304,6 +4624,141 @@ fn write_lease(path: &Path, lease: &LeaseRecord) -> CliResult<()> {
 // Share export pipeline
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone)]
+struct ShareExportWizardDefaults {
+    projects: Vec<String>,
+    inline_threshold: i64,
+    detach_threshold: i64,
+    scrub_preset: String,
+    chunk_threshold: i64,
+    chunk_size: i64,
+    zip: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ShareExportWizardResult {
+    projects: Vec<String>,
+    inline_threshold: i64,
+    detach_threshold: i64,
+    scrub_preset: String,
+    chunk_threshold: i64,
+    chunk_size: i64,
+    zip: bool,
+}
+
+fn share_export_wizard(defaults: ShareExportWizardDefaults) -> CliResult<ShareExportWizardResult> {
+    ftui_runtime::ftui_eprintln!("Interactive share export wizard\n");
+
+    let projects_default = if defaults.projects.is_empty() {
+        "all".to_string()
+    } else {
+        defaults.projects.join(", ")
+    };
+    let projects_line = prompt_line(&format!(
+        "Project filters (comma-separated; empty = all) [{projects_default}]: "
+    ))?;
+    let projects = if projects_line.trim().is_empty() {
+        defaults.projects
+    } else {
+        projects_line
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+    };
+
+    let inline_threshold = prompt_i64("Inline threshold bytes", defaults.inline_threshold, |v| {
+        v >= 0
+    })?;
+    let detach_threshold = prompt_i64("Detach threshold bytes", defaults.detach_threshold, |v| {
+        v >= 0
+    })?;
+    let chunk_threshold = prompt_i64("Chunk threshold bytes", defaults.chunk_threshold, |v| {
+        v >= 0
+    })?;
+    let chunk_size = prompt_i64("Chunk size bytes (min 1024)", defaults.chunk_size, |v| {
+        v >= 1024
+    })?;
+
+    let scrub_preset = loop {
+        let line = prompt_line(&format!(
+            "Scrub preset (standard/strict/archive) [{}]: ",
+            defaults.scrub_preset
+        ))?;
+        let candidate = if line.trim().is_empty() {
+            defaults.scrub_preset.clone()
+        } else {
+            line.trim().to_string()
+        };
+        match share::normalize_scrub_preset(&candidate) {
+            Ok(preset) => break preset.as_str().to_string(),
+            Err(_) => {
+                ftui_runtime::ftui_eprintln!(
+                    "Invalid scrub preset: {candidate}. Expected: standard, strict, archive."
+                );
+            }
+        }
+    };
+
+    let zip = prompt_bool("Package as ZIP", defaults.zip)?;
+
+    Ok(ShareExportWizardResult {
+        projects,
+        inline_threshold,
+        detach_threshold,
+        scrub_preset,
+        chunk_threshold,
+        chunk_size,
+        zip,
+    })
+}
+
+fn prompt_line(prompt: &str) -> CliResult<String> {
+    use std::io::Write;
+
+    ftui_runtime::ftui_eprintln!("{prompt}");
+    let _ = std::io::stderr().flush();
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_line(&mut buf)
+        .map_err(|e| CliError::Other(format!("failed to read input: {e}")))?;
+    Ok(buf.trim_end().to_string())
+}
+
+fn prompt_i64<F>(label: &str, default: i64, validate: F) -> CliResult<i64>
+where
+    F: Fn(i64) -> bool,
+{
+    loop {
+        let line = prompt_line(&format!("{label} [{default}]: "))?;
+        if line.trim().is_empty() {
+            return Ok(default);
+        }
+        match line.trim().parse::<i64>() {
+            Ok(value) if validate(value) => return Ok(value),
+            Ok(_) => ftui_runtime::ftui_eprintln!("Invalid value for {label}."),
+            Err(_) => ftui_runtime::ftui_eprintln!("Invalid integer for {label}."),
+        }
+    }
+}
+
+fn prompt_bool(label: &str, default: bool) -> CliResult<bool> {
+    let suffix = if default { "[Y/n]" } else { "[y/N]" };
+    loop {
+        let line = prompt_line(&format!("{label}? {suffix}: "))?;
+        let trimmed = line.trim().to_ascii_lowercase();
+        if trimmed.is_empty() {
+            return Ok(default);
+        }
+        match trimmed.as_str() {
+            "y" | "yes" | "true" | "1" => return Ok(true),
+            "n" | "no" | "false" | "0" => return Ok(false),
+            _ => ftui_runtime::ftui_eprintln!("Please answer y/n."),
+        }
+    }
+}
+
 struct ShareExportParams {
     output: PathBuf,
     projects: Vec<String>,
@@ -4337,9 +4792,67 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
     ftui_runtime::ftui_println!("Source database: {source_path}");
     ftui_runtime::ftui_println!("Scrub preset:   {}", params.scrub_preset);
 
-    // Dry run: validate only
+    if !params.age_recipients.is_empty() && !params.zip {
+        return Err(CliError::InvalidArgument(
+            "age encryption requires ZIP output (remove --no-zip or omit --age-recipient)"
+                .to_string(),
+        ));
+    }
+
+    // Dry run: create snapshot in temp dir and print summary only (no output artifacts).
     if params.dry_run {
-        ftui_runtime::ftui_println!("Dry run — skipping export.");
+        ftui_runtime::ftui_println!("Dry run — validating export in a temp directory.");
+
+        let tmp = tempfile::tempdir()?;
+        let snapshot_path = tmp.path().join("_snapshot.sqlite3");
+        let snap_ctx = share::create_snapshot_context(
+            source,
+            &snapshot_path,
+            &params.projects,
+            params.scrub_preset,
+        )?;
+
+        ftui_runtime::ftui_println!("\nSummary:");
+        ftui_runtime::ftui_println!("  Projects kept:        {}", snap_ctx.scope.projects.len());
+        ftui_runtime::ftui_println!(
+            "  Secrets replaced:     {}",
+            snap_ctx.scrub_summary.secrets_replaced
+        );
+        ftui_runtime::ftui_println!(
+            "  Bodies redacted:      {}",
+            snap_ctx.scrub_summary.bodies_redacted
+        );
+        ftui_runtime::ftui_println!(
+            "  Ack flags cleared:    {}",
+            snap_ctx.scrub_summary.ack_flags_cleared
+        );
+        ftui_runtime::ftui_println!(
+            "  Recipients cleared:   {}",
+            snap_ctx.scrub_summary.recipients_cleared
+        );
+        ftui_runtime::ftui_println!(
+            "  File reservations rm: {}",
+            snap_ctx.scrub_summary.file_reservations_removed
+        );
+        ftui_runtime::ftui_println!(
+            "  Agent links rm:       {}",
+            snap_ctx.scrub_summary.agent_links_removed
+        );
+
+        ftui_runtime::ftui_println!("\nSecurity checklist:");
+        ftui_runtime::ftui_println!("  1. Confirm the scrub preset matches your sharing intent.");
+        ftui_runtime::ftui_println!(
+            "  2. Review for any remaining secrets (search for \"sk-\", \"ghp_\", \"github_pat_\", \"xox\" in the exported content)."
+        );
+        ftui_runtime::ftui_println!(
+            "  3. Double-check attachment handling (inline={}, detach={}).",
+            params.inline_threshold,
+            params.detach_threshold
+        );
+        ftui_runtime::ftui_println!(
+            "  4. Run `am share verify <bundle>` after export (and after signing)."
+        );
+
         return Ok(());
     }
 
@@ -4398,14 +4911,19 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
         ftui_runtime::ftui_println!("  Database chunked into {} parts", c.chunk_count);
     }
 
-    // 5. Viewer data
+    // 5. Viewer assets
+    ftui_runtime::ftui_println!("Copying viewer assets...");
+    let copied = share::copy_viewer_assets(output)?;
+    ftui_runtime::ftui_println!("  Viewer assets: {} files", copied.len());
+
+    // 6. Viewer data
     ftui_runtime::ftui_println!("Exporting viewer data...");
     let viewer_data = share::export_viewer_data(&snapshot_path, output, snap_ctx.fts_enabled)?;
 
-    // 6. SRI hashes
+    // 7. SRI hashes
     let sri = share::compute_viewer_sri(output);
 
-    // 7. Hosting hints
+    // 8. Hosting hints
     let hints = share::detect_hosting_hints(output);
     if !hints.is_empty() {
         ftui_runtime::ftui_println!(
@@ -4415,7 +4933,7 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
         );
     }
 
-    // 8. Scaffolding
+    // 9. Scaffolding
     ftui_runtime::ftui_println!("Writing manifest and scaffolding...");
     share::write_bundle_scaffolding(
         output,
@@ -4432,7 +4950,7 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
         &sri,
     )?;
 
-    // 9. Sign
+    // 10. Sign
     if let Some(ref key_path) = params.signing_key {
         ftui_runtime::ftui_println!("Signing manifest...");
         let sig = share::sign_manifest(
@@ -4448,10 +4966,10 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
         }
     }
 
-    // 10. Clean up snapshot
+    // 11. Clean up snapshot
     let _ = std::fs::remove_file(&snapshot_path);
 
-    // 11. ZIP
+    // 12. ZIP
     let final_path = if params.zip {
         ftui_runtime::ftui_println!("Packaging as ZIP...");
         let zip_path = output.with_extension("zip");
@@ -4462,7 +4980,7 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
         output.clone()
     };
 
-    // 12. Encrypt
+    // 13. Encrypt
     if !params.age_recipients.is_empty() {
         ftui_runtime::ftui_println!("Encrypting with age...");
         let encrypted = share::encrypt_with_age(&final_path, &params.age_recipients)?;

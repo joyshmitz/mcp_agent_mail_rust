@@ -455,6 +455,24 @@
               "/deliveries/0/payload/created_ts"
             ]
           }
+        },
+        {
+          "name": "nonexistent_sender_error",
+          "input": {
+            "project_key": "/abs/path/backend",
+            "sender_name": "NonExistentAgent",
+            "to": [
+              "GreenCastle"
+            ],
+            "subject": "Should fail",
+            "body_md": "This should fail because sender doesn't exist."
+          },
+          "expect": {
+            "err": {
+              "message_contains": "not found"
+            }
+          },
+          "normalize": {}
         }
       ]
     },
@@ -662,6 +680,19 @@
               "/result/1/created_ts"
             ]
           }
+        },
+        {
+          "name": "empty_query_error",
+          "input": {
+            "project_key": "/abs/path/backend",
+            "query": ""
+          },
+          "expect": {
+            "err": {
+              "message_contains": "empty"
+            }
+          },
+          "normalize": {}
         }
       ]
     },
@@ -710,6 +741,40 @@
             "ignore_json_pointers": [
               "/examples/0/created_ts",
               "/examples/1/created_ts"
+            ]
+          }
+        },
+        {
+          "name": "empty_thread_id_error",
+          "input": {
+            "project_key": "/abs/path/backend",
+            "thread_id": ""
+          },
+          "expect": {
+            "err": {
+              "message_contains": "empty"
+            }
+          },
+          "normalize": {}
+        },
+        {
+          "name": "summarize_thread_no_llm",
+          "input": {
+            "project_key": "/abs/path/backend",
+            "thread_id": "2",
+            "llm_mode": false
+          },
+          "expect": {
+            "ok": {
+              "thread_id": "2",
+              "summary": null,
+              "examples": null
+            }
+          },
+          "normalize": {
+            "ignore_json_pointers": [
+              "/summary",
+              "/examples"
             ]
           }
         }
@@ -937,6 +1002,20 @@
               "/file_reservations/0/old_expires_ts"
             ]
           }
+        },
+        {
+          "name": "insufficient_extend_seconds_error",
+          "input": {
+            "project_key": "/abs/path/backend",
+            "agent_name": "BlueLake",
+            "extend_seconds": 5
+          },
+          "expect": {
+            "err": {
+              "message_contains": "60"
+            }
+          },
+          "normalize": {}
         }
       ]
     },
@@ -1044,6 +1123,19 @@
               "/last_active_ts"
             ]
           }
+        },
+        {
+          "name": "whois_nonexistent_error",
+          "input": {
+            "project_key": "/abs/path/backend",
+            "agent_name": "ZzzNonExistentAgent"
+          },
+          "expect": {
+            "err": {
+              "message_contains": "not found"
+            }
+          },
+          "normalize": {}
         }
       ]
     },
@@ -1453,6 +1545,28 @@
         }
       ]
     },
+    "resource://identity/abs-path-backend": {
+      "cases": [
+        {
+          "name": "identity_project",
+          "input": {},
+          "expect": {
+            "ok": {
+              "project_slug": "abs-path-backend",
+              "git_remote": null,
+              "git_toplevel": null,
+              "git_common_dir": null
+            }
+          },
+          "normalize": {
+            "ignore_json_pointers": [
+              "/git_toplevel",
+              "/git_common_dir"
+            ]
+          }
+        }
+      ]
+    },
     "resource://product/0123456789abcdef0123": {
       "cases": [
         {
@@ -1793,7 +1907,7 @@
                         "file_reservation_paths",
                         "uninstall_precommit_guard"
                       ],
-                      "expected_frequency": "Infrequent\u2014per repository setup.",
+                      "expected_frequency": "Infrequent—per repository setup.",
                       "required_capabilities": [
                         "infrastructure",
                         "repository"
@@ -1948,7 +2062,7 @@
                         "reply_message",
                         "request_contact"
                       ],
-                      "expected_frequency": "Frequent\u2014core write operation.",
+                      "expected_frequency": "Frequent—core write operation.",
                       "required_capabilities": [
                         "messaging",
                         "write"
@@ -2076,7 +2190,7 @@
                         "respond_contact",
                         "set_contact_policy"
                       ],
-                      "expected_frequency": "Occasional\u2014when new communication lines are needed.",
+                      "expected_frequency": "Occasional—when new communication lines are needed.",
                       "required_capabilities": [
                         "contact"
                       ],
@@ -2550,7 +2664,7 @@
               "tools": [
                 {
                   "name": "acknowledge_message",
-                  "calls": 1,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "messaging",
                   "capabilities": [
@@ -2561,7 +2675,7 @@
                 },
                 {
                   "name": "acquire_build_slot",
-                  "calls": 1,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "build_slots",
                   "capabilities": [
@@ -2571,7 +2685,7 @@
                 },
                 {
                   "name": "create_agent_identity",
-                  "calls": 1,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "identity",
                   "capabilities": [
@@ -2581,7 +2695,7 @@
                 },
                 {
                   "name": "ensure_product",
-                  "calls": 1,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "product_bus",
                   "capabilities": [
@@ -2591,7 +2705,7 @@
                 },
                 {
                   "name": "ensure_project",
-                  "calls": 1,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "infrastructure",
                   "capabilities": [
@@ -2602,7 +2716,7 @@
                 },
                 {
                   "name": "fetch_inbox",
-                  "calls": 1,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "messaging",
                   "capabilities": [
@@ -2613,7 +2727,7 @@
                 },
                 {
                   "name": "fetch_inbox_product",
-                  "calls": 1,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "product_bus",
                   "capabilities": [
@@ -2624,7 +2738,7 @@
                 },
                 {
                   "name": "file_reservation_paths",
-                  "calls": 2,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "file_reservations",
                   "capabilities": [
@@ -2635,7 +2749,7 @@
                 },
                 {
                   "name": "health_check",
-                  "calls": 1,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "infrastructure",
                   "capabilities": [
@@ -2645,7 +2759,7 @@
                 },
                 {
                   "name": "list_contacts",
-                  "calls": 2,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "contact",
                   "capabilities": [
@@ -2656,7 +2770,7 @@
                 },
                 {
                   "name": "macro_contact_handshake",
-                  "calls": 1,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "workflow_macros",
                   "capabilities": [
@@ -2668,7 +2782,7 @@
                 },
                 {
                   "name": "macro_file_reservation_cycle",
-                  "calls": 1,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "workflow_macros",
                   "capabilities": [
@@ -2680,7 +2794,7 @@
                 },
                 {
                   "name": "macro_prepare_thread",
-                  "calls": 1,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "workflow_macros",
                   "capabilities": [
@@ -2692,7 +2806,7 @@
                 },
                 {
                   "name": "macro_start_session",
-                  "calls": 1,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "workflow_macros",
                   "capabilities": [
@@ -2705,7 +2819,7 @@
                 },
                 {
                   "name": "mark_message_read",
-                  "calls": 1,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "messaging",
                   "capabilities": [
@@ -2716,7 +2830,7 @@
                 },
                 {
                   "name": "products_link",
-                  "calls": 1,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "product_bus",
                   "capabilities": [
@@ -2726,7 +2840,7 @@
                 },
                 {
                   "name": "register_agent",
-                  "calls": 2,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "identity",
                   "capabilities": [
@@ -2736,7 +2850,7 @@
                 },
                 {
                   "name": "release_build_slot",
-                  "calls": 1,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "build_slots",
                   "capabilities": [
@@ -2746,7 +2860,7 @@
                 },
                 {
                   "name": "release_file_reservations",
-                  "calls": 2,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "file_reservations",
                   "capabilities": [
@@ -2756,7 +2870,7 @@
                 },
                 {
                   "name": "renew_build_slot",
-                  "calls": 1,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "build_slots",
                   "capabilities": [
@@ -2766,7 +2880,7 @@
                 },
                 {
                   "name": "renew_file_reservations",
-                  "calls": 1,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "file_reservations",
                   "capabilities": [
@@ -2776,7 +2890,7 @@
                 },
                 {
                   "name": "reply_message",
-                  "calls": 1,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "messaging",
                   "capabilities": [
@@ -2787,7 +2901,7 @@
                 },
                 {
                   "name": "request_contact",
-                  "calls": 1,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "contact",
                   "capabilities": [
@@ -2797,7 +2911,7 @@
                 },
                 {
                   "name": "respond_contact",
-                  "calls": 1,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "contact",
                   "capabilities": [
@@ -2807,7 +2921,7 @@
                 },
                 {
                   "name": "search_messages",
-                  "calls": 1,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "search",
                   "capabilities": [
@@ -2817,7 +2931,7 @@
                 },
                 {
                   "name": "search_messages_product",
-                  "calls": 1,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "product_bus",
                   "capabilities": [
@@ -2827,7 +2941,7 @@
                 },
                 {
                   "name": "send_message",
-                  "calls": 1,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "messaging",
                   "capabilities": [
@@ -2838,7 +2952,7 @@
                 },
                 {
                   "name": "set_contact_policy",
-                  "calls": 1,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "contact",
                   "capabilities": [
@@ -2849,7 +2963,7 @@
                 },
                 {
                   "name": "summarize_thread",
-                  "calls": 1,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "search",
                   "capabilities": [
@@ -2860,7 +2974,7 @@
                 },
                 {
                   "name": "summarize_thread_product",
-                  "calls": 1,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "product_bus",
                   "capabilities": [
@@ -2871,7 +2985,7 @@
                 },
                 {
                   "name": "whois",
-                  "calls": 1,
+                  "calls": 0,
                   "errors": 0,
                   "cluster": "identity",
                   "capabilities": [

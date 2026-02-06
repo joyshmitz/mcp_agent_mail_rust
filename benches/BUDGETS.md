@@ -46,13 +46,25 @@ Targets based on initial baseline (2026-02-05). Budgets are 2x the measured base
 
 ## Archive Write Budgets
 
-To be established by br-2ei.7.2.
+Baseline numbers are taken from the bench harness artifacts emitted by:
 
-| Operation | Target | Notes |
-|-----------|--------|-------|
-| Single message write | TBD | DB insert + archive file |
-| Batch 100 messages | TBD | Throughput test |
-| Attachment write | TBD | File copy + metadata |
+```bash
+cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write
+```
+
+Artifacts (JSON + raw samples) are written under:
+- `tests/artifacts/bench/archive/<run_id>/summary.json`
+
+Most recent baseline run (2026-02-06): `tests/artifacts/bench/archive/1770365294_1633729/summary.json`.
+
+Budgets are set to ~2x the measured baseline p95 to absorb variance.
+
+| Operation | Baseline p50 | Baseline p95 | Baseline p99 | Budget p95 | Budget p99 | Notes |
+|-----------|--------------|--------------|--------------|------------|------------|-------|
+| Single message (no attachments) | ~7.2ms | ~11.0ms | ~12.6ms | < 25ms | < 30ms | Writes canonical+outbox+1 inbox + git commit flush |
+| Single message (inline attachment) | ~7.5ms | ~10.9ms | ~11.3ms | < 25ms | < 30ms | Includes WebP convert + manifest + audit + inline base64 body |
+| Single message (file attachment) | ~8.0ms | ~11.3ms | ~13.6ms | < 25ms | < 30ms | Includes WebP convert + manifest + audit + file-path body |
+| Batch 100 messages (no attachments) | ~101ms | ~111ms | ~111ms | < 250ms | < 300ms | 100 writes + commit batching (max 10 ops/commit) |
 
 ## Share/Export Pipeline Budgets
 

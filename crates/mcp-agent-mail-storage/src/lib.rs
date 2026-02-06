@@ -903,7 +903,7 @@ pub fn get_commit_queue() -> &'static Mutex<Option<CommitQueue>> {
 //   Worker:     accumulate requests → batch by repo → single commit per repo
 //
 // Under extreme load (50 agents, 1000s of ops/sec), commits coalesce:
-// - 250ms window → many requests batch into 1 commit per repo
+// - 50ms window → requests batch into bounded commits per repo
 // - Zero git contention on the tool hot path
 // - If worker dies, fallback to synchronous commit (no data loss)
 
@@ -939,11 +939,13 @@ pub struct CommitCoalescer {
     _batch_sizes: Arc<Mutex<VecDeque<usize>>>,
 }
 
-/// Default flush interval for the coalescer (250ms).
+/// Default flush interval for the coalescer (50ms).
 ///
 /// This is the maximum time a commit request waits before being processed.
 /// Under sustained load, the worker drains all pending requests every interval.
-pub const DEFAULT_COALESCER_FLUSH_MS: u64 = 250;
+pub const DEFAULT_COALESCER_FLUSH_MS: u64 = 50;
+
+const COALESCER_MAX_BATCH_SIZE: usize = 10;
 
 impl CommitCoalescer {
     /// Create a new coalescer and spawn the background worker thread.
@@ -1091,7 +1093,9 @@ fn coalescer_worker_loop(
 
         // Phase 3: Commit batches by repo
         for (repo_root, requests) in &pending {
-            coalescer_commit_batch(repo_root, requests, &stats, &batch_sizes);
+            for chunk in requests.chunks(COALESCER_MAX_BATCH_SIZE) {
+                coalescer_commit_batch(repo_root, chunk, &stats, &batch_sizes);
+            }
         }
 
         // Phase 4: Notify flush waiters that all pending work is done
@@ -1139,7 +1143,11 @@ fn coalescer_commit_batch(
         }
     }
 
-    let commit_result = if can_merge && requests.len() > 1 {
+    // Keep batch commits bounded to avoid enormous commits under load.
+    let commit_result = if can_merge
+        && requests.len() > 1
+        && requests.len() <= COALESCER_MAX_BATCH_SIZE
+    {
         // Merge all into a single commit
         let merged_paths: Vec<String> = requests
             .iter()
@@ -1359,7 +1367,7 @@ pub fn commit_lock_path(repo_root: &Path, rel_paths: &[&str]) -> PathBuf {
 /// Check if an error is a git index.lock contention error.
 fn is_git_index_lock_error(err: &git2::Error) -> bool {
     let msg = err.message().to_lowercase();
-    msg.contains("index.lock") || msg.contains("lock at")
+    msg.contains("index.lock") || msg.contains("lock at") || msg.contains("index is locked")
 }
 
 /// Try to clean up a stale .git/index.lock file.

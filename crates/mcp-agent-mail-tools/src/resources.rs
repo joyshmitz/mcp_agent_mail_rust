@@ -1115,279 +1115,23 @@ pub struct ToolMetricsResponse {
     uri = "resource://tooling/metrics",
     description = "Tool call counts and error rates"
 )]
-#[allow(clippy::too_many_lines)]
 pub fn tooling_metrics(_ctx: &McpContext) -> McpResult<String> {
     let config = Config::from_env();
-    // Return static metrics matching Python fixture format
-    // In a real implementation, these would be tracked at runtime
-    // Tools sorted alphabetically to match Python fixture
-    let mut tools = vec![
-        ToolMetricsEntry {
-            name: "acknowledge_message".to_string(),
-            calls: 1,
-            errors: 0,
-            cluster: "messaging".to_string(),
-            capabilities: vec!["ack".to_string(), "messaging".to_string()],
-            complexity: "medium".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "acquire_build_slot".to_string(),
-            calls: 1,
-            errors: 0,
-            cluster: "build_slots".to_string(),
-            capabilities: vec!["build".to_string()],
-            complexity: "medium".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "create_agent_identity".to_string(),
-            calls: 1,
-            errors: 0,
-            cluster: "identity".to_string(),
-            capabilities: vec!["identity".to_string()],
-            complexity: "medium".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "ensure_product".to_string(),
-            calls: 1,
-            errors: 0,
-            cluster: "product_bus".to_string(),
-            capabilities: vec!["product".to_string()],
-            complexity: "medium".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "ensure_project".to_string(),
-            calls: 1,
-            errors: 0,
-            cluster: "infrastructure".to_string(),
-            capabilities: vec!["infrastructure".to_string(), "storage".to_string()],
-            complexity: "low".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "fetch_inbox".to_string(),
-            calls: 1,
-            errors: 0,
-            cluster: "messaging".to_string(),
-            capabilities: vec!["messaging".to_string(), "read".to_string()],
-            complexity: "medium".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "fetch_inbox_product".to_string(),
-            calls: 1,
-            errors: 0,
-            cluster: "product_bus".to_string(),
-            capabilities: vec!["messaging".to_string(), "read".to_string()],
-            complexity: "medium".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "file_reservation_paths".to_string(),
-            calls: 2,
-            errors: 0,
-            cluster: "file_reservations".to_string(),
-            capabilities: vec!["file_reservations".to_string(), "repository".to_string()],
-            complexity: "medium".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "health_check".to_string(),
-            calls: 1,
-            errors: 0,
-            cluster: "infrastructure".to_string(),
-            capabilities: vec!["infrastructure".to_string()],
-            complexity: "low".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "list_contacts".to_string(),
-            calls: 2,
-            errors: 0,
-            cluster: "contact".to_string(),
-            capabilities: vec!["audit".to_string(), "contact".to_string()],
-            complexity: "medium".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "macro_contact_handshake".to_string(),
-            calls: 1,
-            errors: 0,
-            cluster: "workflow_macros".to_string(),
-            capabilities: vec![
-                "contact".to_string(),
-                "messaging".to_string(),
-                "workflow".to_string(),
-            ],
-            complexity: "medium".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "macro_file_reservation_cycle".to_string(),
-            calls: 1,
-            errors: 0,
-            cluster: "workflow_macros".to_string(),
-            capabilities: vec![
-                "file_reservations".to_string(),
-                "repository".to_string(),
-                "workflow".to_string(),
-            ],
-            complexity: "medium".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "macro_prepare_thread".to_string(),
-            calls: 1,
-            errors: 0,
-            cluster: "workflow_macros".to_string(),
-            capabilities: vec![
-                "messaging".to_string(),
-                "summarization".to_string(),
-                "workflow".to_string(),
-            ],
-            complexity: "medium".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "macro_start_session".to_string(),
-            calls: 1,
-            errors: 0,
-            cluster: "workflow_macros".to_string(),
-            capabilities: vec![
-                "file_reservations".to_string(),
-                "identity".to_string(),
-                "messaging".to_string(),
-                "workflow".to_string(),
-            ],
-            complexity: "medium".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "mark_message_read".to_string(),
-            calls: 1,
-            errors: 0,
-            cluster: "messaging".to_string(),
-            capabilities: vec!["messaging".to_string(), "read".to_string()],
-            complexity: "medium".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "products_link".to_string(),
-            calls: 1,
-            errors: 0,
-            cluster: "product_bus".to_string(),
-            capabilities: vec!["product".to_string()],
-            complexity: "medium".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "register_agent".to_string(),
-            calls: 2,
-            errors: 0,
-            cluster: "identity".to_string(),
-            capabilities: vec!["identity".to_string()],
-            complexity: "medium".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "release_build_slot".to_string(),
-            calls: 1,
-            errors: 0,
-            cluster: "build_slots".to_string(),
-            capabilities: vec!["build".to_string()],
-            complexity: "medium".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "release_file_reservations".to_string(),
-            calls: 2,
-            errors: 0,
-            cluster: "file_reservations".to_string(),
-            capabilities: vec!["file_reservations".to_string()],
-            complexity: "medium".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "renew_build_slot".to_string(),
-            calls: 1,
-            errors: 0,
-            cluster: "build_slots".to_string(),
-            capabilities: vec!["build".to_string()],
-            complexity: "medium".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "renew_file_reservations".to_string(),
-            calls: 1,
-            errors: 0,
-            cluster: "file_reservations".to_string(),
-            capabilities: vec!["file_reservations".to_string()],
-            complexity: "medium".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "reply_message".to_string(),
-            calls: 1,
-            errors: 0,
-            cluster: "messaging".to_string(),
-            capabilities: vec!["messaging".to_string(), "write".to_string()],
-            complexity: "medium".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "request_contact".to_string(),
-            calls: 1,
-            errors: 0,
-            cluster: "contact".to_string(),
-            capabilities: vec!["contact".to_string()],
-            complexity: "medium".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "respond_contact".to_string(),
-            calls: 1,
-            errors: 0,
-            cluster: "contact".to_string(),
-            capabilities: vec!["contact".to_string()],
-            complexity: "medium".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "search_messages".to_string(),
-            calls: 1,
-            errors: 0,
-            cluster: "search".to_string(),
-            capabilities: vec!["search".to_string()],
-            complexity: "medium".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "search_messages_product".to_string(),
-            calls: 1,
-            errors: 0,
-            cluster: "product_bus".to_string(),
-            capabilities: vec!["search".to_string()],
-            complexity: "medium".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "send_message".to_string(),
-            calls: 1,
-            errors: 0,
-            cluster: "messaging".to_string(),
-            capabilities: vec!["messaging".to_string(), "write".to_string()],
-            complexity: "medium".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "set_contact_policy".to_string(),
-            calls: 1,
-            errors: 0,
-            cluster: "contact".to_string(),
-            capabilities: vec!["configure".to_string(), "contact".to_string()],
-            complexity: "medium".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "summarize_thread".to_string(),
-            calls: 1,
-            errors: 0,
-            cluster: "search".to_string(),
-            capabilities: vec!["search".to_string(), "summarization".to_string()],
-            complexity: "medium".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "summarize_thread_product".to_string(),
-            calls: 1,
-            errors: 0,
-            cluster: "product_bus".to_string(),
-            capabilities: vec!["search".to_string(), "summarization".to_string()],
-            complexity: "medium".to_string(),
-        },
-        ToolMetricsEntry {
-            name: "whois".to_string(),
-            calls: 1,
-            errors: 0,
-            cluster: "identity".to_string(),
-            capabilities: vec!["audit".to_string(), "identity".to_string()],
-            complexity: "medium".to_string(),
-        },
-    ];
+
+    // Use live metrics from the global tracker, showing all known tools.
+    let snapshot = crate::metrics::tool_metrics_snapshot_full();
+
+    let mut tools: Vec<ToolMetricsEntry> = snapshot
+        .into_iter()
+        .map(|e| ToolMetricsEntry {
+            name: e.name,
+            calls: e.calls,
+            errors: e.errors,
+            cluster: e.cluster,
+            capabilities: e.capabilities,
+            complexity: e.complexity,
+        })
+        .collect();
 
     if config.tool_filter.enabled {
         tools.retain(|entry| tool_filter_allows(&config, &entry.name));
@@ -3701,4 +3445,239 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
 
     serde_json::to_string(&reservations)
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+}
+
+#[cfg(test)]
+mod query_param_tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // split_param_and_query
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn split_no_query() {
+        let (base, params) = split_param_and_query("GreenCastle");
+        assert_eq!(base, "GreenCastle");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn split_with_query() {
+        let (base, params) = split_param_and_query("GreenCastle?project=/data/proj&limit=10");
+        assert_eq!(base, "GreenCastle");
+        assert_eq!(params.get("project").unwrap(), "/data/proj");
+        assert_eq!(params.get("limit").unwrap(), "10");
+    }
+
+    #[test]
+    fn split_empty_query() {
+        let (base, params) = split_param_and_query("value?");
+        assert_eq!(base, "value");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn split_query_only() {
+        let (base, params) = split_param_and_query("?key=val");
+        assert_eq!(base, "");
+        assert_eq!(params.get("key").unwrap(), "val");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_query
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_query_basic() {
+        let params = parse_query("a=1&b=2");
+        assert_eq!(params.get("a").unwrap(), "1");
+        assert_eq!(params.get("b").unwrap(), "2");
+    }
+
+    #[test]
+    fn parse_query_empty_value() {
+        let params = parse_query("key=&other=val");
+        assert_eq!(params.get("key").unwrap(), "");
+        assert_eq!(params.get("other").unwrap(), "val");
+    }
+
+    #[test]
+    fn parse_query_no_value() {
+        let params = parse_query("flag");
+        assert_eq!(params.get("flag").unwrap(), "");
+    }
+
+    #[test]
+    fn parse_query_url_encoded() {
+        let params = parse_query("path=%2Fdata%2Fprojects%2Fbackend");
+        assert_eq!(params.get("path").unwrap(), "/data/projects/backend");
+    }
+
+    #[test]
+    fn parse_query_plus_as_space() {
+        let params = parse_query("q=hello+world");
+        assert_eq!(params.get("q").unwrap(), "hello world");
+    }
+
+    #[test]
+    fn parse_query_empty_string() {
+        let params = parse_query("");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn parse_query_trailing_ampersand() {
+        let params = parse_query("a=1&b=2&");
+        assert_eq!(params.len(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_bool_param (Python parity)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bool_param_truthy_values() {
+        assert!(parse_bool_param("1"));
+        assert!(parse_bool_param("true"));
+        assert!(parse_bool_param("True"));
+        assert!(parse_bool_param("TRUE"));
+        assert!(parse_bool_param("t"));
+        assert!(parse_bool_param("T"));
+        assert!(parse_bool_param("yes"));
+        assert!(parse_bool_param("Yes"));
+        assert!(parse_bool_param("y"));
+        assert!(parse_bool_param("Y"));
+    }
+
+    #[test]
+    fn bool_param_falsy_values() {
+        assert!(!parse_bool_param("0"));
+        assert!(!parse_bool_param("false"));
+        assert!(!parse_bool_param("False"));
+        assert!(!parse_bool_param("no"));
+        assert!(!parse_bool_param("No"));
+        assert!(!parse_bool_param("n"));
+        assert!(!parse_bool_param(""));
+        assert!(!parse_bool_param("anything_else"));
+    }
+
+    #[test]
+    fn bool_param_whitespace_trimmed() {
+        assert!(parse_bool_param("  true  "));
+        assert!(parse_bool_param(" 1 "));
+        assert!(!parse_bool_param("  false  "));
+    }
+
+    // -----------------------------------------------------------------------
+    // percent_decode_component
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn percent_decode_basic() {
+        assert_eq!(percent_decode_component("hello"), "hello");
+    }
+
+    #[test]
+    fn percent_decode_encoded_slash() {
+        assert_eq!(percent_decode_component("%2Fdata%2Fpath"), "/data/path");
+    }
+
+    #[test]
+    fn percent_decode_space_encoding() {
+        assert_eq!(percent_decode_component("hello%20world"), "hello world");
+        assert_eq!(percent_decode_component("hello+world"), "hello world");
+    }
+
+    #[test]
+    fn percent_decode_special_chars() {
+        assert_eq!(percent_decode_component("%40user"), "@user");
+        assert_eq!(percent_decode_component("key%3Dvalue"), "key=value");
+    }
+
+    #[test]
+    fn percent_decode_invalid_hex() {
+        // Invalid hex should pass through unchanged.
+        assert_eq!(percent_decode_component("%ZZ"), "%ZZ");
+    }
+
+    #[test]
+    fn percent_decode_truncated() {
+        // Truncated % at end should pass through.
+        assert_eq!(percent_decode_component("abc%2"), "abc%2");
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration: resource URI query patterns
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn inbox_query_params_parsed() {
+        let input = "GreenCastle?project=/data/proj&include_bodies=true&urgent_only=1&limit=5";
+        let (agent, query) = split_param_and_query(input);
+        assert_eq!(agent, "GreenCastle");
+        assert_eq!(query.get("project").unwrap(), "/data/proj");
+        assert!(parse_bool_param(query.get("include_bodies").unwrap()));
+        assert!(parse_bool_param(query.get("urgent_only").unwrap()));
+        assert_eq!(query.get("limit").unwrap().parse::<usize>().unwrap(), 5);
+    }
+
+    #[test]
+    fn thread_query_params_parsed() {
+        let input = "br-123?project=/data/backend&include_bodies=true";
+        let (thread_id, query) = split_param_and_query(input);
+        assert_eq!(thread_id, "br-123");
+        assert_eq!(query.get("project").unwrap(), "/data/backend");
+        assert!(
+            query
+                .get("include_bodies")
+                .is_some_and(|v| parse_bool_param(v))
+        );
+    }
+
+    #[test]
+    fn acks_stale_query_params_parsed() {
+        let input = "BlueBear?project=/data/proj&ttl_seconds=7200&limit=50";
+        let (agent, query) = split_param_and_query(input);
+        assert_eq!(agent, "BlueBear");
+        assert_eq!(
+            query.get("ttl_seconds").unwrap().parse::<u64>().unwrap(),
+            7200
+        );
+        assert_eq!(query.get("limit").unwrap().parse::<usize>().unwrap(), 50);
+    }
+
+    #[test]
+    fn file_reservations_active_only_default() {
+        // When active_only is absent, default should be true (matches Python).
+        let input = "my-project-slug";
+        let (_slug, query) = split_param_and_query(input);
+        let active_only = query.get("active_only").is_none_or(|v| parse_bool_param(v));
+        assert!(active_only, "active_only should default to true");
+    }
+
+    #[test]
+    fn file_reservations_active_only_false() {
+        let input = "my-project-slug?active_only=false";
+        let (_slug, query) = split_param_and_query(input);
+        let active_only = query.get("active_only").is_none_or(|v| parse_bool_param(v));
+        assert!(!active_only, "active_only=false should be honored");
+    }
+
+    #[test]
+    fn outbox_since_ts_parsed() {
+        let input = "RedFox?project=/data/proj&since_ts=2026-01-01T00:00:00Z&include_bodies=1";
+        let (agent, query) = split_param_and_query(input);
+        assert_eq!(agent, "RedFox");
+        assert_eq!(query.get("since_ts").unwrap(), "2026-01-01T00:00:00Z");
+        assert!(parse_bool_param(query.get("include_bodies").unwrap()));
+    }
+
+    #[test]
+    fn encoded_project_path() {
+        // Project paths with slashes must be URL-encoded in query params.
+        let input = "Agent?project=%2Fdata%2Fprojects%2Fmy-app";
+        let (_agent, query) = split_param_and_query(input);
+        assert_eq!(query.get("project").unwrap(), "/data/projects/my-app");
+    }
 }

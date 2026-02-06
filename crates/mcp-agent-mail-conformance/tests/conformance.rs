@@ -668,15 +668,22 @@ fn run_fixtures_against_rust_server_router() {
     // Python also writes "id" and "project_id"; the Rust tools layer currently
     // omits those (parity gap tracked separately).
     let required_profile_fields = [
-        "name", "program", "model", "attachments_policy",
-        "inception_ts", "last_active_ts", "task_description",
+        "name",
+        "program",
+        "model",
+        "attachments_policy",
+        "inception_ts",
+        "last_active_ts",
+        "task_description",
     ];
     for profile_rel in &expected_profiles {
         let content = std::fs::read_to_string(storage_root.join(profile_rel))
             .unwrap_or_else(|e| panic!("read {profile_rel}: {e}"));
-        let parsed: Value = serde_json::from_str(&content)
-            .unwrap_or_else(|e| panic!("parse {profile_rel}: {e}"));
-        let obj = parsed.as_object().unwrap_or_else(|| panic!("{profile_rel} is not a JSON object"));
+        let parsed: Value =
+            serde_json::from_str(&content).unwrap_or_else(|e| panic!("parse {profile_rel}: {e}"));
+        let obj = parsed
+            .as_object()
+            .unwrap_or_else(|| panic!("{profile_rel} is not a JSON object"));
         for field in &required_profile_fields {
             assert!(
                 obj.contains_key(*field),
@@ -684,10 +691,22 @@ fn run_fixtures_against_rust_server_router() {
             );
         }
         // Validate types: name/program/model must be strings, id/project_id must be numbers
-        assert!(obj["name"].is_string(), "{profile_rel}: name must be string");
-        assert!(obj["program"].is_string(), "{profile_rel}: program must be string");
-        assert!(obj["model"].is_string(), "{profile_rel}: model must be string");
-        assert!(obj["attachments_policy"].is_string(), "{profile_rel}: attachments_policy must be string");
+        assert!(
+            obj["name"].is_string(),
+            "{profile_rel}: name must be string"
+        );
+        assert!(
+            obj["program"].is_string(),
+            "{profile_rel}: program must be string"
+        );
+        assert!(
+            obj["model"].is_string(),
+            "{profile_rel}: model must be string"
+        );
+        assert!(
+            obj["attachments_policy"].is_string(),
+            "{profile_rel}: attachments_policy must be string"
+        );
         // JSON must be pretty-printed (contains newlines + indentation)
         assert!(
             content.contains('\n') && content.contains("  "),
@@ -697,8 +716,18 @@ fn run_fixtures_against_rust_server_router() {
 
     // --- Canonical message frontmatter: full schema + format ---
     let required_fm_fields = [
-        "id", "from", "to", "cc", "bcc", "subject", "importance",
-        "created", "ack_required", "thread_id", "project", "project_slug",
+        "id",
+        "from",
+        "to",
+        "cc",
+        "bcc",
+        "subject",
+        "importance",
+        "created",
+        "ack_required",
+        "thread_id",
+        "project",
+        "project_slug",
         "attachments",
     ];
     for msg_rel in &message_files {
@@ -711,7 +740,8 @@ fn run_fixtures_against_rust_server_router() {
         );
         let fm = parse_frontmatter(&content)
             .unwrap_or_else(|| panic!("message {msg_rel} has no valid ---json frontmatter"));
-        let fm_obj = fm.as_object()
+        let fm_obj = fm
+            .as_object()
             .unwrap_or_else(|| panic!("{msg_rel} frontmatter is not a JSON object"));
 
         for field in &required_fm_fields {
@@ -726,13 +756,34 @@ fn run_fixtures_against_rust_server_router() {
         assert!(fm_obj["to"].is_array(), "{msg_rel}: to must be array");
         assert!(fm_obj["cc"].is_array(), "{msg_rel}: cc must be array");
         assert!(fm_obj["bcc"].is_array(), "{msg_rel}: bcc must be array");
-        assert!(fm_obj["subject"].is_string(), "{msg_rel}: subject must be string");
-        assert!(fm_obj["importance"].is_string(), "{msg_rel}: importance must be string");
-        assert!(fm_obj["created"].is_string(), "{msg_rel}: created must be string");
-        assert!(fm_obj["ack_required"].is_boolean(), "{msg_rel}: ack_required must be boolean");
-        assert!(fm_obj["project"].is_string(), "{msg_rel}: project must be string");
-        assert!(fm_obj["project_slug"].is_string(), "{msg_rel}: project_slug must be string");
-        assert!(fm_obj["attachments"].is_array(), "{msg_rel}: attachments must be array");
+        assert!(
+            fm_obj["subject"].is_string(),
+            "{msg_rel}: subject must be string"
+        );
+        assert!(
+            fm_obj["importance"].is_string(),
+            "{msg_rel}: importance must be string"
+        );
+        assert!(
+            fm_obj["created"].is_string(),
+            "{msg_rel}: created must be string"
+        );
+        assert!(
+            fm_obj["ack_required"].is_boolean(),
+            "{msg_rel}: ack_required must be boolean"
+        );
+        assert!(
+            fm_obj["project"].is_string(),
+            "{msg_rel}: project must be string"
+        );
+        assert!(
+            fm_obj["project_slug"].is_string(),
+            "{msg_rel}: project_slug must be string"
+        );
+        assert!(
+            fm_obj["attachments"].is_array(),
+            "{msg_rel}: attachments must be array"
+        );
 
         // Body content: after the closing --- there should be body text
         let after_close = content
@@ -745,7 +796,8 @@ fn run_fixtures_against_rust_server_router() {
         );
 
         // Frontmatter JSON must be pretty-printed
-        let fm_section = &content[content.find("---json").unwrap() + 7..content.find("\n---").unwrap()];
+        let fm_section =
+            &content[content.find("---json").unwrap() + 7..content.find("\n---").unwrap()];
         assert!(
             fm_section.contains('\n') && fm_section.contains("  "),
             "{msg_rel}: frontmatter JSON must be pretty-printed"
@@ -754,9 +806,9 @@ fn run_fixtures_against_rust_server_router() {
 
     // --- Filename pattern validation ---
     // Message filenames should follow: {ISO-timestamp}__{slug}__{id}.md
-    let filename_re = regex::Regex::new(
-        r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z__[a-z0-9._-]+__\d+\.md$"
-    ).expect("valid regex");
+    let filename_re =
+        regex::Regex::new(r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z__[a-z0-9._-]+__\d+\.md$")
+            .expect("valid regex");
     for msg_rel in &message_files {
         let filename = std::path::Path::new(msg_rel.as_str())
             .file_name()
@@ -819,16 +871,22 @@ fn run_fixtures_against_rust_server_router() {
     // Python also writes "created_ts", "released_ts", "project"; those are
     // parity gaps tracked separately.
     let required_res_fields = [
-        "id", "agent", "path_pattern", "exclusive", "reason", "expires_ts",
+        "id",
+        "agent",
+        "path_pattern",
+        "exclusive",
+        "reason",
+        "expires_ts",
     ];
     let mut has_sha1_named = false;
     let mut has_id_named = false;
     for res_rel in &reservation_files {
         let content = std::fs::read_to_string(storage_root.join(res_rel))
             .unwrap_or_else(|e| panic!("read {res_rel}: {e}"));
-        let parsed: Value = serde_json::from_str(&content)
-            .unwrap_or_else(|e| panic!("parse {res_rel}: {e}"));
-        let obj = parsed.as_object()
+        let parsed: Value =
+            serde_json::from_str(&content).unwrap_or_else(|e| panic!("parse {res_rel}: {e}"));
+        let obj = parsed
+            .as_object()
             .unwrap_or_else(|| panic!("{res_rel} is not a JSON object"));
 
         for field in &required_res_fields {
@@ -840,8 +898,14 @@ fn run_fixtures_against_rust_server_router() {
 
         // Type assertions
         assert!(obj["agent"].is_string(), "{res_rel}: agent must be string");
-        assert!(obj["path_pattern"].is_string(), "{res_rel}: path_pattern must be string");
-        assert!(obj["exclusive"].is_boolean(), "{res_rel}: exclusive must be boolean");
+        assert!(
+            obj["path_pattern"].is_string(),
+            "{res_rel}: path_pattern must be string"
+        );
+        assert!(
+            obj["exclusive"].is_boolean(),
+            "{res_rel}: exclusive must be boolean"
+        );
 
         // Must NOT have legacy "path" key (only "path_pattern")
         assert!(
@@ -867,8 +931,14 @@ fn run_fixtures_against_rust_server_router() {
             has_sha1_named = true;
         }
     }
-    assert!(has_id_named, "expected at least one id-<N>.json reservation file");
-    assert!(has_sha1_named, "expected at least one SHA1-named reservation file");
+    assert!(
+        has_id_named,
+        "expected at least one id-<N>.json reservation file"
+    );
+    assert!(
+        has_sha1_named,
+        "expected at least one SHA1-named reservation file"
+    );
 
     // --- Paired SHA1 + stable-id files: SHA1 file reflects the latest reservation ---
     let res_dir_prefix = "projects/abs-path-backend/file_reservations/";
@@ -877,19 +947,26 @@ fn run_fixtures_against_rust_server_router() {
         .filter(|f| f.starts_with(res_dir_prefix))
         .map(|f| f.as_str())
         .collect();
-    let id_files_in_dir: Vec<&str> = res_in_dir.iter().copied().filter(|f| {
-        std::path::Path::new(f)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("id-"))
-    }).collect();
+    let id_files_in_dir: Vec<&str> = res_in_dir
+        .iter()
+        .copied()
+        .filter(|f| {
+            std::path::Path::new(f)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("id-"))
+        })
+        .collect();
     // For each id file, verify its SHA1-named sibling exists and has the same path_pattern.
     for id_file in &id_files_in_dir {
         let id_content = std::fs::read_to_string(storage_root.join(id_file))
             .unwrap_or_else(|e| panic!("read {id_file}: {e}"));
-        let id_parsed: Value = serde_json::from_str(&id_content)
-            .unwrap_or_else(|e| panic!("parse {id_file}: {e}"));
-        let path_pattern = id_parsed.get("path_pattern").and_then(Value::as_str).unwrap_or("");
+        let id_parsed: Value =
+            serde_json::from_str(&id_content).unwrap_or_else(|e| panic!("parse {id_file}: {e}"));
+        let path_pattern = id_parsed
+            .get("path_pattern")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         if path_pattern.is_empty() {
             continue;
         }
@@ -1216,3 +1293,304 @@ fn collect_files_recursive(base: &std::path::Path, dir: &std::path::Path, out: &
 
 // Archive artifact conformance assertions are now embedded at the end of
 // `run_fixtures_against_rust_server_router` to avoid parallel env var races.
+
+// ---------------------------------------------------------------------------
+// Fixture schema drift guard
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fixture_schema_drift_guard() {
+    let fixtures = Fixtures::load_default().expect("failed to load fixtures");
+
+    // Every tool in TOOL_CLUSTER_MAP must have at least one fixture case.
+    let tool_names: Vec<&str> = mcp_agent_mail_tools::TOOL_CLUSTER_MAP
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+    for tool_name in &tool_names {
+        assert!(
+            fixtures.tools.contains_key(*tool_name),
+            "tool {tool_name} is registered in TOOL_CLUSTER_MAP but has no fixture"
+        );
+        let fixture = &fixtures.tools[*tool_name];
+        assert!(
+            !fixture.cases.is_empty(),
+            "tool {tool_name} fixture has zero cases"
+        );
+    }
+
+    // Every fixture tool must be in TOOL_CLUSTER_MAP (no stale fixtures).
+    for tool_name in fixtures.tools.keys() {
+        assert!(
+            tool_names.contains(&tool_name.as_str()),
+            "fixture tool {tool_name} is not in TOOL_CLUSTER_MAP (stale fixture?)"
+        );
+    }
+
+    // Every fixture case must have either ok or err expectation (already validated by load,
+    // but belt-and-suspenders).
+    for (tool_name, fixture) in &fixtures.tools {
+        for case in &fixture.cases {
+            assert!(
+                case.expect.ok.is_some() || case.expect.err.is_some(),
+                "tool {tool_name} case {} has neither ok nor err expectation",
+                case.name
+            );
+        }
+    }
+    for (uri, fixture) in &fixtures.resources {
+        for case in &fixture.cases {
+            assert!(
+                case.expect.ok.is_some() || case.expect.err.is_some(),
+                "resource {uri} case {} has neither ok nor err expectation",
+                case.name
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Coverage completeness assertions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fixture_tool_error_case_coverage() {
+    let fixtures = Fixtures::load_default().expect("failed to load fixtures");
+
+    // These tools MUST have at least one error case (they have well-defined error paths).
+    let tools_requiring_error_cases = [
+        "ensure_project",                 // relative path -> error
+        "file_reservation_paths",         // empty paths -> error
+        "force_release_file_reservation", // force release missing -> error
+        "search_messages",                // empty query -> error
+        "summarize_thread",               // empty thread_id -> error
+        "whois",                          // non-existent agent -> error
+        "renew_file_reservations",        // insufficient seconds -> error
+        "send_message",                   // non-existent sender -> error
+    ];
+
+    for tool_name in &tools_requiring_error_cases {
+        let fixture = fixtures
+            .tools
+            .get(*tool_name)
+            .unwrap_or_else(|| panic!("fixture missing for {tool_name}"));
+        let has_error_case = fixture.cases.iter().any(|c| c.expect.err.is_some());
+        assert!(
+            has_error_case,
+            "tool {tool_name} should have at least one error case fixture"
+        );
+    }
+}
+
+#[test]
+fn fixture_resource_identity_coverage() {
+    let fixtures = Fixtures::load_default().expect("failed to load fixtures");
+
+    // resource://identity/{project} must be covered.
+    let has_identity = fixtures
+        .resources
+        .keys()
+        .any(|uri| uri.starts_with("resource://identity/"));
+    assert!(
+        has_identity,
+        "fixtures must include at least one resource://identity/{{project}} case"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// TOON format parameter handling
+// ---------------------------------------------------------------------------
+
+#[test]
+fn toon_format_resolution_json_fallback() {
+    // When TOON_BIN is empty (no encoder available), format requests should
+    // resolve to JSON or produce a TOON envelope with fallback data.
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("toon-test.sqlite3");
+    let db_url = format!("sqlite://{}", db_path.display());
+    let storage = tmp.path().join("archive");
+    let _env_guard = EnvVarGuard::set(&[
+        ("DATABASE_URL", &db_url),
+        ("STORAGE_ROOT", storage.to_str().unwrap()),
+        ("TOOLS_FILTER_ENABLED", "0"),
+        ("TOON_BIN", ""),
+        ("TOON_TRU_BIN", ""),
+        ("MCP_AGENT_MAIL_OUTPUT_FORMAT", ""),
+        ("TOON_DEFAULT_FORMAT", ""),
+        ("AGENT_NAME_ENFORCEMENT_MODE", "coerce"),
+    ]);
+
+    let config = mcp_agent_mail_core::Config::from_env();
+    let router = mcp_agent_mail_server::build_server(&config).into_router();
+    let cx = Cx::for_testing();
+    let budget = Budget::INFINITE;
+
+    // Call health_check - should work regardless of TOON config.
+    let params = CallToolParams {
+        name: "health_check".to_string(),
+        arguments: None,
+        meta: None,
+    };
+    let result = router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+    let call_result = result.expect("health_check should not fail");
+    assert!(!call_result.is_error, "health_check should succeed");
+
+    let json = decode_json_from_tool_content(&call_result.content)
+        .expect("health_check should return JSON");
+    assert_eq!(
+        json.get("status").and_then(|v| v.as_str()),
+        Some("ok"),
+        "health_check must return status=ok"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// LLM mode parameter acceptance
+// ---------------------------------------------------------------------------
+
+#[test]
+fn llm_mode_parameter_accepted_by_tools() {
+    // Verify that tools accepting llm_mode parameter don't reject it.
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("llm-test.sqlite3");
+    let db_url = format!("sqlite://{}", db_path.display());
+    let storage = tmp.path().join("archive");
+    let _env_guard = EnvVarGuard::set(&[
+        ("DATABASE_URL", &db_url),
+        ("STORAGE_ROOT", storage.to_str().unwrap()),
+        ("TOOLS_FILTER_ENABLED", "0"),
+        ("TOON_BIN", ""),
+        ("TOON_TRU_BIN", ""),
+        ("MCP_AGENT_MAIL_OUTPUT_FORMAT", ""),
+        ("AGENT_NAME_ENFORCEMENT_MODE", "coerce"),
+    ]);
+
+    let config = mcp_agent_mail_core::Config::from_env();
+    let router = mcp_agent_mail_server::build_server(&config).into_router();
+    let cx = Cx::for_testing();
+    let budget = Budget::INFINITE;
+    let mut req_id: u64 = 1;
+
+    // Set up project + agents + message for summarize_thread
+    let setup_calls: Vec<(&str, Value)> = vec![
+        (
+            "ensure_project",
+            serde_json::json!({"human_key": "/tmp/llm-mode-test-project"}),
+        ),
+        (
+            "register_agent",
+            serde_json::json!({
+                "project_key": "/tmp/llm-mode-test-project",
+                "program": "test",
+                "model": "test-model",
+                "name": "BlueLake"
+            }),
+        ),
+        (
+            "register_agent",
+            serde_json::json!({
+                "project_key": "/tmp/llm-mode-test-project",
+                "program": "test",
+                "model": "test-model",
+                "name": "GreenCastle"
+            }),
+        ),
+        (
+            "send_message",
+            serde_json::json!({
+                "project_key": "/tmp/llm-mode-test-project",
+                "sender_name": "BlueLake",
+                "to": ["GreenCastle"],
+                "subject": "LLM mode test",
+                "body_md": "Testing llm_mode=false parameter.",
+                "thread_id": "llm-test-thread"
+            }),
+        ),
+    ];
+
+    for (tool_name, args) in setup_calls {
+        let params = CallToolParams {
+            name: tool_name.to_string(),
+            arguments: Some(args),
+            meta: None,
+        };
+        let result = router.handle_tools_call(
+            &cx,
+            req_id,
+            params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+        );
+        req_id += 1;
+        let call_result = result.unwrap_or_else(|e| panic!("{tool_name} setup failed: {e}"));
+        assert!(!call_result.is_error, "{tool_name} setup returned error");
+    }
+
+    // summarize_thread with llm_mode=false should succeed (no LLM call attempted).
+    let params = CallToolParams {
+        name: "summarize_thread".to_string(),
+        arguments: Some(serde_json::json!({
+            "project_key": "/tmp/llm-mode-test-project",
+            "thread_id": "llm-test-thread",
+            "llm_mode": false
+        })),
+        meta: None,
+    };
+    let result = router.handle_tools_call(
+        &cx,
+        req_id,
+        params,
+        &budget,
+        SessionState::new(),
+        None,
+        None,
+    );
+    req_id += 1;
+    let call_result = result.expect("summarize_thread should not fail with llm_mode=false");
+    assert!(
+        !call_result.is_error,
+        "summarize_thread should succeed with llm_mode=false"
+    );
+    let json = decode_json_from_tool_content(&call_result.content)
+        .expect("summarize_thread should return JSON");
+    assert_eq!(
+        json.get("thread_id").and_then(|v| v.as_str()),
+        Some("llm-test-thread"),
+        "thread_id should match"
+    );
+
+    // macro_prepare_thread with llm_mode=false should succeed.
+    let params = CallToolParams {
+        name: "macro_prepare_thread".to_string(),
+        arguments: Some(serde_json::json!({
+            "project_key": "/tmp/llm-mode-test-project",
+            "agent_name": "GreenCastle",
+            "thread_id": "llm-test-thread",
+            "program": "test",
+            "model": "test-model",
+            "llm_mode": false
+        })),
+        meta: None,
+    };
+    let result = router.handle_tools_call(
+        &cx,
+        req_id,
+        params,
+        &budget,
+        SessionState::new(),
+        None,
+        None,
+    );
+    let call_result = result.expect("macro_prepare_thread should not fail with llm_mode=false");
+    assert!(
+        !call_result.is_error,
+        "macro_prepare_thread should succeed with llm_mode=false: {:?}",
+        call_result.content
+    );
+}

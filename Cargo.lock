@@ -4114,6 +4114,7 @@ dependencies = [
  "mcp-agent-mail-core",
  "mcp-agent-mail-server",
  "mcp-agent-mail-storage",
+ "mcp-agent-mail-tools",
  "regex",
  "serde",
  "serde_json",
@@ -4189,6 +4190,7 @@ dependencies = [
  "fastmcp-server",
  "fastmcp-transport",
  "ftui-runtime",
+ "glob",
  "include_dir",
  "jsonwebtoken",
  "mcp-agent-mail-core",
@@ -4198,6 +4200,7 @@ dependencies = [
  "minijinja",
  "serde",
  "serde_json",
+ "tempfile",
  "tracing",
 ]
 
@@ -4209,6 +4212,7 @@ dependencies = [
  "chrono",
  "ed25519-dalek",
  "hex",
+ "include_dir",
  "mcp-agent-mail-core",
  "regex",
  "serde",

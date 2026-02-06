@@ -21,6 +21,7 @@ pub mod identity;
 pub mod llm;
 pub mod macros;
 pub mod messaging;
+pub mod metrics;
 pub mod products;
 pub mod reservations;
 pub mod resources;
@@ -32,6 +33,10 @@ pub use contacts::*;
 pub use identity::*;
 pub use macros::*;
 pub use messaging::*;
+pub use metrics::{
+    MetricsSnapshotEntry, record_call, record_error, tool_meta, tool_metrics_snapshot,
+    tool_metrics_snapshot_full,
+};
 pub use products::*;
 pub use reservations::*;
 pub use resources::*;

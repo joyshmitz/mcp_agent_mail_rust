@@ -119,4 +119,24 @@
 | Tool filter conformance (6 profiles) | Verified (Tests) | `crates/mcp-agent-mail-conformance/tests/conformance.rs` |
 | Notification signal tests (9 tests) | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` |
 | Instrumentation fixture tests (40 vectors) | Verified (Tests) | `crates/mcp-agent-mail-db/src/tracking.rs` |
+| Instrumentation lifecycle + integration | Verified (Tests) | `crates/mcp-agent-mail-db/src/tracking.rs` (20+ unit), `tests/workers.rs` (4 integration) |
 | Benchmark suite | Verified (Tests) | `crates/mcp-agent-mail/benches/benchmarks.rs` |
+
+## HTTP Server (Logging, Health, OTEL)
+| Feature | Status | Evidence |
+| --- | --- | --- |
+| HTTP request logging (KV + JSON + panel) | Verified (Tests) | `crates/mcp-agent-mail-server/src/lib.rs` (37 unit tests: formatters, TTY/non-TTY panel, field derivation) |
+| ExpectedErrorFilter (8 patterns + cause chain) | Verified (Tests) | `crates/mcp-agent-mail-server/src/lib.rs` (10 tests: each pattern, case-insensitive, level preservation, cause chain) |
+| OTEL config no-op parity | Verified (Tests) | `crates/mcp-agent-mail-server/src/lib.rs`, `tests/http_logging.rs` (no spans/traces emitted) |
+| Health endpoints (/health/liveness, /health/readiness) | Verified (Tests) | `crates/mcp-agent-mail-server/src/lib.rs` (27 unit tests: JSON payloads, content-type, 405, auth bypass) |
+| Well-known endpoints (/.well-known/oauth-authorization-server) | Verified (Tests) | `crates/mcp-agent-mail-server/src/lib.rs` (both paths, auth required, 405) |
+| HTTP logging config gating | Verified (Tests) | `tests/http_logging.rs` (10 integration tests: enable matrix, defaults) |
+| Health endpoint integration | Verified (Tests) | `tests/health_endpoints.rs` (5 integration tests) |
+
+## Background Workers
+| Feature | Status | Evidence |
+| --- | --- | --- |
+| ACK TTL scan + escalation | Verified (Tests) | `crates/mcp-agent-mail-server/src/ack_ttl.rs` (3 unit), `tests/workers.rs` (4 integration) |
+| Tool metrics emit | Verified (Tests) | `crates/mcp-agent-mail-server/src/tool_metrics.rs` (3 unit), `tests/workers.rs` (2 integration) |
+| Retention/quota report | Verified (Tests) | `crates/mcp-agent-mail-server/src/retention.rs` (9 unit), `tests/workers.rs` (2 integration) |
+| File reservations cleanup | Verified (Tests) | `crates/mcp-agent-mail-server/src/cleanup.rs` (unit), `tests/workers.rs` (config gating) |
