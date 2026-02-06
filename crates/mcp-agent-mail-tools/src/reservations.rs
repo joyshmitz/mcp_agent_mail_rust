@@ -866,3 +866,83 @@ fn guard_is_installed(repo_path: &std::path::Path) -> bool {
 
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    // -----------------------------------------------------------------------
+    // expand_tilde
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn expand_tilde_bare_tilde() {
+        let result = expand_tilde("~");
+        // Should expand to HOME (or leave as "~" if HOME unset)
+        assert!(!result.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn expand_tilde_with_subpath() {
+        let result = expand_tilde("~/Documents/file.txt");
+        // Should not start with "~" anymore (assuming HOME is set)
+        if std::env::var_os("HOME").is_some() {
+            assert!(!result.starts_with("~"));
+            assert!(result.to_string_lossy().ends_with("Documents/file.txt"));
+        }
+    }
+
+    #[test]
+    fn expand_tilde_absolute_path_unchanged() {
+        assert_eq!(
+            expand_tilde("/usr/local/bin"),
+            PathBuf::from("/usr/local/bin")
+        );
+    }
+
+    #[test]
+    fn expand_tilde_relative_path_unchanged() {
+        assert_eq!(expand_tilde("src/main.rs"), PathBuf::from("src/main.rs"));
+    }
+
+    #[test]
+    fn expand_tilde_tilde_in_middle_unchanged() {
+        // Only leading ~ is expanded
+        assert_eq!(expand_tilde("foo/~/bar"), PathBuf::from("foo/~/bar"));
+    }
+
+    #[test]
+    fn expand_tilde_empty_string() {
+        assert_eq!(expand_tilde(""), PathBuf::from(""));
+    }
+
+    // -----------------------------------------------------------------------
+    // normalize_repo_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn normalize_absolute_path_unchanged() {
+        assert_eq!(
+            normalize_repo_path("/data/projects/repo"),
+            PathBuf::from("/data/projects/repo")
+        );
+    }
+
+    #[test]
+    fn normalize_relative_path_joins_cwd() {
+        let result = normalize_repo_path("src/main.rs");
+        // Should be absolute (joined with cwd)
+        assert!(result.is_absolute());
+        assert!(result.to_string_lossy().ends_with("src/main.rs"));
+    }
+
+    #[test]
+    fn normalize_tilde_path_expanded() {
+        if std::env::var_os("HOME").is_some() {
+            let result = normalize_repo_path("~/projects/repo");
+            assert!(result.is_absolute());
+            assert!(result.to_string_lossy().ends_with("projects/repo"));
+        }
+    }
+}
