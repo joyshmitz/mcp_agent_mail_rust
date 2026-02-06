@@ -25,16 +25,15 @@ pub fn build_search_indexes(snapshot_path: &Path) -> Result<bool, ShareError> {
     let has_thread_id = column_exists(&conn, "messages", "thread_id")?;
 
     // Create FTS5 virtual table
-    let create_result = conn.execute_raw(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(\
+    let create_sql = "CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(\
             subject, \
             body, \
             importance UNINDEXED, \
             project_slug UNINDEXED, \
             thread_key UNINDEXED, \
             created_ts UNINDEXED\
-        )",
-    );
+        )";
+    let create_result = conn.execute_raw(create_sql);
 
     if let Err(e) = create_result {
         let msg = e.to_string();
@@ -48,6 +47,53 @@ pub fn build_search_indexes(snapshot_path: &Path) -> Result<bool, ShareError> {
         return Err(ShareError::Sqlite {
             message: format!("FTS5 CREATE failed: {msg}"),
         });
+    }
+
+    // If the snapshot DB already contains an old/incompatible fts_messages schema (from an earlier
+    // export run), rebuild it so the populate SQL stays valid.
+    let mut needs_rebuild = false;
+    for col in [
+        "subject",
+        "body",
+        "importance",
+        "project_slug",
+        "thread_key",
+        "created_ts",
+    ] {
+        if !column_exists(&conn, "fts_messages", col)? {
+            needs_rebuild = true;
+            break;
+        }
+    }
+
+    if needs_rebuild {
+        let drop_result = conn.execute_raw("DROP TABLE IF EXISTS fts_messages");
+        if let Err(e) = drop_result {
+            let msg = e.to_string();
+            if msg.contains("fts5")
+                || msg.contains("unknown tokenizer")
+                || msg.contains("no such module")
+            {
+                return Ok(false);
+            }
+            return Err(ShareError::Sqlite {
+                message: format!("FTS5 DROP failed: {msg}"),
+            });
+        }
+
+        let recreate_result = conn.execute_raw(create_sql);
+        if let Err(e) = recreate_result {
+            let msg = e.to_string();
+            if msg.contains("fts5")
+                || msg.contains("unknown tokenizer")
+                || msg.contains("no such module")
+            {
+                return Ok(false);
+            }
+            return Err(ShareError::Sqlite {
+                message: format!("FTS5 CREATE (rebuild) failed: {msg}"),
+            });
+        }
     }
 
     // Clear any existing data (idempotent re-runs)
@@ -269,6 +315,22 @@ pub fn create_performance_indexes(snapshot_path: &Path) -> Result<Vec<String>, S
 
     let has_sender_id = column_exists(&conn, "messages", "sender_id")?;
     let has_thread_id = column_exists(&conn, "messages", "thread_id")?;
+
+    // Export snapshots are static. Drop any legacy FTS triggers so our later `UPDATE messages ...`
+    // statements can't fail if the snapshot rebuilds `fts_messages` with a different schema.
+    for trigger in [
+        // Older naming
+        "messages_ai",
+        "messages_ad",
+        "messages_au",
+        // Current naming (matches the DB schema in `mcp-agent-mail-db`)
+        "fts_messages_ai",
+        "fts_messages_ad",
+        "fts_messages_au",
+    ] {
+        conn.execute_raw(&format!("DROP TRIGGER IF EXISTS {trigger}"))
+            .map_err(sql_err)?;
+    }
 
     // Add lowercase columns (suppress error if already exist)
     let _ = conn.execute_raw("ALTER TABLE messages ADD COLUMN subject_lower TEXT");
@@ -503,6 +565,41 @@ mod tests {
     }
 
     #[test]
+    fn fts_rebuilds_when_schema_is_incompatible() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+
+        // Simulate a legacy export that created an FTS table without newer columns like
+        // "importance" and "thread_key". The export pipeline should rebuild it.
+        let conn = sqlmodel_sqlite::SqliteConnection::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw(
+            "CREATE VIRTUAL TABLE fts_messages USING fts5(subject, body, project_slug UNINDEXED)",
+        )
+        .unwrap();
+        drop(conn);
+
+        let fts_ok = build_search_indexes(&db).unwrap();
+        assert!(fts_ok, "FTS5 should be available");
+
+        let conn = sqlmodel_sqlite::SqliteConnection::open_file(db.display().to_string()).unwrap();
+        let rows = conn
+            .query_sync("PRAGMA table_info(fts_messages)", &[])
+            .unwrap();
+        let columns: Vec<String> = rows
+            .iter()
+            .map(|r| r.get_named::<String>("name").unwrap())
+            .collect();
+        assert!(columns.contains(&"importance".to_string()));
+        assert!(columns.contains(&"thread_key".to_string()));
+
+        let rows = conn
+            .query_sync("SELECT COUNT(*) AS cnt FROM fts_messages", &[])
+            .unwrap();
+        let count: i64 = rows[0].get_named("cnt").unwrap();
+        assert_eq!(count, 2, "should have 2 FTS entries after rebuild");
+    }
+
+    #[test]
     fn materialized_views_created() {
         let dir = tempfile::tempdir().unwrap();
         let db = create_test_db(dir.path());
@@ -660,6 +757,45 @@ mod tests {
         let rows = conn.query_sync("PRAGMA journal_mode", &[]).unwrap();
         let mode: String = rows[0].get_named("journal_mode").unwrap();
         assert_eq!(mode, "delete");
+    }
+
+    #[test]
+    fn finalize_drops_legacy_fts_triggers_if_schema_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+
+        // Simulate the server schema having a different FTS layout + triggers that refer to
+        // `fts_messages(message_id, ...)`. The share export pipeline rebuilds `fts_messages`, so
+        // those triggers must be removed before any message updates.
+        let conn = sqlmodel_sqlite::SqliteConnection::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw(
+            "CREATE VIRTUAL TABLE fts_messages USING fts5(message_id UNINDEXED, subject, body)",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TRIGGER fts_messages_ai AFTER INSERT ON messages BEGIN \
+                 INSERT INTO fts_messages(rowid, message_id, subject, body) VALUES (NEW.id, NEW.id, NEW.subject, NEW.body_md); \
+             END;",
+        ).unwrap();
+        conn.execute_raw(
+            "CREATE TRIGGER fts_messages_ad AFTER DELETE ON messages BEGIN \
+                 DELETE FROM fts_messages WHERE rowid = OLD.id; \
+             END;",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TRIGGER fts_messages_au AFTER UPDATE ON messages BEGIN \
+                 DELETE FROM fts_messages WHERE rowid = OLD.id; \
+                 INSERT INTO fts_messages(rowid, message_id, subject, body) VALUES (NEW.id, NEW.id, NEW.subject, NEW.body_md); \
+             END;",
+        ).unwrap();
+        drop(conn);
+
+        let result = finalize_export_db(&db);
+        assert!(
+            result.is_ok(),
+            "finalize_export_db should succeed even with legacy FTS triggers"
+        );
     }
 
     #[test]

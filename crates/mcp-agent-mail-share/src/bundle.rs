@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use include_dir::{Dir, include_dir};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -15,6 +16,8 @@ use crate::hosting::{self, HostingHint};
 use crate::scope::ProjectScopeResult;
 use crate::scrub::ScrubSummary;
 use crate::{ShareError, ShareResult};
+
+static BUILTIN_VIEWER_ASSETS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/viewer_assets");
 
 /// Per-attachment entry in the manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -735,11 +738,54 @@ fn generate_deploy_guide(hints: &[HostingHint]) -> String {
     guide
 }
 
+/// Copy embedded viewer assets into `viewer/` in the bundle.
+///
+/// Mirrors legacy behavior (package resources). Writes files in deterministic order.
+pub fn copy_viewer_assets(output_dir: &Path) -> ShareResult<Vec<String>> {
+    let viewer_root = output_dir.join("viewer");
+    std::fs::create_dir_all(&viewer_root)?;
+
+    let mut rel_paths = Vec::new();
+    collect_embedded_file_paths(&BUILTIN_VIEWER_ASSETS, &mut rel_paths);
+    rel_paths.sort();
+
+    let mut copied = Vec::with_capacity(rel_paths.len());
+    for rel in rel_paths {
+        let Some(file) = BUILTIN_VIEWER_ASSETS.get_file(&rel) else {
+            continue;
+        };
+
+        let dest = viewer_root.join(&rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&dest, file.contents())?;
+        copied.push(format!("viewer/{rel}"));
+    }
+
+    Ok(copied)
+}
+
+fn collect_embedded_file_paths(dir: &Dir<'_>, out: &mut Vec<String>) {
+    for entry in dir.entries() {
+        match entry {
+            include_dir::DirEntry::Dir(subdir) => collect_embedded_file_paths(subdir, out),
+            include_dir::DirEntry::File(file) => {
+                let rel = file.path().to_string_lossy().replace('\\', "/");
+                out.push(rel);
+            }
+        }
+    }
+}
+
 /// Copy viewer assets from a source directory into `viewer/` in the bundle.
 ///
 /// Recursively copies all files, preserving directory structure.
 /// Files are sorted for deterministic output.
-pub fn copy_viewer_assets(viewer_source: &Path, output_dir: &Path) -> ShareResult<Vec<String>> {
+pub fn copy_viewer_assets_from(
+    viewer_source: &Path,
+    output_dir: &Path,
+) -> ShareResult<Vec<String>> {
     let viewer_root = output_dir.join("viewer");
     std::fs::create_dir_all(&viewer_root)?;
 
@@ -1469,7 +1515,20 @@ mod tests {
     // === Viewer asset tests ===
 
     #[test]
-    fn copy_viewer_assets_copies_directory_structure() {
+    fn copy_viewer_assets_builtin_copies_expected_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("bundle");
+        std::fs::create_dir_all(&output).unwrap();
+
+        let copied = copy_viewer_assets(&output).unwrap();
+        assert!(!copied.is_empty());
+        assert!(copied.iter().any(|p| p == "viewer/index.html"));
+        assert!(output.join("viewer/index.html").exists());
+        assert!(output.join("viewer/vendor/sql-wasm.wasm").exists());
+    }
+
+    #[test]
+    fn copy_viewer_assets_from_copies_directory_structure() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("viewer_assets");
         std::fs::create_dir_all(source.join("vendor")).unwrap();
@@ -1482,7 +1541,7 @@ mod tests {
         let output = dir.path().join("bundle");
         std::fs::create_dir_all(&output).unwrap();
 
-        let copied = copy_viewer_assets(&source, &output).unwrap();
+        let copied = copy_viewer_assets_from(&source, &output).unwrap();
 
         // All files copied
         assert_eq!(copied.len(), 5);
@@ -1503,7 +1562,7 @@ mod tests {
         let output = dir.path().join("bundle");
         std::fs::create_dir_all(&output).unwrap();
 
-        let result = copy_viewer_assets(Path::new("/nonexistent/viewer"), &output);
+        let result = copy_viewer_assets_from(Path::new("/nonexistent/viewer"), &output);
         assert!(matches!(result, Err(ShareError::BundleNotFound { .. })));
     }
 
@@ -1522,8 +1581,8 @@ mod tests {
         std::fs::create_dir_all(&out1).unwrap();
         std::fs::create_dir_all(&out2).unwrap();
 
-        let copied1 = copy_viewer_assets(&source, &out1).unwrap();
-        let copied2 = copy_viewer_assets(&source, &out2).unwrap();
+        let copied1 = copy_viewer_assets_from(&source, &out1).unwrap();
+        let copied2 = copy_viewer_assets_from(&source, &out2).unwrap();
         assert_eq!(copied1, copied2, "copy order should be deterministic");
     }
 
