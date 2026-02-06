@@ -46,7 +46,7 @@
 | Search messages (FTS: sanitization + LIKE fallback) | Verified (Tests) | `crates/mcp-agent-mail-db/src/queries.rs` (20 tests), `crates/mcp-agent-mail-tools/src/search.rs` |
 | Summarize thread (heuristic + LLM refinement) | Verified (Tests) | `crates/mcp-agent-mail-tools/src/search.rs`, `crates/mcp-agent-mail-tools/src/llm.rs` (20 tests) |
 | LLM integration (env bridge + model selection + completion + merge) | Verified (Tests) | `crates/mcp-agent-mail-tools/src/llm.rs` (20 tests) |
-| Subject truncation (200 chars) | Implemented | `crates/mcp-agent-mail-tools/src/messaging.rs` |
+| Subject truncation (200 chars, UTF-8 safe) | Verified (Tests) | `crates/mcp-agent-mail-tools/src/messaging.rs` (char-boundary-safe truncation) |
 | Acknowledge + read tracking | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/messaging.rs` |
 | Ack-required views | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/resources.rs` |
 | Attachment handling + WebP conversion | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` (7 tests), `crates/mcp-agent-mail-tools/src/messaging.rs` |
@@ -84,7 +84,7 @@
 | Stale lock healing (startup) | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` |
 | Notification signals | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` |
 | Recent commits (path-filtered) | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` |
-| Lock status diagnostics | Implemented | `crates/mcp-agent-mail-storage/src/lib.rs` |
+| Lock status diagnostics | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` (4 tests: nonexistent root, empty root, finds locks, owner metadata) |
 | Thread digest (append-only) | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` |
 | Storage-to-tools wiring | Verified (Tests) | identity.rs, messaging.rs, reservations.rs, resources.rs |
 | Query tracking + slow queries | Verified (Tests) | `crates/mcp-agent-mail-db/src/tracking.rs` (11 tests, 40 fixture vectors), `crates/mcp-agent-mail-db/src/queries.rs` (TrackedConnection, all calls instrumented), `crates/mcp-agent-mail-server/src/lib.rs` (auto-enable) |
@@ -99,7 +99,7 @@
 | file_reservations (list/active/soon) | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (3 integration tests: list, active, empty project) |
 | acks (pending/remind/overdue) | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (4 integration tests: pending, empty, overdue, remind) |
 | list-acks | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (2 integration tests: shows ack-required messages, empty for nonexistent) |
-| mail status | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
+| mail status | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (2 integration tests: shows counts, empty project) |
 | migrate | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (10 tests: output parity, idempotent, tables, FTS, negative cases) |
 | clear-and-reset-everything | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (2 integration tests: force+archive, force+no-archive) |
 | lint / typecheck | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |

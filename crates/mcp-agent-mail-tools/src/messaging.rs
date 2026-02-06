@@ -294,13 +294,14 @@ pub async fn send_message(
         ));
     }
 
-    // Truncate subject at 200 chars (parity with Python legacy)
-    let subject = if subject.len() > 200 {
+    // Truncate subject at 200 chars (parity with Python legacy).
+    // Use char_indices to avoid panicking on multi-byte UTF-8 boundaries.
+    let subject = if subject.chars().count() > 200 {
         tracing::warn!(
             "Subject exceeds 200 characters ({}); truncating",
-            subject.len()
+            subject.chars().count()
         );
-        subject[..200].to_string()
+        subject.chars().take(200).collect::<String>()
     } else {
         subject
     };
@@ -922,13 +923,14 @@ pub async fn reply_message(
     } else {
         format!("{prefix} {}", original.subject)
     };
-    // Truncate subject at 200 chars (parity with Python legacy)
-    let subject = if subject.len() > 200 {
+    // Truncate subject at 200 chars (parity with Python legacy).
+    // Use char_indices to avoid panicking on multi-byte UTF-8 boundaries.
+    let subject = if subject.chars().count() > 200 {
         tracing::warn!(
             "Reply subject exceeds 200 characters ({}); truncating",
-            subject.len()
+            subject.chars().count()
         );
-        subject[..200].to_string()
+        subject.chars().take(200).collect::<String>()
     } else {
         subject
     };

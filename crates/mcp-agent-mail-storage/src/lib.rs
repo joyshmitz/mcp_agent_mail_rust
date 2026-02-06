@@ -4550,4 +4550,64 @@ mod tests {
         // fallbacks should be 0 when the queue isn't full
         assert_eq!(stats.fallbacks, 0);
     }
+
+    #[test]
+    fn collect_lock_status_nonexistent_root() {
+        let config = Config {
+            storage_root: PathBuf::from("/tmp/nonexistent_lock_status_test_root"),
+            ..Config::default()
+        };
+        let result = collect_lock_status(&config).unwrap();
+        assert_eq!(result["exists"], false);
+        assert!(result["locks"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn collect_lock_status_empty_root() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let result = collect_lock_status(&config).unwrap();
+        assert_eq!(result["exists"], true);
+        assert!(result["locks"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn collect_lock_status_finds_lock_files() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+
+        // Create a nested .lock file
+        let sub = tmp.path().join("projects").join("test-proj");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("index.lock"), "lock contents").unwrap();
+
+        let result = collect_lock_status(&config).unwrap();
+        assert_eq!(result["exists"], true);
+        let locks = result["locks"].as_array().unwrap();
+        assert_eq!(locks.len(), 1);
+        assert!(locks[0]["path"].as_str().unwrap().contains("index.lock"));
+        assert!(locks[0]["size"].as_u64().unwrap() > 0);
+        assert!(locks[0]["modified_epoch"].as_u64().is_some());
+    }
+
+    #[test]
+    fn collect_lock_status_includes_owner_metadata() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+
+        // Create a .lock file with an owner metadata sidecar
+        fs::write(tmp.path().join("repo.lock"), "lock").unwrap();
+        fs::write(
+            tmp.path().join("repo.lock.owner.json"),
+            r#"{"agent":"BlueLake","pid":1234}"#,
+        )
+        .unwrap();
+
+        let result = collect_lock_status(&config).unwrap();
+        let locks = result["locks"].as_array().unwrap();
+        assert_eq!(locks.len(), 1);
+        let owner = &locks[0]["owner"];
+        assert_eq!(owner["agent"].as_str().unwrap(), "BlueLake");
+        assert_eq!(owner["pid"].as_u64().unwrap(), 1234);
+    }
 }

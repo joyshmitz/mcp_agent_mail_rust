@@ -2004,9 +2004,16 @@ fn handle_doctor_check_with(
 }
 
 fn handle_mail(action: MailCommand) -> CliResult<()> {
+    let conn = open_db_sync()?;
+    handle_mail_with_conn(&conn, action)
+}
+
+fn handle_mail_with_conn(
+    conn: &sqlmodel_sqlite::SqliteConnection,
+    action: MailCommand,
+) -> CliResult<()> {
     match action {
         MailCommand::Status { project_path } => {
-            let conn = open_db_sync()?;
             let identity = resolve_project_identity(project_path.to_string_lossy().as_ref());
             let slug = &identity.project_uid;
 
@@ -6544,6 +6551,155 @@ sys.exit(7)
         assert!(
             output.contains("Stale acks") && output.contains("RedFox"),
             "expected stale ack reminder, got: {output}"
+        );
+    }
+
+    /// Seed a DB with a project whose slug matches what `resolve_project_identity`
+    /// computes for the given `project_path`.
+    fn seed_mail_status_db(
+        db_path: &Path,
+        project_path: &str,
+    ) -> sqlmodel_sqlite::SqliteConnection {
+        use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
+
+        let conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
+            .expect("init schema");
+
+        let now_us = mcp_agent_mail_db::timestamps::now_micros();
+        let identity = resolve_project_identity(project_path);
+        let slug = &identity.project_uid;
+
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+            &[
+                SqlValue::BigInt(1),
+                SqlValue::Text(slug.to_string()),
+                SqlValue::Text(project_path.to_string()),
+                SqlValue::BigInt(now_us),
+            ],
+        )
+        .unwrap();
+
+        // Agents
+        let agent_insert = "INSERT INTO agents (\
+                id, project_id, name, program, model, task_description, \
+                inception_ts, last_active_ts, attachments_policy, contact_policy\
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        conn.execute_sync(
+            agent_insert,
+            &[
+                SqlValue::BigInt(1),
+                SqlValue::BigInt(1),
+                SqlValue::Text("AgentA".to_string()),
+                SqlValue::Text("test".to_string()),
+                SqlValue::Text("test".to_string()),
+                SqlValue::Text(String::new()),
+                SqlValue::BigInt(now_us),
+                SqlValue::BigInt(now_us),
+                SqlValue::Text("auto".to_string()),
+                SqlValue::Text("auto".to_string()),
+            ],
+        )
+        .unwrap();
+        conn.execute_sync(
+            agent_insert,
+            &[
+                SqlValue::BigInt(2),
+                SqlValue::BigInt(1),
+                SqlValue::Text("AgentB".to_string()),
+                SqlValue::Text("test".to_string()),
+                SqlValue::Text("test".to_string()),
+                SqlValue::Text(String::new()),
+                SqlValue::BigInt(now_us),
+                SqlValue::BigInt(now_us),
+                SqlValue::Text("auto".to_string()),
+                SqlValue::Text("auto".to_string()),
+            ],
+        )
+        .unwrap();
+
+        // Messages
+        let msg_insert = "INSERT INTO messages (\
+                id, project_id, sender_id, thread_id, subject, body_md, importance, \
+                ack_required, created_ts, attachments\
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        for i in 1..=3 {
+            conn.execute_sync(
+                msg_insert,
+                &[
+                    SqlValue::BigInt(i),
+                    SqlValue::BigInt(1),
+                    SqlValue::BigInt(1),
+                    SqlValue::Null,
+                    SqlValue::Text(format!("Message {i}")),
+                    SqlValue::Text("body".to_string()),
+                    SqlValue::Text("normal".to_string()),
+                    SqlValue::BigInt(0),
+                    SqlValue::BigInt(now_us),
+                    SqlValue::Text("[]".to_string()),
+                ],
+            )
+            .unwrap();
+        }
+
+        conn
+    }
+
+    #[test]
+    fn integration_mail_status_shows_counts() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let project_path = "/tmp/mail-status-test-proj";
+        let conn = seed_mail_status_db(&db_path, project_path);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_mail_with_conn(
+            &conn,
+            MailCommand::Status {
+                project_path: PathBuf::from(project_path),
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "mail status failed: {result:?}");
+        // The seeded DB has 3 messages and 2 agents
+        assert!(
+            output.contains("Messages") && output.contains("3"),
+            "expected message count 3 in output, got: {output}"
+        );
+        assert!(
+            output.contains("Agents") && output.contains("2"),
+            "expected agent count 2 in output, got: {output}"
+        );
+    }
+
+    #[test]
+    fn integration_mail_status_empty_project() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        // Seed with one project path, then query with a different one
+        let conn = seed_mail_status_db(&db_path, "/tmp/some-project");
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_mail_with_conn(
+            &conn,
+            MailCommand::Status {
+                project_path: PathBuf::from("/tmp/nonexistent"),
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "mail status failed: {result:?}");
+        // Should show 0 messages and 0 agents for a different project
+        assert!(
+            output.contains("Messages") && output.contains("0"),
+            "expected 0 messages for nonexistent project, got: {output}"
+        );
+        assert!(
+            output.contains("Agents") && output.contains("0"),
+            "expected 0 agents for nonexistent project, got: {output}"
         );
     }
 }
