@@ -359,6 +359,106 @@ fn seed_cli_json_db_product_only(db_path: &Path) -> String {
     "deadbeef".to_string()
 }
 
+fn seed_cli_acks_db(db_path: &Path, root: &Path) -> (String, String, i64) {
+    use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
+
+    let created_at_us = 1_704_067_200_000_000i64; // 2024-01-01T00:00:00Z
+
+    let proj_alpha_dir = root.join("proj_alpha");
+    std::fs::create_dir_all(&proj_alpha_dir).unwrap();
+    let proj_alpha_key = proj_alpha_dir.canonicalize().unwrap().display().to_string();
+
+    let conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+        .expect("open sqlite db");
+    conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
+        .expect("init schema");
+
+    conn.execute_sync(
+        "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+        &[
+            SqlValue::BigInt(1),
+            SqlValue::Text("proj-alpha".to_string()),
+            SqlValue::Text(proj_alpha_key),
+            SqlValue::BigInt(created_at_us),
+        ],
+    )
+    .unwrap();
+
+    let agent_insert = "INSERT INTO agents (\
+            id, project_id, name, program, model, task_description, \
+            inception_ts, last_active_ts, attachments_policy, contact_policy\
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+    // Recipient
+    conn.execute_sync(
+        agent_insert,
+        &[
+            SqlValue::BigInt(1),
+            SqlValue::BigInt(1),
+            SqlValue::Text("GreenCastle".to_string()),
+            SqlValue::Text("test".to_string()),
+            SqlValue::Text("test".to_string()),
+            SqlValue::Text(String::new()),
+            SqlValue::BigInt(0),
+            SqlValue::BigInt(0),
+            SqlValue::Text("auto".to_string()),
+            SqlValue::Text("auto".to_string()),
+        ],
+    )
+    .unwrap();
+    // Sender
+    conn.execute_sync(
+        agent_insert,
+        &[
+            SqlValue::BigInt(2),
+            SqlValue::BigInt(1),
+            SqlValue::Text("PurpleBear".to_string()),
+            SqlValue::Text("test".to_string()),
+            SqlValue::Text("test".to_string()),
+            SqlValue::Text(String::new()),
+            SqlValue::BigInt(0),
+            SqlValue::BigInt(0),
+            SqlValue::Text("auto".to_string()),
+            SqlValue::Text("auto".to_string()),
+        ],
+    )
+    .unwrap();
+
+    // One ack-required message to exercise `acks` + `list-acks` queries.
+    let msg_id = 100i64;
+    conn.execute_sync(
+        "INSERT INTO messages (\
+            id, project_id, sender_id, thread_id, subject, body_md, importance, \
+            ack_required, created_ts, attachments\
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &[
+            SqlValue::BigInt(msg_id),
+            SqlValue::BigInt(1),
+            SqlValue::BigInt(2),
+            SqlValue::Null,
+            SqlValue::Text("Ack needed".to_string()),
+            SqlValue::Text("please ack".to_string()),
+            SqlValue::Text("normal".to_string()),
+            SqlValue::BigInt(1),
+            SqlValue::BigInt(created_at_us + 10),
+            SqlValue::Text("[]".to_string()),
+        ],
+    )
+    .unwrap();
+
+    conn.execute_sync(
+        "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?, ?, ?)",
+        &[
+            SqlValue::BigInt(msg_id),
+            SqlValue::BigInt(1),
+            SqlValue::Text("to".to_string()),
+        ],
+    )
+    .unwrap();
+
+    ("proj-alpha".to_string(), "GreenCastle".to_string(), msg_id)
+}
+
 fn seed_archive_fixture(root: &Path) {
     use zip::write::FileOptions;
 
@@ -403,6 +503,21 @@ fn run_json_cmd(
         String::from_utf8_lossy(&out.stdout).to_string(),
         String::from_utf8_lossy(&out.stderr).to_string(),
     )
+}
+
+fn assert_cmd_success_contains(env: &TestEnv, case: &str, args: &[&str], needles: &[&str]) {
+    let (status, stdout, stderr) = run_json_cmd(env, None, args);
+    assert!(
+        status.success(),
+        "expected success for {case} args={args:?}, got status={:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        status.code()
+    );
+    for needle in needles {
+        assert!(
+            stdout.contains(needle),
+            "expected stdout to contain {needle:?} for {case} args={args:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
 }
 
 fn assert_json_snapshot(env: &TestEnv, case: &str, cwd: Option<&Path>, args: &[&str]) {
@@ -548,5 +663,58 @@ fn cli_json_snapshots() {
             "GreenCastle",
             "--json",
         ],
+    );
+}
+
+#[test]
+fn cli_acks_smoke() {
+    // br-2ei.5.7.2: regression guard for `acks` / `list-acks` (ensure DB schema joins are valid).
+    let env = TestEnv::new();
+    let (project_slug, agent_name, msg_id) = seed_cli_acks_db(&env.db_path, env.tmp.path());
+    let msg_id_s = msg_id.to_string();
+
+    assert_cmd_success_contains(
+        &env,
+        "acks_pending",
+        &["acks", "pending", &project_slug, &agent_name],
+        &[&msg_id_s, "PurpleBear", "Ack needed"],
+    );
+    assert_cmd_success_contains(
+        &env,
+        "acks_remind",
+        &[
+            "acks",
+            "remind",
+            &project_slug,
+            &agent_name,
+            "--min-age-minutes",
+            "0",
+        ],
+        &[&msg_id_s, "PurpleBear", "Ack needed"],
+    );
+    assert_cmd_success_contains(
+        &env,
+        "acks_overdue",
+        &[
+            "acks",
+            "overdue",
+            &project_slug,
+            &agent_name,
+            "--ttl-minutes",
+            "0",
+        ],
+        &[&msg_id_s, "PurpleBear", "Ack needed"],
+    );
+    assert_cmd_success_contains(
+        &env,
+        "list_acks",
+        &[
+            "list-acks",
+            "--project",
+            &project_slug,
+            "--agent",
+            &agent_name,
+        ],
+        &[&msg_id_s, "PurpleBear", "Ack needed", "pending"],
     );
 }

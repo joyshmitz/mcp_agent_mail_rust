@@ -4,6 +4,8 @@
 
 # SQLite databases (runtime)
 *.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 storage.sqlite3
 
 # Temp dirs

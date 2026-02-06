@@ -498,12 +498,29 @@ pub fn package_directory_as_zip(source_dir: &Path, destination: &Path) -> ShareR
 
     for relative_path in &entries {
         let full_path = source.join(relative_path);
-        let mode = file_mode(&full_path);
+        let resolved = full_path.canonicalize().map_err(|e| {
+            ShareError::Io(std::io::Error::other(format!(
+                "Failed to canonicalize ZIP source path {}: {e}",
+                full_path.display()
+            )))
+        })?;
+        if !resolved.starts_with(&source) {
+            return Err(ShareError::Io(std::io::Error::other(format!(
+                "Refusing to include path outside ZIP source: {relative_path}"
+            ))));
+        }
+        if !resolved.is_file() {
+            return Err(ShareError::Io(std::io::Error::other(format!(
+                "Refusing to include non-file ZIP entry: {relative_path}"
+            ))));
+        }
+
+        let mode = file_mode(&resolved);
         let file_options = options.unix_permissions(mode);
 
         zip.start_file(relative_path.clone(), file_options)
             .map_err(|e| ShareError::Io(std::io::Error::other(e.to_string())))?;
-        let mut f = std::fs::File::open(&full_path)?;
+        let mut f = std::fs::File::open(&resolved)?;
         std::io::copy(&mut f, &mut zip)?;
     }
 
@@ -560,16 +577,33 @@ fn collect_entries(base: &Path, current: &Path, entries: &mut Vec<String>) -> st
     for entry in std::fs::read_dir(current)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if file_type.is_dir() {
             collect_entries(base, &path, entries)?;
-        } else {
-            let relative = path
-                .strip_prefix(base)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            entries.push(relative);
+            continue;
         }
+
+        if file_type.is_symlink() {
+            // Avoid traversing symlinked directories during ZIP packaging; for symlinked files,
+            // we rely on canonicalization guards in `package_directory_as_zip`.
+            if std::fs::metadata(&path).is_ok_and(|m| m.is_dir()) {
+                continue;
+            }
+        }
+
+        if !(file_type.is_file() || file_type.is_symlink()) {
+            continue;
+        }
+
+        let relative = path
+            .strip_prefix(base)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        entries.push(relative);
     }
     Ok(())
 }
@@ -1521,6 +1555,27 @@ mod tests {
         let h1 = super::sha256_file(&zip1).unwrap();
         let h2 = super::sha256_file(&zip2).unwrap();
         assert_eq!(h1, h2, "zip output should be deterministic");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn zip_refuses_symlink_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("a.txt"), b"alpha").unwrap();
+
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, b"top-secret").unwrap();
+        std::os::unix::fs::symlink(&secret, source.join("leak.txt")).unwrap();
+
+        let zip_path = dir.path().join("bundle.zip");
+        let err = package_directory_as_zip(&source, &zip_path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("outside ZIP source"),
+            "unexpected error message: {msg}"
+        );
     }
 
     // === Viewer asset tests ===

@@ -774,6 +774,8 @@ dependencies = [
  "dotenvy",
  "fastembed",
  "flate2",
+ "ftui 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
+ "ftui-extras 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
  "fxhash",
  "glob",
  "half",
@@ -2027,14 +2029,29 @@ dependencies = [
 name = "ftui"
 version = "0.1.1"
 dependencies = [
- "ftui-core",
- "ftui-extras",
- "ftui-layout",
- "ftui-render",
- "ftui-runtime",
- "ftui-style",
- "ftui-text",
- "ftui-widgets",
+ "ftui-core 0.1.1",
+ "ftui-extras 0.1.1",
+ "ftui-layout 0.1.1",
+ "ftui-render 0.1.1",
+ "ftui-runtime 0.1.1",
+ "ftui-style 0.1.1",
+ "ftui-text 0.1.1",
+ "ftui-widgets 0.1.1",
+]
+
+[[package]]
+name = "ftui"
+version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441#f0ad8a6d9b016ce6a000dc5e1461e1411aee1441"
+dependencies = [
+ "ftui-core 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
+ "ftui-extras 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
+ "ftui-layout 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
+ "ftui-render 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
+ "ftui-runtime 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
+ "ftui-style 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
+ "ftui-text 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
+ "ftui-widgets 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
 ]
 
 [[package]]
@@ -2050,10 +2067,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "ftui-core"
+version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441#f0ad8a6d9b016ce6a000dc5e1461e1411aee1441"
+dependencies = [
+ "bitflags 2.10.0",
+ "crossterm 0.29.0",
+ "signal-hook 0.4.3",
+ "unicode-display-width",
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
 name = "ftui-extras"
 version = "0.1.1"
 dependencies = [
- "ftui-runtime",
+ "ftui-runtime 0.1.1",
+]
+
+[[package]]
+name = "ftui-extras"
+version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441#f0ad8a6d9b016ce6a000dc5e1461e1411aee1441"
+dependencies = [
+ "base64 0.22.1",
+ "ftui-core 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
+ "ftui-render 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
+ "ftui-runtime 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
+ "ftui-style 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
+ "ftui-text 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
+ "ftui-widgets 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
+ "math-text-transform",
+ "pulldown-cmark",
+ "serde_json",
+ "unicode-display-width",
+ "unicode-segmentation",
+ "unicodeit",
 ]
 
 [[package]]
@@ -2061,10 +2111,24 @@ name = "ftui-i18n"
 version = "0.1.1"
 
 [[package]]
+name = "ftui-i18n"
+version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441#f0ad8a6d9b016ce6a000dc5e1461e1411aee1441"
+
+[[package]]
 name = "ftui-layout"
 version = "0.1.1"
 dependencies = [
- "ftui-core",
+ "ftui-core 0.1.1",
+ "rustc-hash",
+]
+
+[[package]]
+name = "ftui-layout"
+version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441#f0ad8a6d9b016ce6a000dc5e1461e1411aee1441"
+dependencies = [
+ "ftui-core 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
  "rustc-hash",
 ]
 
@@ -2073,7 +2137,21 @@ name = "ftui-render"
 version = "0.1.1"
 dependencies = [
  "bitflags 2.10.0",
- "ftui-core",
+ "ftui-core 0.1.1",
+ "memchr",
+ "smallvec",
+ "unicode-display-width",
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
+name = "ftui-render"
+version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441#f0ad8a6d9b016ce6a000dc5e1461e1411aee1441"
+dependencies = [
+ "bitflags 2.10.0",
+ "ftui-core 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
  "memchr",
  "smallvec",
  "unicode-display-width",
@@ -2086,12 +2164,29 @@ name = "ftui-runtime"
 version = "0.1.1"
 dependencies = [
  "crossterm 0.29.0",
- "ftui-core",
- "ftui-i18n",
- "ftui-layout",
- "ftui-render",
- "ftui-style",
- "ftui-text",
+ "ftui-core 0.1.1",
+ "ftui-i18n 0.1.1",
+ "ftui-layout 0.1.1",
+ "ftui-render 0.1.1",
+ "ftui-style 0.1.1",
+ "ftui-text 0.1.1",
+ "tracing",
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
+name = "ftui-runtime"
+version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441#f0ad8a6d9b016ce6a000dc5e1461e1411aee1441"
+dependencies = [
+ "crossterm 0.29.0",
+ "ftui-core 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
+ "ftui-i18n 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
+ "ftui-layout 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
+ "ftui-render 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
+ "ftui-style 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
+ "ftui-text 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
  "tracing",
  "unicode-segmentation",
  "unicode-width",
@@ -2101,7 +2196,16 @@ dependencies = [
 name = "ftui-style"
 version = "0.1.1"
 dependencies = [
- "ftui-render",
+ "ftui-render 0.1.1",
+ "tracing",
+]
+
+[[package]]
+name = "ftui-style"
+version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441#f0ad8a6d9b016ce6a000dc5e1461e1411aee1441"
+dependencies = [
+ "ftui-render 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
  "tracing",
 ]
 
@@ -2109,10 +2213,27 @@ dependencies = [
 name = "ftui-text"
 version = "0.1.1"
 dependencies = [
- "ftui-core",
- "ftui-layout",
- "ftui-render",
- "ftui-style",
+ "ftui-core 0.1.1",
+ "ftui-layout 0.1.1",
+ "ftui-render 0.1.1",
+ "ftui-style 0.1.1",
+ "lru 0.16.3",
+ "ropey",
+ "rustc-hash",
+ "smallvec",
+ "tracing",
+ "unicode-segmentation",
+]
+
+[[package]]
+name = "ftui-text"
+version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441#f0ad8a6d9b016ce6a000dc5e1461e1411aee1441"
+dependencies = [
+ "ftui-core 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
+ "ftui-layout 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
+ "ftui-render 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
+ "ftui-style 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
  "lru 0.16.3",
  "ropey",
  "rustc-hash",
@@ -2126,11 +2247,26 @@ name = "ftui-widgets"
 version = "0.1.1"
 dependencies = [
  "bitflags 2.10.0",
- "ftui-core",
- "ftui-layout",
- "ftui-render",
- "ftui-style",
- "ftui-text",
+ "ftui-core 0.1.1",
+ "ftui-layout 0.1.1",
+ "ftui-render 0.1.1",
+ "ftui-style 0.1.1",
+ "ftui-text 0.1.1",
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
+name = "ftui-widgets"
+version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441#f0ad8a6d9b016ce6a000dc5e1461e1411aee1441"
+dependencies = [
+ "bitflags 2.10.0",
+ "ftui-core 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
+ "ftui-layout 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
+ "ftui-render 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
+ "ftui-style 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
+ "ftui-text 0.1.1 (git+https://github.com/Dicklesworthstone/frankentui?rev=f0ad8a6d9b016ce6a000dc5e1461e1411aee1441)",
  "unicode-segmentation",
  "unicode-width",
 ]
@@ -4057,6 +4193,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "math-text-transform"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0b94e989ffe85172727d00fb39360f801db7d70d8357c8d018ca9b155d86d83"
+
+[[package]]
 name = "matrixmultiply"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4085,7 +4227,7 @@ dependencies = [
  "criterion",
  "fastmcp-core",
  "fastmcp-rust",
- "ftui-runtime",
+ "ftui-runtime 0.1.1",
  "hex",
  "mcp-agent-mail-conformance",
  "mcp-agent-mail-core",
@@ -4111,8 +4253,8 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm 0.28.1",
- "ftui",
- "ftui-runtime",
+ "ftui 0.1.1",
+ "ftui-runtime 0.1.1",
  "hex",
  "mcp-agent-mail-core",
  "mcp-agent-mail-db",
@@ -4218,7 +4360,7 @@ dependencies = [
  "fastmcp-rust",
  "fastmcp-server",
  "fastmcp-transport",
- "ftui-runtime",
+ "ftui-runtime 0.1.1",
  "glob",
  "include_dir",
  "jsonwebtoken",
@@ -7341,6 +7483,18 @@ name = "unicode_categories"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39ec24b3121d976906ece63c9daad25b85969647682eee313cb5779fdd69e14e"
+
+[[package]]
+name = "unicodeit"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1069c222ea63347e2e59763aa12d32c9c6a4e595931c7724a769f6a75bfbc553"
+dependencies = [
+ "aho-corasick",
+ "cfg-if",
+ "memchr",
+ "regex",
+]
 
 [[package]]
 name = "unit-prefix"

@@ -1095,6 +1095,13 @@ fn handle_config(action: ConfigCommand) -> CliResult<()> {
 
 fn handle_file_reservations(action: FileReservationsCommand) -> CliResult<()> {
     let conn = open_db_sync()?;
+    handle_file_reservations_with_conn(&conn, action)
+}
+
+fn handle_file_reservations_with_conn(
+    conn: &sqlmodel_sqlite::SqliteConnection,
+    action: FileReservationsCommand,
+) -> CliResult<()> {
     let now_us = mcp_agent_mail_db::timestamps::now_micros();
 
     match action {
@@ -1243,6 +1250,13 @@ fn handle_file_reservations(action: FileReservationsCommand) -> CliResult<()> {
 
 fn handle_acks(action: AcksCommand) -> CliResult<()> {
     let conn = open_db_sync()?;
+    handle_acks_with_conn(&conn, action)
+}
+
+fn handle_acks_with_conn(
+    conn: &sqlmodel_sqlite::SqliteConnection,
+    action: AcksCommand,
+) -> CliResult<()> {
     let now_us = mcp_agent_mail_db::timestamps::now_micros();
 
     match action {
@@ -1257,7 +1271,7 @@ fn handle_acks(action: AcksCommand) -> CliResult<()> {
                     "SELECT m.id, m.subject, m.importance, m.created_ts, \
                             sender_a.name AS sender_name \
                      FROM messages m \
-                     JOIN inbox i ON i.message_id = m.id \
+                     JOIN message_recipients i ON i.message_id = m.id \
                      JOIN agents recv_a ON recv_a.id = i.agent_id \
                      JOIN agents sender_a ON sender_a.id = m.sender_id \
                      JOIN projects p ON p.id = m.project_id \
@@ -1301,7 +1315,7 @@ fn handle_acks(action: AcksCommand) -> CliResult<()> {
                 .query_sync(
                     "SELECT m.id, m.subject, m.created_ts, sender_a.name AS sender_name \
                      FROM messages m \
-                     JOIN inbox i ON i.message_id = m.id \
+                     JOIN message_recipients i ON i.message_id = m.id \
                      JOIN agents recv_a ON recv_a.id = i.agent_id \
                      JOIN agents sender_a ON sender_a.id = m.sender_id \
                      JOIN projects p ON p.id = m.project_id \
@@ -1353,7 +1367,7 @@ fn handle_acks(action: AcksCommand) -> CliResult<()> {
                 .query_sync(
                     "SELECT m.id, m.subject, m.created_ts, sender_a.name AS sender_name \
                      FROM messages m \
-                     JOIN inbox i ON i.message_id = m.id \
+                     JOIN message_recipients i ON i.message_id = m.id \
                      JOIN agents recv_a ON recv_a.id = i.agent_id \
                      JOIN agents sender_a ON sender_a.id = m.sender_id \
                      JOIN projects p ON p.id = m.project_id \
@@ -1398,12 +1412,21 @@ fn handle_acks(action: AcksCommand) -> CliResult<()> {
 
 fn handle_list_acks(project_key: &str, agent_name: &str, limit: i64) -> CliResult<()> {
     let conn = open_db_sync()?;
+    handle_list_acks_with_conn(&conn, project_key, agent_name, limit)
+}
+
+fn handle_list_acks_with_conn(
+    conn: &sqlmodel_sqlite::SqliteConnection,
+    project_key: &str,
+    agent_name: &str,
+    limit: i64,
+) -> CliResult<()> {
     let rows = conn
         .query_sync(
             "SELECT m.id, m.subject, m.importance, m.created_ts, \
                     i.ack_ts, i.read_ts, sender_a.name AS sender_name \
              FROM messages m \
-             JOIN inbox i ON i.message_id = m.id \
+             JOIN message_recipients i ON i.message_id = m.id \
              JOIN agents recv_a ON recv_a.id = i.agent_id \
              JOIN agents sender_a ON sender_a.id = m.sender_id \
              JOIN projects p ON p.id = m.project_id \
@@ -2830,6 +2853,89 @@ mod tests {
         key_tx.send('d').expect("send deploy");
         let result = thread.join().expect("join preview thread");
         assert!(matches!(result, Err(CliError::ExitCode(42))));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn share_preview_does_not_serve_symlink_escape() {
+        use std::io::{Read, Write};
+        use std::net::{SocketAddr, TcpStream};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        fn http_get(addr: SocketAddr, path: &str) -> (u16, Vec<u8>) {
+            let mut stream = TcpStream::connect(addr).expect("connect");
+            let req = format!(
+                "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n",
+                host = addr
+            );
+            stream.write_all(req.as_bytes()).expect("write request");
+            stream.flush().expect("flush");
+
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).expect("read response");
+
+            let split = buf
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .expect("header split");
+            let (head, body) = buf.split_at(split + 4);
+
+            let head_str = String::from_utf8_lossy(head);
+            let code: u16 = head_str
+                .split("\r\n")
+                .next()
+                .unwrap_or_default()
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0);
+            (code, body.to_vec())
+        }
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let bundle = temp.path().join("bundle");
+        std::fs::create_dir_all(&bundle).expect("create bundle dir");
+        std::fs::write(bundle.join("index.html"), "<html>root</html>").expect("write index");
+        std::fs::write(bundle.join("manifest.json"), "{}\n").expect("write manifest");
+
+        let secret = temp.path().join("secret.txt");
+        std::fs::write(&secret, "top-secret").expect("write secret");
+        std::os::unix::fs::symlink(&secret, bundle.join("leak.txt")).expect("symlink");
+
+        share::copy_viewer_assets(&bundle).expect("copy viewer assets");
+
+        let (addr_tx, addr_rx) = mpsc::channel::<SocketAddr>();
+        let (key_tx, key_rx) = mpsc::channel::<char>();
+
+        let thread = std::thread::spawn(move || {
+            run_share_preview_with_control(
+                bundle,
+                "127.0.0.1".to_string(),
+                0,
+                false,
+                Some(key_rx),
+                Some(addr_tx),
+                None,
+            )
+        });
+
+        let addr = addr_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("preview server did not start");
+
+        let (code, body) = http_get(addr, "/leak.txt");
+        assert_eq!(
+            code,
+            404,
+            "expected symlink escape to be blocked (code={code}, body={})",
+            String::from_utf8_lossy(&body)
+        );
+
+        key_tx.send('q').expect("send quit");
+        let result = thread.join().expect("join preview thread");
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -6080,6 +6186,364 @@ sys.exit(7)
         assert!(
             content.contains("9999"),
             "env file should contain port 9999, got: {content}"
+        );
+    }
+
+    /// Helper: seed a DB with projects, agents, messages, and file_reservations for CLI tests.
+    fn seed_acks_and_reservations_db(db_path: &Path) -> sqlmodel_sqlite::SqliteConnection {
+        use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
+
+        let conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
+            .expect("init schema");
+
+        let now_us = mcp_agent_mail_db::timestamps::now_micros();
+
+        // Project
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+            &[
+                SqlValue::BigInt(1),
+                SqlValue::Text("test-proj".to_string()),
+                SqlValue::Text("/tmp/test-proj".to_string()),
+                SqlValue::BigInt(now_us),
+            ],
+        )
+        .unwrap();
+
+        // Agents
+        let agent_insert = "INSERT INTO agents (\
+                id, project_id, name, program, model, task_description, \
+                inception_ts, last_active_ts, attachments_policy, contact_policy\
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        conn.execute_sync(
+            agent_insert,
+            &[
+                SqlValue::BigInt(1),
+                SqlValue::BigInt(1),
+                SqlValue::Text("BlueLake".to_string()),
+                SqlValue::Text("test".to_string()),
+                SqlValue::Text("test".to_string()),
+                SqlValue::Text(String::new()),
+                SqlValue::BigInt(now_us),
+                SqlValue::BigInt(now_us),
+                SqlValue::Text("auto".to_string()),
+                SqlValue::Text("auto".to_string()),
+            ],
+        )
+        .unwrap();
+        conn.execute_sync(
+            agent_insert,
+            &[
+                SqlValue::BigInt(2),
+                SqlValue::BigInt(1),
+                SqlValue::Text("RedFox".to_string()),
+                SqlValue::Text("test".to_string()),
+                SqlValue::Text("test".to_string()),
+                SqlValue::Text(String::new()),
+                SqlValue::BigInt(now_us),
+                SqlValue::BigInt(now_us),
+                SqlValue::Text("auto".to_string()),
+                SqlValue::Text("auto".to_string()),
+            ],
+        )
+        .unwrap();
+
+        // Messages (ack_required=1 from RedFox to BlueLake)
+        let msg_insert = "INSERT INTO messages (\
+                id, project_id, sender_id, thread_id, subject, body_md, importance, \
+                ack_required, created_ts, attachments\
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        conn.execute_sync(
+            msg_insert,
+            &[
+                SqlValue::BigInt(100),
+                SqlValue::BigInt(1),
+                SqlValue::BigInt(2), // sender: RedFox
+                SqlValue::Null,
+                SqlValue::Text("Please review PR".to_string()),
+                SqlValue::Text("body".to_string()),
+                SqlValue::Text("high".to_string()),
+                SqlValue::BigInt(1),                    // ack_required
+                SqlValue::BigInt(now_us - 120_000_000), // 2 min ago
+                SqlValue::Text("[]".to_string()),
+            ],
+        )
+        .unwrap();
+        // Non-ack message
+        conn.execute_sync(
+            msg_insert,
+            &[
+                SqlValue::BigInt(101),
+                SqlValue::BigInt(1),
+                SqlValue::BigInt(2),
+                SqlValue::Null,
+                SqlValue::Text("FYI update".to_string()),
+                SqlValue::Text("body".to_string()),
+                SqlValue::Text("normal".to_string()),
+                SqlValue::BigInt(0),                   // not ack_required
+                SqlValue::BigInt(now_us - 60_000_000), // 1 min ago
+                SqlValue::Text("[]".to_string()),
+            ],
+        )
+        .unwrap();
+
+        // Recipients
+        let recip_insert =
+            "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?, ?, ?)";
+        conn.execute_sync(
+            recip_insert,
+            &[
+                SqlValue::BigInt(100),
+                SqlValue::BigInt(1), // BlueLake
+                SqlValue::Text("to".to_string()),
+            ],
+        )
+        .unwrap();
+        conn.execute_sync(
+            recip_insert,
+            &[
+                SqlValue::BigInt(101),
+                SqlValue::BigInt(1),
+                SqlValue::Text("to".to_string()),
+            ],
+        )
+        .unwrap();
+
+        // File reservations (active, by BlueLake)
+        let future_ts = now_us + 3_600_000_000; // 1 hour from now
+        conn.execute_sync(
+            "INSERT INTO file_reservations (\
+                id, project_id, agent_id, path_pattern, exclusive, reason, \
+                created_ts, expires_ts, released_ts\
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                SqlValue::BigInt(1),
+                SqlValue::BigInt(1),
+                SqlValue::BigInt(1), // BlueLake
+                SqlValue::Text("src/api/*.rs".to_string()),
+                SqlValue::BigInt(1),
+                SqlValue::Text("refactoring API".to_string()),
+                SqlValue::BigInt(now_us),
+                SqlValue::BigInt(future_ts),
+                SqlValue::Null, // not released
+            ],
+        )
+        .unwrap();
+
+        conn
+    }
+
+    #[test]
+    fn integration_acks_pending_shows_unacked_messages() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_acks_with_conn(
+            &conn,
+            AcksCommand::Pending {
+                project: "test-proj".to_string(),
+                agent: "BlueLake".to_string(),
+                limit: 20,
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "acks pending failed: {result:?}");
+        // Should show the ack-required message from RedFox
+        assert!(
+            output.contains("RedFox") && output.contains("Please review PR"),
+            "expected ack-required message in output, got: {output}"
+        );
+    }
+
+    #[test]
+    fn integration_acks_pending_empty_when_no_acks() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        // RedFox has no ack-required messages
+        let result = handle_acks_with_conn(
+            &conn,
+            AcksCommand::Pending {
+                project: "test-proj".to_string(),
+                agent: "RedFox".to_string(),
+                limit: 20,
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "acks pending failed: {result:?}");
+        assert!(
+            output.contains("No pending acks"),
+            "expected empty result, got: {output}"
+        );
+    }
+
+    #[test]
+    fn integration_acks_overdue_finds_old_messages() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        // ttl_minutes=1 means messages older than 1 min are overdue;
+        // our message is 2 min old
+        let result = handle_acks_with_conn(
+            &conn,
+            AcksCommand::Overdue {
+                project: "test-proj".to_string(),
+                agent: "BlueLake".to_string(),
+                ttl_minutes: 1,
+                limit: 50,
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "acks overdue failed: {result:?}");
+        assert!(
+            output.contains("OVERDUE") && output.contains("RedFox"),
+            "expected overdue ack in output, got: {output}"
+        );
+    }
+
+    #[test]
+    fn integration_list_acks_shows_ack_required_messages() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_list_acks_with_conn(&conn, "test-proj", "BlueLake", 20);
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "list-acks failed: {result:?}");
+        assert!(
+            output.contains("RedFox") && output.contains("pending"),
+            "expected ack-required message with pending status, got: {output}"
+        );
+    }
+
+    #[test]
+    fn integration_list_acks_empty_for_nonexistent_agent() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_list_acks_with_conn(&conn, "test-proj", "GhostAgent", 20);
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "list-acks failed: {result:?}");
+        assert!(
+            output.contains("No ack-required messages"),
+            "expected empty result, got: {output}"
+        );
+    }
+
+    #[test]
+    fn integration_file_reservations_list_shows_active() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_file_reservations_with_conn(
+            &conn,
+            FileReservationsCommand::List {
+                project: "test-proj".to_string(),
+                active_only: false,
+                all: false,
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "file_reservations list failed: {result:?}");
+        assert!(
+            output.contains("src/api/*.rs") && output.contains("BlueLake"),
+            "expected reservation in output, got: {output}"
+        );
+    }
+
+    #[test]
+    fn integration_file_reservations_active_shows_active() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_file_reservations_with_conn(
+            &conn,
+            FileReservationsCommand::Active {
+                project: "test-proj".to_string(),
+                limit: None,
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(
+            result.is_ok(),
+            "file_reservations active failed: {result:?}"
+        );
+        assert!(
+            output.contains("src/api/*.rs") && output.contains("BlueLake"),
+            "expected active reservation, got: {output}"
+        );
+    }
+
+    #[test]
+    fn integration_file_reservations_empty_project() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_file_reservations_with_conn(
+            &conn,
+            FileReservationsCommand::List {
+                project: "nonexistent-proj".to_string(),
+                active_only: false,
+                all: false,
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "file_reservations list failed: {result:?}");
+        assert!(
+            output.contains("No file reservations"),
+            "expected empty result, got: {output}"
+        );
+    }
+
+    #[test]
+    fn integration_acks_remind_finds_stale() {
+        let _guard = stdio_capture_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        // min_age_minutes=1 means messages older than 1 min are stale;
+        // our ack-required message is 2 min old
+        let result = handle_acks_with_conn(
+            &conn,
+            AcksCommand::Remind {
+                project: "test-proj".to_string(),
+                agent: "BlueLake".to_string(),
+                min_age_minutes: 1,
+                limit: 50,
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "acks remind failed: {result:?}");
+        assert!(
+            output.contains("Stale acks") && output.contains("RedFox"),
+            "expected stale ack reminder, got: {output}"
         );
     }
 }
@@ -9872,6 +10336,9 @@ fn start_preview_server(
     use asupersync::runtime::RuntimeBuilder;
     use std::sync::mpsc;
 
+    // Avoid serving files outside the preview root via symlink escape.
+    let base_dir = dir.canonicalize().unwrap_or(dir);
+
     let socket_addr: std::net::SocketAddr = format!("{host}:{port}")
         .parse()
         .map_err(|e| CliError::InvalidArgument(format!("invalid address: {e}")))?;
@@ -9897,7 +10364,7 @@ fn start_preview_server(
         };
         let handle = runtime.handle();
         runtime.block_on(async move {
-            let dir = dir.clone();
+            let dir = base_dir.clone();
             let log = log.clone();
             let listener = match Http1Listener::bind_with_config(
                 socket_addr,
@@ -9951,10 +10418,15 @@ fn start_preview_server(
                             file_path = file_path.join("index.html");
                         }
 
-                        let mut resp = if file_path.exists() && file_path.is_file() {
-                            match std::fs::read(&file_path) {
+                        let resolved = file_path.canonicalize().ok();
+                        let within_root = resolved.as_ref().is_some_and(|p| p.starts_with(&dir));
+                        let mut resp = if within_root
+                            && resolved.as_ref().is_some_and(|p| p.is_file())
+                        {
+                            let resolved = resolved.as_ref().unwrap();
+                            match std::fs::read(resolved) {
                                 Ok(content) => {
-                                    let ct = guess_content_type(&file_path);
+                                    let ct = guess_content_type(resolved);
                                     let mut resp = Response::new(200, "OK", content);
                                     resp.headers
                                         .push(("Content-Type".to_string(), ct.to_string()));

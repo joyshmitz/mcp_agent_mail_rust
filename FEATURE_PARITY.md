@@ -11,7 +11,7 @@
 | Feature | Status | Evidence |
 | --- | --- | --- |
 | FastMCP server (stdio transport) | Implemented | `crates/mcp-agent-mail-server/src/lib.rs` |
-| FastMCP server (HTTP) | Implemented | `crates/mcp-agent-mail-server/src/lib.rs` |
+| FastMCP server (HTTP) | Verified (Tests) | `crates/mcp-agent-mail-server/src/lib.rs`, `scripts/e2e_http.sh` (47 E2E assertions), `tests/e2e/test_http.sh` |
 | Tool registry + tool clusters | Verified (Conformance) | `crates/mcp-agent-mail-server/src/lib.rs` |
 | Resource URI system (`resource://...`) | Verified (Conformance) | `crates/mcp-agent-mail-tools/src/resources.rs` |
 | Tool filtering profiles (full/core/minimal/messaging/custom) | Verified (Tests) | `crates/mcp-agent-mail-core/src/config.rs`, `crates/mcp-agent-mail-tools/src/lib.rs`, `crates/mcp-agent-mail-server/src/lib.rs`, `crates/mcp-agent-mail-conformance/tests/conformance.rs` |
@@ -73,7 +73,7 @@
 | SQLite schema + migrations (idempotent init) | Verified (Tests) | `crates/mcp-agent-mail-db/src/schema.rs` |
 | DB pool + WAL PRAGMAs | Verified (Tests) | `crates/mcp-agent-mail-db/src/pool.rs` |
 | Core queries used by tools | Verified (Conformance) | `crates/mcp-agent-mail-db/src/queries.rs` |
-| FTS indexing | Implemented | `crates/mcp-agent-mail-db/src/schema.rs` |
+| FTS indexing | Verified (Tests) | `crates/mcp-agent-mail-db/src/schema.rs` (triggers), `crates/mcp-agent-mail-db/src/queries.rs` (20 FTS search tests), `crates/mcp-agent-mail-tools/src/search.rs` |
 | Git archive init + per-project repos | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` |
 | Agent profile archive writes | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` |
 | Message bundle write pipeline | Verified (Tests) | `crates/mcp-agent-mail-storage/src/lib.rs` |
@@ -94,22 +94,22 @@
 | --- | --- | --- |
 | CLI command parity | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (40+ commands, 123+ tests, only `--interactive` deferred) |
 | CLI output module (TTY-aware tables, JSON mode) | Verified (Tests) | `crates/mcp-agent-mail-cli/src/output.rs` (CliTable, json_or_table, 33 tests) |
-| Config management (show-port, set-port) | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
-| list-projects (--json, --include-agents) | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
-| file_reservations (list/active/soon) | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
-| acks (pending/remind/overdue) | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
-| list-acks | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
+| Config management (show-port, set-port) | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (2 integration tests: show-port returns port, set-port writes env file) |
+| list-projects (--json, --include-agents) | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (integration test), `tests/cli_json_snapshots.rs` (JSON snapshot) |
+| file_reservations (list/active/soon) | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (3 integration tests: list, active, empty project) |
+| acks (pending/remind/overdue) | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (4 integration tests: pending, empty, overdue, remind) |
+| list-acks | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (2 integration tests: shows ack-required messages, empty for nonexistent) |
 | mail status | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
 | migrate | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (10 tests: output parity, idempotent, tables, FTS, negative cases) |
-| clear-and-reset-everything | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
+| clear-and-reset-everything | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (2 integration tests: force+archive, force+no-archive) |
 | lint / typecheck | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
 | projects (mark-identity/discovery-init/adopt) | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
-| doctor check (--verbose, --json) | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
-| Guard install/uninstall + conflict detection | Implemented | `crates/mcp-agent-mail-guard/src/lib.rs` |
-| Guard status / guard check (Rust native) | Implemented | `crates/mcp-agent-mail-guard/src/lib.rs` |
-| Doctor repair/backups/restore | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` (repair, backups, restore commands) |
+| doctor check (--verbose, --json) | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (integration test), `tests/cli_json_snapshots.rs` (JSON snapshot) |
+| Guard install/uninstall + conflict detection | Verified (Tests) | `crates/mcp-agent-mail-guard/src/lib.rs`, `tests/e2e/test_guard.sh` (32 E2E assertions: install, check, uninstall, conflict detection, case-insensitive, advisory mode) |
+| Guard status / guard check (Rust native) | Verified (Tests) | `crates/mcp-agent-mail-guard/src/lib.rs`, `tests/e2e/test_guard.sh` (status, check with stdin-nul, advisory mode) |
+| Doctor repair/backups/restore | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (repair, backups, restore commands; backups integration test), `tests/cli_json_snapshots.rs` (backups JSON snapshot) |
 | Share export/update/verify/decrypt/preview | Verified (Tests) | `crates/mcp-agent-mail-share/src/` (8 modules, 62 tests), `crates/mcp-agent-mail-cli/src/lib.rs` |
-| Archive save/list/restore | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
+| Archive save/list/restore | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (roundtrip smoke test), `tests/cli_json_snapshots.rs` (archive list JSON snapshots), `tests/e2e/test_archive.sh` (16 E2E assertions) |
 
 ## Conformance & Benchmarks
 | Feature | Status | Evidence |
