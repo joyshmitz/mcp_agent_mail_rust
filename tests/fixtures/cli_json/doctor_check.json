@@ -1,0 +1,15 @@
+{
+  "checks": [
+    {
+      "check": "database",
+      "detail": "SQLite database accessible",
+      "status": "ok"
+    },
+    {
+      "check": "storage_root",
+      "detail": "<TMP_ROOT>/storage_root",
+      "status": "warn"
+    }
+  ],
+  "healthy": true
+}

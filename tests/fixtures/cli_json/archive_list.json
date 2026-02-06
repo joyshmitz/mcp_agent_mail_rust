@@ -1,0 +1,12 @@
+[
+  {
+    "created_at": "2024-01-01T00:00:00Z",
+    "file": "fixture.zip",
+    "path": "<TMP_ROOT>/archived_mailbox_states/fixture.zip",
+    "projects": [
+      "all"
+    ],
+    "scrub_preset": "archive",
+    "size_bytes": 229
+  }
+]

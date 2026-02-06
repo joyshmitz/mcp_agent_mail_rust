@@ -1,0 +1,6 @@
+Usage: am amctl env [OPTIONS]
+
+Options:
+  -p, --path <PATH>    [default: .]
+  -a, --agent <AGENT>
+  -h, --help           Print help

@@ -1,0 +1,15 @@
+Usage: am am-run [OPTIONS] <SLOT> <CMD>...
+
+Arguments:
+  <SLOT>
+  <CMD>...
+
+Options:
+  -p, --path <PATH>                [default: .]
+  -a, --agent <AGENT>
+      --ttl-seconds <TTL_SECONDS>  [default: 3600]
+      --shared
+      --exclusive
+      --block-on-conflicts
+      --no-block-on-conflicts
+  -h, --help                       Print help

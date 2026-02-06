@@ -1,0 +1,20 @@
+{
+  "product": {
+    "created_at": "2024-01-01T00:00:00.000000Z",
+    "id": 1,
+    "name": "Test Product",
+    "product_uid": "abc123"
+  },
+  "projects": [
+    {
+      "human_key": "<TMP_ROOT>/proj_alpha",
+      "id": 1,
+      "slug": "proj-alpha"
+    },
+    {
+      "human_key": "<TMP_ROOT>/proj_beta",
+      "id": 2,
+      "slug": "proj-beta"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+Usage: am clear-and-reset-everything [OPTIONS]
+
+Options:
+  -f, --force       Skip the final destructive confirmation prompt (still asks about creating an archive).
+      --archive     Attempt a pre-reset archive before deleting data (default: prompt when interactive).
+      --no-archive  Skip creating a pre-reset archive.
+  -h, --help        Print help

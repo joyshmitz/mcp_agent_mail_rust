@@ -1,0 +1,7 @@
+Usage: am guard check [OPTIONS]
+
+Options:
+      --stdin-nul
+      --advisory
+      --repo <REPO>
+  -h, --help         Print help

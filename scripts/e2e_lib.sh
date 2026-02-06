@@ -128,6 +128,19 @@ e2e_assert_contains() {
     fi
 }
 
+# Assert a string does NOT contain a substring
+e2e_assert_not_contains() {
+    local label="$1"
+    local haystack="$2"
+    local needle="$3"
+    if [[ "$haystack" == *"$needle"* ]]; then
+        e2e_fail "$label"
+        echo -e "    expected to NOT contain: ${_e2e_color_green}${needle}${_e2e_color_reset}"
+    else
+        e2e_pass "$label"
+    fi
+}
+
 # Assert a file exists
 e2e_assert_file_exists() {
     local label="$1"
@@ -343,8 +356,22 @@ e2e_ensure_binary() {
     local bin_path="${CARGO_TARGET_DIR}/debug/${bin_name}"
     if [ ! -f "$bin_path" ] || [ "${E2E_FORCE_BUILD:-0}" = "1" ]; then
         e2e_log "Building ${bin_name}..."
-        cargo build -p "$bin_name" 2>&1 | tail -5
+        case "$bin_name" in
+            am)
+                cargo build -p "mcp-agent-mail-cli" --bin "am" 2>&1 | tail -5
+                ;;
+            mcp-agent-mail)
+                cargo build -p "mcp-agent-mail" --bin "mcp-agent-mail" 2>&1 | tail -5
+                ;;
+            *)
+                # Default: assume package/bin share the same name.
+                cargo build -p "$bin_name" --bin "$bin_name" 2>&1 | tail -5
+                ;;
+        esac
     fi
+
+    # Ensure built binaries are callable by name in E2E scripts.
+    export PATH="${CARGO_TARGET_DIR}/debug:${PATH}"
     echo "$bin_path"
 }
 

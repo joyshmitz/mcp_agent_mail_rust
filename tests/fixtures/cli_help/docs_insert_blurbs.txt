@@ -1,0 +1,8 @@
+Usage: am docs insert-blurbs [OPTIONS]
+
+Options:
+  -d, --scan-dir <SCAN_DIR>
+      --yes
+      --dry-run
+      --max-depth <MAX_DEPTH>
+  -h, --help                   Print help

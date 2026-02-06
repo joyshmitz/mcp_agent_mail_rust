@@ -1,0 +1,38 @@
+[
+  {
+    "agents": [
+      {
+        "model": "test",
+        "name": "GreenCastle",
+        "program": "test"
+      },
+      {
+        "model": "test",
+        "name": "PurpleBear",
+        "program": "test"
+      }
+    ],
+    "created_at": "2024-01-01T00:00:00.000000Z",
+    "human_key": "<TMP_ROOT>/proj_alpha",
+    "id": 1,
+    "slug": "proj-alpha"
+  },
+  {
+    "agents": [
+      {
+        "model": "test",
+        "name": "GreenCastle",
+        "program": "test"
+      },
+      {
+        "model": "test",
+        "name": "OrangeFish",
+        "program": "test"
+      }
+    ],
+    "created_at": "2024-01-01T00:00:00.000000Z",
+    "human_key": "<TMP_ROOT>/proj_beta",
+    "id": 2,
+    "slug": "proj-beta"
+  }
+]

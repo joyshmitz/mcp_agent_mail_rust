@@ -1,0 +1,4 @@
+Usage: am migrate
+
+Options:
+  -h, --help  Print help

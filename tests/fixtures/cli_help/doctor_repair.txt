@@ -1,0 +1,10 @@
+Usage: am doctor repair [OPTIONS] [PROJECT]
+
+Arguments:
+  [PROJECT]
+
+Options:
+      --dry-run
+  -y, --yes
+      --backup-dir <BACKUP_DIR>
+  -h, --help                     Print help

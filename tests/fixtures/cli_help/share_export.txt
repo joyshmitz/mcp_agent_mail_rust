@@ -1,0 +1,19 @@
+Usage: am share export [OPTIONS] --output <OUTPUT>
+
+Options:
+  -o, --output <OUTPUT>
+  -i, --interactive
+  -p, --project <PROJECTS>
+      --inline-threshold <INLINE_THRESHOLD>      [default: 65536]
+      --detach-threshold <DETACH_THRESHOLD>      [default: 26214400]
+      --scrub-preset <SCRUB_PRESET>              [default: standard]
+      --chunk-threshold <CHUNK_THRESHOLD>        [default: 20971520]
+      --chunk-size <CHUNK_SIZE>                  [default: 4194304]
+      --dry-run
+      --no-dry-run
+      --zip
+      --no-zip
+      --signing-key <SIGNING_KEY>
+      --signing-public-out <SIGNING_PUBLIC_OUT>
+      --age-recipient <AGE_RECIPIENT>
+  -h, --help                                     Print help
