@@ -780,6 +780,114 @@ pub async fn create_message(
     }
 }
 
+/// Create a message AND insert all recipients in a single SQLite transaction.
+///
+/// This eliminates N+2 separate auto-commit writes (1 message INSERT + N
+/// recipient INSERTs) into a single transaction with 1 fsync.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_message_with_recipients(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    sender_id: i64,
+    subject: &str,
+    body_md: &str,
+    thread_id: Option<&str>,
+    importance: &str,
+    ack_required: bool,
+    attachments: &str,
+    recipients: &[(i64, &str)], // (agent_id, kind)
+) -> Outcome<MessageRow, DbError> {
+    let now = now_micros();
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+
+    // Begin transaction
+    let tx = match tracked.begin(cx).await {
+        Outcome::Ok(t) => t,
+        Outcome::Err(e) => return Outcome::Err(DbError::Sql(e)),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    // Insert message
+    let mut row = MessageRow {
+        id: None,
+        project_id,
+        sender_id,
+        thread_id: thread_id.map(String::from),
+        subject: subject.to_string(),
+        body_md: body_md.to_string(),
+        importance: importance.to_string(),
+        ack_required: i64::from(ack_required),
+        created_ts: now,
+        attachments: attachments.to_string(),
+    };
+
+    let id_out = map_sql_outcome(insert!(&row).execute(cx, &tx).await);
+    let message_id = match id_out {
+        Outcome::Ok(id) => {
+            row.id = Some(id);
+            id
+        }
+        Outcome::Err(e) => {
+            let _ = tx.rollback(cx).await;
+            return Outcome::Err(e);
+        }
+        Outcome::Cancelled(r) => {
+            let _ = tx.rollback(cx).await;
+            return Outcome::Cancelled(r);
+        }
+        Outcome::Panicked(p) => {
+            let _ = tx.rollback(cx).await;
+            return Outcome::Panicked(p);
+        }
+    };
+
+    // Insert all recipients within the same transaction
+    for (agent_id, kind) in recipients {
+        let recip = MessageRecipientRow {
+            message_id,
+            agent_id: *agent_id,
+            kind: (*kind).to_string(),
+            read_ts: None,
+            ack_ts: None,
+        };
+
+        let out = map_sql_outcome(insert!(&recip).execute(cx, &tx).await);
+        match out {
+            Outcome::Ok(_) => {}
+            Outcome::Err(e) => {
+                let _ = tx.rollback(cx).await;
+                return Outcome::Err(e);
+            }
+            Outcome::Cancelled(r) => {
+                let _ = tx.rollback(cx).await;
+                return Outcome::Cancelled(r);
+            }
+            Outcome::Panicked(p) => {
+                let _ = tx.rollback(cx).await;
+                return Outcome::Panicked(p);
+            }
+        }
+    }
+
+    // Commit (single fsync)
+    match tx.commit(cx).await {
+        Outcome::Ok(()) => Outcome::Ok(row),
+        Outcome::Err(e) => Outcome::Err(DbError::Sql(e)),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
 /// List messages for a thread.
 ///
 /// Thread semantics:

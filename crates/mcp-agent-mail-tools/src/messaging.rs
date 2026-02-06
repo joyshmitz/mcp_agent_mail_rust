@@ -647,9 +647,13 @@ pub async fn send_message(
     let attachments_json =
         serde_json::to_string(&all_attachment_meta).unwrap_or_else(|_| "[]".to_string());
 
-    // Create message in DB (use processed body with inline replacements)
+    // Create message + recipients in a single DB transaction (1 fsync)
+    let recipient_refs: Vec<(i64, &str)> = all_recipients
+        .iter()
+        .map(|(id, kind)| (*id, kind.as_str()))
+        .collect();
     let message = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::create_message(
+        mcp_agent_mail_db::queries::create_message_with_recipients(
             ctx.cx(),
             &pool,
             project_id,
@@ -660,21 +664,12 @@ pub async fn send_message(
             &importance_val,
             ack_required.unwrap_or(false),
             &attachments_json,
+            &recipient_refs,
         )
         .await,
     )?;
 
     let message_id = message.id.unwrap_or(0);
-
-    // Add recipients
-    let recipient_refs: Vec<(i64, &str)> = all_recipients
-        .iter()
-        .map(|(id, kind)| (*id, kind.as_str()))
-        .collect();
-    db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::add_recipients(ctx.cx(), &pool, message_id, &recipient_refs)
-            .await,
-    )?;
 
     // Emit notification signals for to/cc recipients only (never bcc).
     let notification_meta = mcp_agent_mail_storage::NotificationMessage {
