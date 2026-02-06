@@ -8154,10 +8154,14 @@ fn handle_archive(action: ArchiveCommand) -> CliResult<()> {
 
             let archive_dir = archive_states_dir(false)?;
             if !archive_dir.exists() {
-                ftui_runtime::ftui_println!(
-                    "Archive directory {} does not exist yet.",
-                    archive_dir.display()
-                );
+                if json {
+                    ftui_runtime::ftui_println!("[]");
+                } else {
+                    ftui_runtime::ftui_println!(
+                        "Archive directory {} does not exist yet.",
+                        archive_dir.display()
+                    );
+                }
                 return Ok(());
             }
 
@@ -8176,10 +8180,14 @@ fn handle_archive(action: ArchiveCommand) -> CliResult<()> {
             files.sort_by_key(|(_, m)| std::cmp::Reverse(*m));
 
             if files.is_empty() {
-                ftui_runtime::ftui_println!(
-                    "No saved mailbox states found under {}.",
-                    archive_dir.display()
-                );
+                if json {
+                    ftui_runtime::ftui_println!("[]");
+                } else {
+                    ftui_runtime::ftui_println!(
+                        "No saved mailbox states found under {}.",
+                        archive_dir.display()
+                    );
+                }
                 return Ok(());
             }
 
@@ -9109,7 +9117,15 @@ async fn handle_products_with(
             json,
         } => {
             let Some(sanitized) = mcp_agent_mail_db::queries::sanitize_fts_query(&query) else {
-                ftui_runtime::ftui_println!("Query '{query}' cannot produce search results.");
+                if json {
+                    let payload = serde_json::json!({ "result": [] });
+                    ftui_runtime::ftui_println!(
+                        "{}",
+                        serde_json::to_string_pretty(&payload).unwrap_or_default()
+                    );
+                } else {
+                    ftui_runtime::ftui_println!("Query '{query}' cannot produce search results.");
+                }
                 return Ok(());
             };
 
@@ -9135,7 +9151,15 @@ async fn handle_products_with(
                 };
             let project_ids = projects.iter().filter_map(|p| p.id).collect::<Vec<_>>();
             if project_ids.is_empty() {
-                ftui_runtime::ftui_println!("No results.");
+                if json {
+                    let payload = serde_json::json!({ "result": [] });
+                    ftui_runtime::ftui_println!(
+                        "{}",
+                        serde_json::to_string_pretty(&payload).unwrap_or_default()
+                    );
+                } else {
+                    ftui_runtime::ftui_println!("No results.");
+                }
                 return Ok(());
             }
 
@@ -9189,7 +9213,15 @@ async fn handle_products_with(
             }
 
             if out.is_empty() {
-                ftui_runtime::ftui_println!("No results.");
+                if json {
+                    let payload = serde_json::json!({ "result": [] });
+                    ftui_runtime::ftui_println!(
+                        "{}",
+                        serde_json::to_string_pretty(&payload).unwrap_or_default()
+                    );
+                } else {
+                    ftui_runtime::ftui_println!("No results.");
+                }
                 return Ok(());
             }
 
@@ -9373,7 +9405,11 @@ async fn handle_products_with(
             }
 
             if items.is_empty() {
-                ftui_runtime::ftui_println!("No messages found.");
+                if json {
+                    ftui_runtime::ftui_println!("[]");
+                } else {
+                    ftui_runtime::ftui_println!("No messages found.");
+                }
                 return Ok(());
             }
 
