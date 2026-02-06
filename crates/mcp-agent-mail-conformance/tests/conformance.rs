@@ -7,9 +7,18 @@ use mcp_agent_mail_conformance::{Case, ExpectedError, Fixtures, Normalize};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::sync::{Mutex, OnceLock};
 
 /// Auto-increment ID field names that are non-deterministic across test runs.
 const AUTO_INCREMENT_ID_KEYS: &[&str] = &["id", "message_id", "reply_to"];
+
+/// Tests in this file mutate process-wide environment variables (Rust has no per-test env isolation).
+/// The Rust test harness runs tests in parallel by default, so serialize any env mutations and
+/// `Config::from_env()` calls to avoid flakey cross-test races.
+fn env_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 /// Recursively null out auto-increment integer ID fields in a JSON value.
 /// This handles the fact that fixture cases run sequentially in a shared DB,
@@ -46,7 +55,8 @@ fn align_cluster_tools(actual: &mut Value, expected: &Value) {
     };
 
     // Collect all tool names from expected
-    let mut expected_tool_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut expected_tool_names: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for cluster in expected_clusters {
         if let Some(tools) = cluster.get("tools").and_then(|t| t.as_array()) {
             for tool in tools {
@@ -255,6 +265,39 @@ impl Drop for ToolFilterEnvGuard {
     }
 }
 
+struct EnvVarGuard {
+    previous: Vec<(String, Option<String>)>,
+}
+
+impl EnvVarGuard {
+    fn set(vars: &[(&str, &str)]) -> Self {
+        let mut previous = Vec::new();
+        for (key, value) in vars {
+            let old = std::env::var(*key).ok();
+            previous.push(((*key).to_string(), old));
+            unsafe {
+                std::env::set_var(key, value);
+            }
+        }
+        Self { previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        for (key, value) in self.previous.drain(..) {
+            match value {
+                Some(v) => unsafe {
+                    std::env::set_var(&key, v);
+                },
+                None => unsafe {
+                    std::env::remove_var(&key);
+                },
+            }
+        }
+    }
+}
+
 fn load_tool_filter_fixtures() -> ToolFilterFixtures {
     let path = "tests/conformance/fixtures/tool_filter/cases.json";
     let raw = std::fs::read_to_string(path).expect("tool filter fixtures missing");
@@ -299,6 +342,7 @@ fn args_from_case(case: &Case) -> Option<Value> {
 
 struct FixtureEnv {
     tmp: tempfile::TempDir,
+    _env_guard: EnvVarGuard,
     fixtures: Fixtures,
     router: fastmcp::Router,
 }
@@ -309,16 +353,27 @@ fn setup_fixture_env() -> FixtureEnv {
     let db_path = tmp.path().join("db.sqlite3");
     let db_url = format!("sqlite://{}", db_path.display());
     let storage_root = tmp.path().join("archive");
-    unsafe {
-        std::env::set_var("DATABASE_URL", db_url);
-        std::env::set_var("WORKTREES_ENABLED", "1");
-        std::env::set_var(
-            "STORAGE_ROOT",
-            storage_root
-                .to_str()
-                .expect("storage_root must be valid UTF-8"),
-        );
-    }
+    let storage_root_str = storage_root
+        .to_str()
+        .expect("storage_root must be valid UTF-8");
+    // Ensure fixtures run deterministically regardless of developer shell env.
+    // Also explicitly disable tool filtering (otherwise tools may not be registered).
+    let env_guard = EnvVarGuard::set(&[
+        ("DATABASE_URL", &db_url),
+        ("WORKTREES_ENABLED", "1"),
+        ("STORAGE_ROOT", storage_root_str),
+        ("TOOLS_FILTER_ENABLED", "0"),
+        ("TOOLS_FILTER_PROFILE", "full"),
+        ("TOOLS_FILTER_MODE", "include"),
+        ("TOOLS_FILTER_CLUSTERS", ""),
+        ("TOOLS_FILTER_TOOLS", ""),
+        ("MCP_AGENT_MAIL_OUTPUT_FORMAT", ""),
+        ("TOON_DEFAULT_FORMAT", ""),
+        ("TOON_BIN", ""),
+        ("TOON_TRU_BIN", ""),
+        ("TOON_STATS", "0"),
+        ("AGENT_NAME_ENFORCEMENT_MODE", "coerce"),
+    ]);
 
     for repo_name in &["repo_install", "repo_uninstall"] {
         let repo_dir = std::path::Path::new("/tmp/agent-mail-fixtures").join(repo_name);
@@ -338,6 +393,7 @@ fn setup_fixture_env() -> FixtureEnv {
 
     FixtureEnv {
         tmp,
+        _env_guard: env_guard,
         fixtures,
         router,
     }
@@ -373,6 +429,7 @@ fn load_and_validate_fixture_schema() {
 
 #[test]
 fn run_fixtures_against_rust_server_router() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let env = setup_fixture_env();
     let storage_root = env.tmp.path().join("archive");
     let fixtures = &env.fixtures;
@@ -569,9 +626,8 @@ fn run_fixtures_against_rust_server_router() {
     for msg_rel in &message_files {
         let content = std::fs::read_to_string(storage_root.join(msg_rel))
             .unwrap_or_else(|e| panic!("failed to read {msg_rel}: {e}"));
-        let fm = parse_frontmatter(&content).unwrap_or_else(|| {
-            panic!("message {msg_rel} has no valid ---json frontmatter")
-        });
+        let fm = parse_frontmatter(&content)
+            .unwrap_or_else(|| panic!("message {msg_rel} has no valid ---json frontmatter"));
         assert!(fm.get("from").and_then(Value::as_str).is_some());
         assert!(fm.get("subject").and_then(Value::as_str).is_some());
         assert!(fm.get("to").and_then(Value::as_array).is_some());
@@ -588,7 +644,10 @@ fn run_fixtures_against_rust_server_router() {
         .filter(|f| f.contains("/outbox/") && f.ends_with(".md"))
         .collect();
     assert!(!inbox_files.is_empty(), "expected at least one inbox copy");
-    assert!(!outbox_files.is_empty(), "expected at least one outbox copy");
+    assert!(
+        !outbox_files.is_empty(),
+        "expected at least one outbox copy"
+    );
 
     // --- File reservation artifacts ---
     let reservation_files: Vec<&String> = files
@@ -599,10 +658,215 @@ fn run_fixtures_against_rust_server_router() {
         !reservation_files.is_empty(),
         "expected at least one file reservation JSON artifact"
     );
+
+    // --- Notification signal assertions (tool flow) ---
+    let notif_tmp = tempfile::TempDir::new().expect("failed to create notifications tempdir");
+    let notif_db_path = notif_tmp.path().join("db.sqlite3");
+    let notif_db_url = format!("sqlite://{}", notif_db_path.display());
+    let notif_storage_root = notif_tmp.path().join("archive");
+    let notif_signals_dir = notif_tmp.path().join("signals");
+    let _env_guard = EnvVarGuard::set(&[
+        ("DATABASE_URL", notif_db_url.as_str()),
+        (
+            "STORAGE_ROOT",
+            notif_storage_root
+                .to_str()
+                .expect("storage_root must be valid UTF-8"),
+        ),
+        ("NOTIFICATIONS_ENABLED", "1"),
+        ("NOTIFICATIONS_DEBOUNCE_MS", "0"),
+        ("NOTIFICATIONS_INCLUDE_METADATA", "1"),
+        (
+            "NOTIFICATIONS_SIGNALS_DIR",
+            notif_signals_dir
+                .to_str()
+                .expect("signals_dir must be valid UTF-8"),
+        ),
+    ]);
+
+    let config = mcp_agent_mail_core::Config::from_env();
+    let router = mcp_agent_mail_server::build_server(&config).into_router();
+
+    let project_dir = notif_tmp.path().join("project");
+    std::fs::create_dir_all(&project_dir).expect("create notification project dir");
+    let project_key = project_dir.to_string_lossy().to_string();
+    let project_slug = mcp_agent_mail_core::compute_project_slug(&project_key);
+
+    let ensure_params = CallToolParams {
+        name: "ensure_project".to_string(),
+        arguments: Some(serde_json::json!({ "human_key": project_key.clone() })),
+        meta: None,
+    };
+    let ensure_result = router
+        .handle_tools_call(
+            &cx,
+            req_id,
+            ensure_params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("ensure_project failed: {e}"));
+    req_id += 1;
+    assert!(!ensure_result.is_error, "ensure_project returned error");
+
+    for name in ["BoldCastle", "CalmRiver", "DeepMeadow", "IronPeak"] {
+        let register_params = CallToolParams {
+            name: "register_agent".to_string(),
+            arguments: Some(serde_json::json!({
+                "project_key": project_key.clone(),
+                "program": "codex-cli",
+                "model": "gpt-5",
+                "name": name,
+            })),
+            meta: None,
+        };
+        let register_result = router
+            .handle_tools_call(
+                &cx,
+                req_id,
+                register_params,
+                &budget,
+                SessionState::new(),
+                None,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("register_agent failed for {name}: {e}"));
+        req_id += 1;
+        assert!(
+            !register_result.is_error,
+            "register_agent returned error for {name}: {:?}",
+            register_result.content
+        );
+    }
+
+    let send_params = CallToolParams {
+        name: "send_message".to_string(),
+        arguments: Some(serde_json::json!({
+            "project_key": project_key.clone(),
+            "sender_name": "BoldCastle",
+            "to": ["CalmRiver"],
+            "cc": ["DeepMeadow"],
+            "bcc": ["IronPeak"],
+            "subject": "Signal test",
+            "body_md": "Hello from notifications test.",
+            "importance": "high",
+        })),
+        meta: None,
+    };
+    let send_result = router
+        .handle_tools_call(
+            &cx,
+            req_id,
+            send_params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("send_message failed: {e}"));
+    req_id += 1;
+    assert!(
+        !send_result.is_error,
+        "send_message returned error: {:?}",
+        send_result.content
+    );
+
+    let send_json = decode_json_from_tool_content(&send_result.content)
+        .expect("failed to decode send_message response");
+    let message_id = send_json
+        .pointer("/deliveries/0/payload/id")
+        .and_then(Value::as_i64)
+        .expect("send_message response missing deliveries[0].payload.id");
+
+    let signal_root = notif_signals_dir
+        .join("projects")
+        .join(&project_slug)
+        .join("agents");
+    let to_signal = signal_root.join("CalmRiver.signal");
+    let cc_signal = signal_root.join("DeepMeadow.signal");
+    let bcc_signal = signal_root.join("IronPeak.signal");
+
+    // Debug: check signal directory structure
+    eprintln!("signal_root: {}", signal_root.display());
+    eprintln!("signal_root exists: {}", signal_root.exists());
+    eprintln!("notif_signals_dir: {}", notif_signals_dir.display());
+    eprintln!(
+        "notif_signals_dir exists: {}",
+        notif_signals_dir.exists()
+    );
+    eprintln!("to_signal path: {}", to_signal.display());
+    eprintln!("project_slug: {project_slug}");
+    eprintln!("send_json: {send_json}");
+    // List files in signals dir recursively
+    fn list_dir_recursive(path: &std::path::Path, indent: usize) {
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries {
+                if let Ok(entry) = entry {
+                    let p = entry.path();
+                    eprintln!(
+                        "{}{}",
+                        " ".repeat(indent),
+                        p.file_name().unwrap_or_default().to_string_lossy()
+                    );
+                    if p.is_dir() {
+                        list_dir_recursive(&p, indent + 2);
+                    }
+                }
+            }
+        }
+    }
+    if notif_signals_dir.exists() {
+        list_dir_recursive(&notif_signals_dir, 2);
+    }
+
+    assert!(to_signal.exists(), "expected CalmRiver signal file");
+    assert!(cc_signal.exists(), "expected DeepMeadow signal file");
+    assert!(!bcc_signal.exists(), "did not expect IronPeak signal file");
+
+    let to_payload: Value = serde_json::from_str(
+        &std::fs::read_to_string(&to_signal).expect("failed to read CalmRiver signal"),
+    )
+    .expect("failed to parse CalmRiver signal JSON");
+    assert_eq!(to_payload["project"], project_slug);
+    assert_eq!(to_payload["agent"], "CalmRiver");
+    assert_eq!(to_payload["message"]["id"], message_id);
+    assert_eq!(to_payload["message"]["from"], "BoldCastle");
+    assert_eq!(to_payload["message"]["subject"], "Signal test");
+    assert_eq!(to_payload["message"]["importance"], "high");
+
+    let fetch_params = CallToolParams {
+        name: "fetch_inbox".to_string(),
+        arguments: Some(serde_json::json!({
+            "project_key": project_key.clone(),
+            "agent_name": "CalmRiver",
+        })),
+        meta: None,
+    };
+    let fetch_result = router
+        .handle_tools_call(
+            &cx,
+            req_id,
+            fetch_params,
+            &budget,
+            SessionState::new(),
+            None,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("fetch_inbox failed: {e}"));
+    assert!(!fetch_result.is_error, "fetch_inbox returned error");
+
+    assert!(
+        !to_signal.exists(),
+        "expected CalmRiver signal to be cleared after fetch_inbox"
+    );
+    assert!(cc_signal.exists(), "expected DeepMeadow signal to remain");
 }
 
 #[test]
 fn tool_filter_profiles_match_fixtures() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let fixtures = load_tool_filter_fixtures();
 
     for case in fixtures.cases {
