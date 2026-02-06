@@ -333,6 +333,7 @@ fn tracked(conn: &sqlmodel_sqlite::SqliteConnection) -> TrackedConnection<'_> {
 /// Ensure a project exists, creating if necessary.
 ///
 /// Returns the project row (existing or newly created).
+/// Uses the in-memory cache to avoid DB round-trips on repeated calls.
 pub async fn ensure_project(
     cx: &Cx,
     pool: &DbPool,
@@ -347,6 +348,11 @@ pub async fn ensure_project(
     }
 
     let slug = generate_slug(human_key);
+
+    // Fast path: check cache first
+    if let Some(cached) = crate::cache::read_cache().get_project(&slug) {
+        return Outcome::Ok(cached);
+    }
 
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
@@ -365,13 +371,17 @@ pub async fn ensure_project(
             .await,
     );
     match existing {
-        Outcome::Ok(Some(row)) => Outcome::Ok(row),
+        Outcome::Ok(Some(row)) => {
+            crate::cache::read_cache().put_project(&row);
+            Outcome::Ok(row)
+        }
         Outcome::Ok(None) => {
             let mut row = ProjectRow::new(slug, human_key.to_string());
             let id_out = map_sql_outcome(insert!(&row).execute(cx, &tracked).await);
             match id_out {
                 Outcome::Ok(id) => {
                     row.id = Some(id);
+                    crate::cache::read_cache().put_project(&row);
                     Outcome::Ok(row)
                 }
                 Outcome::Err(e) => Outcome::Err(e),
@@ -385,12 +395,16 @@ pub async fn ensure_project(
     }
 }
 
-/// Get project by slug
+/// Get project by slug (cache-first)
 pub async fn get_project_by_slug(
     cx: &Cx,
     pool: &DbPool,
     slug: &str,
 ) -> Outcome<ProjectRow, DbError> {
+    if let Some(cached) = crate::cache::read_cache().get_project(slug) {
+        return Outcome::Ok(cached);
+    }
+
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -406,7 +420,10 @@ pub async fn get_project_by_slug(
             .first(cx, &tracked)
             .await,
     ) {
-        Outcome::Ok(Some(row)) => Outcome::Ok(row),
+        Outcome::Ok(Some(row)) => {
+            crate::cache::read_cache().put_project(&row);
+            Outcome::Ok(row)
+        }
         Outcome::Ok(None) => Outcome::Err(DbError::not_found("Project", slug)),
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
@@ -414,12 +431,16 @@ pub async fn get_project_by_slug(
     }
 }
 
-/// Get project by `human_key`
+/// Get project by `human_key` (cache-first)
 pub async fn get_project_by_human_key(
     cx: &Cx,
     pool: &DbPool,
     human_key: &str,
 ) -> Outcome<ProjectRow, DbError> {
+    if let Some(cached) = crate::cache::read_cache().get_project_by_human_key(human_key) {
+        return Outcome::Ok(cached);
+    }
+
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -435,7 +456,10 @@ pub async fn get_project_by_human_key(
             .first(cx, &tracked)
             .await,
     ) {
-        Outcome::Ok(Some(row)) => Outcome::Ok(row),
+        Outcome::Ok(Some(row)) => {
+            crate::cache::read_cache().put_project(&row);
+            Outcome::Ok(row)
+        }
         Outcome::Ok(None) => Outcome::Err(DbError::not_found("Project", human_key)),
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
@@ -512,7 +536,10 @@ pub async fn register_agent(
             // Keep inception_ts stable.
             let updated = map_sql_outcome(update!(&row).execute(cx, &tracked).await);
             match updated {
-                Outcome::Ok(_) => Outcome::Ok(row),
+                Outcome::Ok(_) => {
+                    crate::cache::read_cache().put_agent(&row);
+                    Outcome::Ok(row)
+                }
                 Outcome::Err(e) => Outcome::Err(e),
                 Outcome::Cancelled(r) => Outcome::Cancelled(r),
                 Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -536,6 +563,7 @@ pub async fn register_agent(
             match id_out {
                 Outcome::Ok(id) => {
                     row.id = Some(id);
+                    crate::cache::read_cache().put_agent(&row);
                     Outcome::Ok(row)
                 }
                 Outcome::Err(e) => Outcome::Err(e),
@@ -549,13 +577,17 @@ pub async fn register_agent(
     }
 }
 
-/// Get agent by project and name
+/// Get agent by project and name (cache-first)
 pub async fn get_agent(
     cx: &Cx,
     pool: &DbPool,
     project_id: i64,
     name: &str,
 ) -> Outcome<AgentRow, DbError> {
+    if let Some(cached) = crate::cache::read_cache().get_agent(project_id, name) {
+        return Outcome::Ok(cached);
+    }
+
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -572,7 +604,10 @@ pub async fn get_agent(
             .first(cx, &tracked)
             .await,
     ) {
-        Outcome::Ok(Some(row)) => Outcome::Ok(row),
+        Outcome::Ok(Some(row)) => {
+            crate::cache::read_cache().put_agent(&row);
+            Outcome::Ok(row)
+        }
         Outcome::Ok(None) => {
             Outcome::Err(DbError::not_found("Agent", format!("{project_id}:{name}")))
         }
@@ -582,8 +617,12 @@ pub async fn get_agent(
     }
 }
 
-/// Get agent by id.
+/// Get agent by id (cache-first).
 pub async fn get_agent_by_id(cx: &Cx, pool: &DbPool, agent_id: i64) -> Outcome<AgentRow, DbError> {
+    if let Some(cached) = crate::cache::read_cache().get_agent_by_id(agent_id) {
+        return Outcome::Ok(cached);
+    }
+
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -599,7 +638,10 @@ pub async fn get_agent_by_id(cx: &Cx, pool: &DbPool, agent_id: i64) -> Outcome<A
             .first(cx, &tracked)
             .await,
     ) {
-        Outcome::Ok(Some(row)) => Outcome::Ok(row),
+        Outcome::Ok(Some(row)) => {
+            crate::cache::read_cache().put_agent(&row);
+            Outcome::Ok(row)
+        }
         Outcome::Ok(None) => Outcome::Err(DbError::not_found("Agent", agent_id.to_string())),
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
@@ -630,25 +672,111 @@ pub async fn list_agents(
     )
 }
 
-/// Update agent's `last_active_ts`
+/// Touch agent (deferred).
+///
+/// Enqueues a `last_active_ts` update into the in-memory batch queue.
+/// The actual DB write happens when the flush interval elapses or when
+/// `flush_deferred_touches` is called explicitly. This eliminates a DB
+/// round-trip on every single tool invocation.
 pub async fn touch_agent(cx: &Cx, pool: &DbPool, agent_id: i64) -> Outcome<(), DbError> {
+    let now = now_micros();
+    let should_flush = crate::cache::read_cache().enqueue_touch(agent_id, now);
+
+    if should_flush {
+        flush_deferred_touches(cx, pool).await
+    } else {
+        Outcome::Ok(())
+    }
+}
+
+/// Immediately flush all pending deferred touch updates to the DB.
+/// Call this on server shutdown or when precise `last_active_ts` is needed.
+pub async fn flush_deferred_touches(cx: &Cx, pool: &DbPool) -> Outcome<(), DbError> {
+    let pending = crate::cache::read_cache().drain_touches();
+    if pending.is_empty() {
+        return Outcome::Ok(());
+    }
+
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
+        Outcome::Err(e) => {
+            re_enqueue_touches(&pending);
+            return Outcome::Err(e);
+        }
+        Outcome::Cancelled(r) => {
+            re_enqueue_touches(&pending);
+            return Outcome::Cancelled(r);
+        }
+        Outcome::Panicked(p) => {
+            re_enqueue_touches(&pending);
+            return Outcome::Panicked(p);
+        }
     };
 
     let tracked = tracked(&*conn);
 
-    let now = now_micros();
+    // Batch all updates in a single transaction
+    match map_sql_outcome(traw_execute(cx, &tracked, "BEGIN IMMEDIATE", &[]).await) {
+        Outcome::Ok(_) => {}
+        other => {
+            re_enqueue_touches(&pending);
+            return match other {
+                Outcome::Err(e) => Outcome::Err(e),
+                Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                Outcome::Panicked(p) => Outcome::Panicked(p),
+                Outcome::Ok(_) => unreachable!(),
+            };
+        }
+    }
+
     let sql = "UPDATE agents SET last_active_ts = ? WHERE id = ?";
-    let params = [Value::BigInt(now), Value::BigInt(agent_id)];
-    match map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await) {
+    for (agent_id, ts) in &pending {
+        let params = [Value::BigInt(*ts), Value::BigInt(*agent_id)];
+        match map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await) {
+            Outcome::Ok(_) => {}
+            Outcome::Err(e) => {
+                let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
+                re_enqueue_touches(&pending);
+                return Outcome::Err(e);
+            }
+            Outcome::Cancelled(r) => {
+                let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
+                re_enqueue_touches(&pending);
+                return Outcome::Cancelled(r);
+            }
+            Outcome::Panicked(p) => {
+                let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
+                re_enqueue_touches(&pending);
+                return Outcome::Panicked(p);
+            }
+        }
+    }
+
+    match map_sql_outcome(traw_execute(cx, &tracked, "COMMIT", &[]).await) {
         Outcome::Ok(_) => Outcome::Ok(()),
-        Outcome::Err(e) => Outcome::Err(e),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
+        Outcome::Err(e) => {
+            let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
+            re_enqueue_touches(&pending);
+            Outcome::Err(e)
+        }
+        Outcome::Cancelled(r) => {
+            let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
+            re_enqueue_touches(&pending);
+            Outcome::Cancelled(r)
+        }
+        Outcome::Panicked(p) => {
+            let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
+            re_enqueue_touches(&pending);
+            Outcome::Panicked(p)
+        }
+    }
+}
+
+/// Re-enqueue touches that failed to flush, so they aren't lost.
+fn re_enqueue_touches(pending: &std::collections::HashMap<i64, i64>) {
+    let cache = crate::cache::read_cache();
+    for (&agent_id, &ts) in pending {
+        cache.enqueue_touch(agent_id, ts);
     }
 }
 
@@ -1950,6 +2078,89 @@ pub async fn list_file_reservations(
     };
 
     let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
+    match rows_out {
+        Outcome::Ok(rows) => {
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                let id: i64 = match row.get_named("id") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let proj_id: i64 = match row.get_named("project_id") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let agent_id: i64 = match row.get_named("agent_id") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let path_pattern: String = match row.get_named("path_pattern") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let exclusive: i64 = match row.get_named("exclusive") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let reason: String = match row.get_named("reason") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let created_ts: i64 = match row.get_named("created_ts") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let expires_ts: i64 = match row.get_named("expires_ts") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let released_ts: Option<i64> = match row.get_named("released_ts") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                out.push(FileReservationRow {
+                    id: Some(id),
+                    project_id: proj_id,
+                    agent_id,
+                    path_pattern,
+                    exclusive,
+                    reason,
+                    created_ts,
+                    expires_ts,
+                    released_ts,
+                });
+            }
+            Outcome::Ok(out)
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// List unreleased file reservations for a project (includes expired).
+///
+/// This is used by cleanup logic to avoid scanning the full historical table
+/// (released reservations can be unbounded).
+pub async fn list_unreleased_file_reservations(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+) -> Outcome<Vec<FileReservationRow>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+
+    let sql =
+        "SELECT * FROM file_reservations WHERE project_id = ? AND released_ts IS NULL ORDER BY id";
+    let params = vec![Value::BigInt(project_id)];
+
+    let rows_out = map_sql_outcome(traw_query(cx, &tracked, sql, &params).await);
     match rows_out {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());

@@ -55,6 +55,22 @@ Notes:
 
 ## Generating Fixtures (Python Reference)
 
+Preferred (Rust wrapper, still runs the Python generator under the hood):
+
+```bash
+cargo run -p mcp-agent-mail-conformance -- regen
+```
+
+Write fixtures to a temp file (useful for testing without touching tracked fixtures):
+
+```bash
+cargo run -p mcp-agent-mail-conformance -- regen --output /tmp/python_reference.json
+```
+
+The wrapper sets `MCP_AGENT_MAIL_CONFORMANCE_FIXTURE_PATH` for the Python generator.
+
+Direct (legacy venv):
+
 ```
 legacy_python_mcp_agent_mail_code/mcp_agent_mail/.venv/bin/python \
   crates/mcp-agent-mail-conformance/tests/conformance/python_reference/generate_fixtures.py

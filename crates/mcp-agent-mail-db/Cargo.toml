@@ -27,5 +27,8 @@ sqlmodel-sqlite.workspace = true
 # Async runtime
 asupersync.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

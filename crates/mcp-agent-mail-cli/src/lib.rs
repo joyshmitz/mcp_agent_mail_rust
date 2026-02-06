@@ -15,8 +15,8 @@
 use clap::{Args, Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+    Arc, OnceLock,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use chrono::{DateTime, Utc};
@@ -265,14 +265,14 @@ pub enum ArchiveCommand {
     Save {
         #[arg(long = "project", short = 'p')]
         projects: Vec<String>,
-        #[arg(long)]
-        scrub_preset: Option<String>,
+        #[arg(long, default_value = "archive")]
+        scrub_preset: String,
         #[arg(long, short = 'l')]
         label: Option<String>,
     },
     List {
-        #[arg(long, short = 'n')]
-        limit: Option<i64>,
+        #[arg(long, short = 'n', default_value_t = 0)]
+        limit: i64,
         #[arg(long)]
         json: bool,
     },
@@ -434,19 +434,27 @@ pub enum ProductsCommand {
         product_key: Option<String>,
         #[arg(long, short = 'n')]
         name: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     Link {
         product_key: String,
         project: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     Status {
         product_key: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     Search {
         product_key: String,
         query: String,
         #[arg(long, short = 'l', default_value_t = 20)]
         limit: i64,
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     Inbox {
         product_key: String,
@@ -463,15 +471,19 @@ pub enum ProductsCommand {
         no_bodies: bool,
         #[arg(long)]
         since_ts: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     #[command(name = "summarize-thread")]
     SummarizeThread {
         product_key: String,
         thread_id: String,
-        #[arg(long, short = 'n')]
-        per_thread_limit: Option<i64>,
+        #[arg(long, short = 'n', default_value_t = 50)]
+        per_thread_limit: i64,
         #[arg(long)]
         no_llm: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -2006,6 +2018,964 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Archive subcommand argument parsing tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn clap_parses_archive_save_defaults() {
+        let cli =
+            Cli::try_parse_from(["am", "archive", "save"]).expect("failed to parse archive save");
+        match cli.command {
+            Commands::Archive {
+                action:
+                    ArchiveCommand::Save {
+                        projects,
+                        scrub_preset,
+                        label,
+                    },
+            } => {
+                assert!(projects.is_empty());
+                assert_eq!(scrub_preset, "archive");
+                assert!(label.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_archive_save_all_flags() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "archive",
+            "save",
+            "-p",
+            "proj1",
+            "-p",
+            "proj2",
+            "--scrub-preset",
+            "strict",
+            "-l",
+            "nightly",
+        ])
+        .expect("failed to parse archive save flags");
+        match cli.command {
+            Commands::Archive {
+                action:
+                    ArchiveCommand::Save {
+                        projects,
+                        scrub_preset,
+                        label,
+                    },
+            } => {
+                assert_eq!(projects, vec!["proj1".to_string(), "proj2".to_string()]);
+                assert_eq!(scrub_preset, "strict");
+                assert_eq!(label.as_deref(), Some("nightly"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_archive_list_defaults() {
+        let cli =
+            Cli::try_parse_from(["am", "archive", "list"]).expect("failed to parse archive list");
+        match cli.command {
+            Commands::Archive {
+                action: ArchiveCommand::List { limit, json },
+            } => {
+                assert_eq!(limit, 0);
+                assert!(!json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_archive_list_flags() {
+        let cli = Cli::try_parse_from(["am", "archive", "list", "-n", "5", "--json"])
+            .expect("failed to parse archive list flags");
+        match cli.command {
+            Commands::Archive {
+                action: ArchiveCommand::List { limit, json },
+            } => {
+                assert_eq!(limit, 5);
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_archive_restore_flags() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "archive",
+            "restore",
+            "/tmp/state.zip",
+            "--force",
+            "--dry-run",
+        ])
+        .expect("failed to parse archive restore flags");
+        match cli.command {
+            Commands::Archive {
+                action:
+                    ArchiveCommand::Restore {
+                        archive_file,
+                        force,
+                        dry_run,
+                    },
+            } => {
+                assert_eq!(archive_file, PathBuf::from("/tmp/state.zip"));
+                assert!(force);
+                assert!(dry_run);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Products subcommand argument parsing tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn clap_parses_products_search_defaults() {
+        let cli = Cli::try_parse_from(["am", "products", "search", "prod-1", "query"])
+            .expect("failed to parse products search defaults");
+        match cli.command {
+            Commands::Products {
+                action:
+                    ProductsCommand::Search {
+                        product_key,
+                        query,
+                        limit,
+                        json,
+                    },
+            } => {
+                assert_eq!(product_key, "prod-1");
+                assert_eq!(query, "query");
+                assert_eq!(limit, 20);
+                assert!(!json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_products_inbox_positional_agent_and_flags() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "products",
+            "inbox",
+            "prod-1",
+            "GreenCastle",
+            "--limit",
+            "5",
+            "--urgent-only",
+            "--include-bodies",
+            "--since-ts",
+            "2026-02-05T00:00:00Z",
+            "--json",
+        ])
+        .expect("failed to parse products inbox");
+        match cli.command {
+            Commands::Products {
+                action:
+                    ProductsCommand::Inbox {
+                        product_key,
+                        agent,
+                        limit,
+                        urgent_only,
+                        all,
+                        include_bodies,
+                        no_bodies,
+                        since_ts,
+                        json,
+                    },
+            } => {
+                assert_eq!(product_key, "prod-1");
+                assert_eq!(agent, "GreenCastle");
+                assert_eq!(limit, 5);
+                assert!(urgent_only);
+                assert!(!all);
+                assert!(include_bodies);
+                assert!(!no_bodies);
+                assert_eq!(since_ts.as_deref(), Some("2026-02-05T00:00:00Z"));
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slugify_matches_legacy() {
+        assert_eq!(slugify(" My Project! "), "my-project");
+        assert_eq!(slugify(""), "project");
+        assert_eq!(slugify("___"), "project");
+        assert_eq!(slugify("A--B"), "a-b");
+    }
+
+    #[test]
+    fn compose_archive_basename_matches_legacy() {
+        use chrono::TimeZone;
+
+        let ts = Utc.with_ymd_and_hms(2026, 2, 5, 12, 34, 56).unwrap();
+        let projects = vec!["My Project".to_string(), "Another".to_string()];
+        let base = compose_archive_basename(ts, &projects, "archive", Some("nightly"));
+        assert_eq!(
+            base,
+            "mailbox-state-20260205-123456Z-my-project-another-archive-nightly"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Archive save/list/restore integration-ish tests
+    // -----------------------------------------------------------------------
+
+    static ARCHIVE_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    struct CwdGuard {
+        original: PathBuf,
+    }
+
+    impl CwdGuard {
+        fn chdir(path: &Path) -> Self {
+            let original = std::env::current_dir().expect("get cwd");
+            std::env::set_current_dir(path).expect("set cwd");
+            Self { original }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
+    }
+
+    fn seed_mailbox_db(db_path: &Path) {
+        let conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+            .expect("open test sqlite db");
+        conn.execute_raw(
+            "CREATE TABLE projects (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                slug TEXT NOT NULL, \
+                human_key TEXT NOT NULL, \
+                created_at INTEGER NOT NULL DEFAULT 0\
+            )",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE agents (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                project_id INTEGER NOT NULL, \
+                name TEXT NOT NULL, \
+                program TEXT NOT NULL DEFAULT '', \
+                model TEXT NOT NULL DEFAULT '', \
+                task_description TEXT NOT NULL DEFAULT '', \
+                inception_ts INTEGER NOT NULL DEFAULT 0, \
+                last_active_ts INTEGER NOT NULL DEFAULT 0, \
+                attachments_policy TEXT NOT NULL DEFAULT 'auto', \
+                contact_policy TEXT NOT NULL DEFAULT 'auto'\
+            )",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE messages (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                project_id INTEGER NOT NULL, \
+                sender_id INTEGER NOT NULL, \
+                thread_id TEXT, \
+                subject TEXT NOT NULL DEFAULT '', \
+                body_md TEXT NOT NULL DEFAULT '', \
+                importance TEXT NOT NULL DEFAULT 'normal', \
+                ack_required INTEGER NOT NULL DEFAULT 0, \
+                created_ts INTEGER NOT NULL DEFAULT 0, \
+                attachments TEXT NOT NULL DEFAULT '[]'\
+            )",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE message_recipients (\
+                message_id INTEGER NOT NULL, \
+                agent_id INTEGER NOT NULL, \
+                kind TEXT NOT NULL DEFAULT 'to', \
+                read_ts INTEGER, \
+                ack_ts INTEGER, \
+                PRIMARY KEY (message_id, agent_id)\
+            )",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE file_reservations (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                project_id INTEGER NOT NULL, \
+                agent_id INTEGER NOT NULL, \
+                path_pattern TEXT NOT NULL, \
+                exclusive INTEGER NOT NULL DEFAULT 1, \
+                reason TEXT NOT NULL DEFAULT '', \
+                created_ts INTEGER NOT NULL DEFAULT 0, \
+                expires_ts INTEGER NOT NULL DEFAULT 0, \
+                released_ts INTEGER\
+            )",
+        )
+        .unwrap();
+
+        // Two projects so we can scope down to one.
+        let created_at_us = 1_704_067_200_000_000i64; // 2024-01-01T00:00:00Z
+        conn.execute_raw(&format!(
+            "INSERT INTO projects (slug, human_key, created_at) VALUES \
+             ('proj-alpha', '/data/projects/alpha', {created_at_us}), \
+             ('proj-beta',  '/data/projects/beta',  {created_at_us})"
+        ))
+        .unwrap();
+        conn.execute_raw("INSERT INTO agents (project_id, name) VALUES (1, 'GreenCastle')")
+            .unwrap();
+        conn.execute_raw("INSERT INTO agents (project_id, name) VALUES (2, 'PurpleBear')")
+            .unwrap();
+        conn.execute_raw(
+            "INSERT INTO messages (project_id, sender_id, subject, body_md) VALUES \
+             (1, 1, 'Msg A', 'hello'), \
+             (1, 1, 'Msg B', 'world'), \
+             (2, 2, 'Msg C', 'bye')",
+        )
+        .unwrap();
+        conn.execute_raw("INSERT INTO message_recipients (message_id, agent_id) VALUES (1, 1)")
+            .unwrap();
+        conn.execute_raw("INSERT INTO message_recipients (message_id, agent_id) VALUES (2, 1)")
+            .unwrap();
+        conn.execute_raw("INSERT INTO message_recipients (message_id, agent_id) VALUES (3, 2)")
+            .unwrap();
+        conn.execute_raw(
+            "INSERT INTO file_reservations (project_id, agent_id, path_pattern) VALUES (1, 1, 'src/*.rs')",
+        )
+        .unwrap();
+    }
+
+    fn seed_storage_root(storage_root: &Path) {
+        std::fs::create_dir_all(storage_root.join("nested/dir")).unwrap();
+        std::fs::write(storage_root.join("nested/dir/file.txt"), b"hello\n").unwrap();
+
+        // Minimal git marker so `detect_git_head()` has stable output.
+        std::fs::create_dir_all(storage_root.join(".git")).unwrap();
+        std::fs::write(storage_root.join(".git/HEAD"), b"0123456789abcdef\n").unwrap();
+    }
+
+    fn find_backup_entry(dir: &Path, prefix: &str) -> Option<PathBuf> {
+        let entries = std::fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
+                continue;
+            };
+            if name.starts_with(prefix) {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn archive_save_list_restore_roundtrip_smoke() {
+        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        use std::io::Read;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
+        let _cwd = CwdGuard::chdir(root.path());
+
+        let storage_root = root.path().join("storage_repo");
+        seed_storage_root(&storage_root);
+
+        let source_db = root.path().join("mailbox.sqlite3");
+        seed_mailbox_db(&source_db);
+
+        // Save archive for a single project to exercise scoping.
+        let archive_path = archive_save_state(
+            &source_db,
+            &storage_root,
+            vec!["proj-alpha".to_string()],
+            "archive".to_string(),
+            Some("nightly".to_string()),
+        )
+        .expect("archive save");
+        assert!(archive_path.exists());
+
+        // Validate zip layout + metadata content.
+        let file = std::fs::File::open(&archive_path).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        assert!(zip.by_name(ARCHIVE_METADATA_FILENAME).is_ok());
+        assert!(zip.by_name(ARCHIVE_SNAPSHOT_RELATIVE).is_ok());
+        assert!(zip.by_name("storage_repo/nested/dir/file.txt").is_ok());
+        assert!(zip.by_name("storage_repo/.git/HEAD").is_ok());
+
+        let mut meta_contents = String::new();
+        zip.by_name(ARCHIVE_METADATA_FILENAME)
+            .unwrap()
+            .read_to_string(&mut meta_contents)
+            .unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&meta_contents).unwrap();
+        assert_eq!(meta["scrub_preset"].as_str(), Some("archive"));
+        assert_eq!(meta["label"].as_str(), Some("nightly"));
+        assert_eq!(
+            meta["projects_requested"].as_array().unwrap().len(),
+            1,
+            "save should record requested project filters"
+        );
+        let included = meta["projects_included"].as_array().unwrap();
+        assert_eq!(included.len(), 1, "scope should keep only 1 project");
+        assert_eq!(included[0]["slug"].as_str(), Some("proj-alpha"));
+        assert_eq!(
+            included[0]["created_at"].as_str(),
+            Some("2024-01-01T00:00:00+00:00")
+        );
+
+        // `archive list --json` output should include the new archive.
+        {
+            use ftui_runtime::stdio_capture::StdioCapture;
+
+            let capture = StdioCapture::install().unwrap();
+            handle_archive(ArchiveCommand::List {
+                limit: 0,
+                json: true,
+            })
+            .unwrap();
+            let mut sink = Vec::new();
+            capture.drain(&mut sink).unwrap();
+            drop(capture);
+
+            let output = String::from_utf8_lossy(&sink).trim().to_string();
+            let list_json: serde_json::Value = serde_json::from_str(&output).unwrap();
+            let arr = list_json.as_array().unwrap();
+            assert_eq!(arr.len(), 1);
+            assert_eq!(
+                arr[0]["file"].as_str(),
+                archive_path.file_name().and_then(|s| s.to_str())
+            );
+            assert_eq!(arr[0]["scrub_preset"].as_str(), Some("archive"));
+            assert_eq!(
+                arr[0]["projects"].as_array().unwrap()[0].as_str(),
+                Some("proj-alpha")
+            );
+        }
+
+        // Restore safety: without --force on non-tty stdin, should refuse to prompt.
+        let archive_arg = PathBuf::from(archive_path.file_name().unwrap());
+        let restore_dir = root.path().join("restore");
+        let restore_db = restore_dir.join("mailbox.sqlite3");
+        let restore_storage = restore_dir.join("storage_repo");
+        std::fs::create_dir_all(&restore_dir).unwrap();
+        std::fs::write(&restore_db, b"old-db").unwrap();
+        std::fs::create_dir_all(&restore_storage).unwrap();
+        std::fs::write(restore_storage.join("old.txt"), b"old-storage").unwrap();
+
+        let err = archive_restore_state(
+            archive_arg.clone(),
+            &restore_db,
+            &restore_storage,
+            false,
+            false,
+        )
+        .unwrap_err();
+        let msg = match err {
+            CliError::Other(m) => m,
+            other => format!("{other}"),
+        };
+        assert!(
+            msg.contains("refusing to prompt on non-interactive stdin"),
+            "unexpected error: {msg}"
+        );
+
+        // Dry-run should print plan and make no changes.
+        {
+            use ftui_runtime::stdio_capture::StdioCapture;
+
+            let capture = StdioCapture::install().unwrap();
+            archive_restore_state(
+                archive_arg.clone(),
+                &restore_db,
+                &restore_storage,
+                false,
+                true,
+            )
+            .unwrap();
+            let mut sink = Vec::new();
+            capture.drain(&mut sink).unwrap();
+            drop(capture);
+
+            let output = String::from_utf8_lossy(&sink);
+            assert!(output.contains("Dry-run plan:"));
+            assert!(output.contains("restore snapshot ->"));
+            assert!(output.contains("restore storage repo ->"));
+            assert_eq!(std::fs::read(&restore_db).unwrap(), b"old-db");
+            assert_eq!(
+                std::fs::read(restore_storage.join("old.txt")).unwrap(),
+                b"old-storage"
+            );
+        }
+
+        // Actual restore with --force should create backups and restore snapshot + storage.
+        archive_restore_state(archive_arg, &restore_db, &restore_storage, true, false).unwrap();
+
+        let db_backup =
+            find_backup_entry(&restore_dir, "mailbox.sqlite3.backup-").expect("db backup created");
+        assert_eq!(std::fs::read(&db_backup).unwrap(), b"old-db");
+
+        let storage_backup = find_backup_entry(&restore_dir, "storage_repo.backup-")
+            .expect("storage backup created");
+        assert!(storage_backup.is_dir());
+        assert_eq!(
+            std::fs::read(storage_backup.join("old.txt")).unwrap(),
+            b"old-storage"
+        );
+
+        // Restored DB should contain only the scoped project.
+        let restored_conn =
+            sqlmodel_sqlite::SqliteConnection::open_file(restore_db.display().to_string()).unwrap();
+        let rows = restored_conn
+            .query_sync("SELECT slug FROM projects ORDER BY id", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let slug: String = rows[0].get_named("slug").unwrap();
+        assert_eq!(slug, "proj-alpha");
+
+        // Restored storage should include the archived files.
+        assert_eq!(
+            std::fs::read(restore_storage.join("nested/dir/file.txt")).unwrap(),
+            b"hello\n"
+        );
+        assert_eq!(
+            std::fs::read(restore_storage.join(".git/HEAD")).unwrap(),
+            b"0123456789abcdef\n"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Products commands integration-ish tests (local DB, no env mutation)
+    // -----------------------------------------------------------------------
+
+    fn seed_products_cli_db(root: &tempfile::TempDir) -> (PathBuf, String, String, i64) {
+        use mcp_agent_mail_db::sqlmodel::Value;
+
+        let created_at_us = 1_704_067_200_000_000i64; // 2024-01-01T00:00:00Z
+
+        // Use real directories so get_project_record() canonicalization is stable.
+        let proj_alpha_dir = root.path().join("proj_alpha");
+        std::fs::create_dir_all(&proj_alpha_dir).unwrap();
+        let proj_beta_dir = root.path().join("proj_beta");
+        std::fs::create_dir_all(&proj_beta_dir).unwrap();
+
+        let proj_alpha_key = proj_alpha_dir.canonicalize().unwrap().display().to_string();
+        let proj_beta_key = proj_beta_dir.canonicalize().unwrap().display().to_string();
+
+        let db_path = root.path().join("mailbox.sqlite3");
+        let conn = sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string())
+            .expect("open products test sqlite db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql())
+            .expect("init schema");
+
+        // Projects
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+            &[
+                Value::BigInt(1),
+                Value::Text("proj-alpha".to_string()),
+                Value::Text(proj_alpha_key.clone()),
+                Value::BigInt(created_at_us),
+            ],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+            &[
+                Value::BigInt(2),
+                Value::Text("proj-beta".to_string()),
+                Value::Text(proj_beta_key.clone()),
+                Value::BigInt(created_at_us),
+            ],
+        )
+        .unwrap();
+
+        // Agents: same recipient name across both projects (legacy semantics).
+        let agent_insert = "INSERT INTO agents (\
+                id, project_id, name, program, model, task_description, \
+                inception_ts, last_active_ts, attachments_policy, contact_policy\
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+        conn.execute_sync(
+            agent_insert,
+            &[
+                Value::BigInt(1),
+                Value::BigInt(1),
+                Value::Text("GreenCastle".to_string()),
+                Value::Text("test".to_string()),
+                Value::Text("test".to_string()),
+                Value::Text(String::new()),
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::Text("auto".to_string()),
+                Value::Text("auto".to_string()),
+            ],
+        )
+        .unwrap();
+        conn.execute_sync(
+            agent_insert,
+            &[
+                Value::BigInt(2),
+                Value::BigInt(2),
+                Value::Text("GreenCastle".to_string()),
+                Value::Text("test".to_string()),
+                Value::Text("test".to_string()),
+                Value::Text(String::new()),
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::Text("auto".to_string()),
+                Value::Text("auto".to_string()),
+            ],
+        )
+        .unwrap();
+        // Senders
+        conn.execute_sync(
+            agent_insert,
+            &[
+                Value::BigInt(3),
+                Value::BigInt(1),
+                Value::Text("PurpleBear".to_string()),
+                Value::Text("test".to_string()),
+                Value::Text("test".to_string()),
+                Value::Text(String::new()),
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::Text("auto".to_string()),
+                Value::Text("auto".to_string()),
+            ],
+        )
+        .unwrap();
+        conn.execute_sync(
+            agent_insert,
+            &[
+                Value::BigInt(4),
+                Value::BigInt(2),
+                Value::Text("OrangeFish".to_string()),
+                Value::Text("test".to_string()),
+                Value::Text("test".to_string()),
+                Value::Text(String::new()),
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::Text("auto".to_string()),
+                Value::Text("auto".to_string()),
+            ],
+        )
+        .unwrap();
+
+        // Messages (FTS triggers will populate fts_messages)
+        let msg_insert = "INSERT INTO messages (\
+                id, project_id, sender_id, thread_id, subject, body_md, importance, \
+                ack_required, created_ts, attachments\
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        conn.execute_sync(
+            msg_insert,
+            &[
+                Value::BigInt(10),
+                Value::BigInt(1),
+                Value::BigInt(3),
+                Value::Null,
+                Value::Text("Unicorn alpha".to_string()),
+                Value::Text("body alpha".to_string()),
+                Value::Text("high".to_string()),
+                Value::BigInt(0),
+                Value::BigInt(created_at_us + 10),
+                Value::Text("[]".to_string()),
+            ],
+        )
+        .unwrap();
+        conn.execute_sync(
+            msg_insert,
+            &[
+                Value::BigInt(11),
+                Value::BigInt(1),
+                Value::BigInt(3),
+                Value::Null,
+                Value::Text("Other alpha".to_string()),
+                Value::Text("misc".to_string()),
+                Value::Text("normal".to_string()),
+                Value::BigInt(1),
+                Value::BigInt(created_at_us + 5),
+                Value::Text("[]".to_string()),
+            ],
+        )
+        .unwrap();
+        conn.execute_sync(
+            msg_insert,
+            &[
+                Value::BigInt(20),
+                Value::BigInt(2),
+                Value::BigInt(4),
+                Value::Null,
+                Value::Text("Beta ping".to_string()),
+                Value::Text("body beta".to_string()),
+                Value::Text("normal".to_string()),
+                Value::BigInt(0),
+                Value::BigInt(created_at_us + 20),
+                Value::Text("[]".to_string()),
+            ],
+        )
+        .unwrap();
+
+        // Recipients
+        let recip_insert =
+            "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?, ?, ?)";
+        conn.execute_sync(
+            recip_insert,
+            &[
+                Value::BigInt(10),
+                Value::BigInt(1),
+                Value::Text("to".to_string()),
+            ],
+        )
+        .unwrap();
+        conn.execute_sync(
+            recip_insert,
+            &[
+                Value::BigInt(11),
+                Value::BigInt(1),
+                Value::Text("to".to_string()),
+            ],
+        )
+        .unwrap();
+        conn.execute_sync(
+            recip_insert,
+            &[
+                Value::BigInt(20),
+                Value::BigInt(2),
+                Value::Text("to".to_string()),
+            ],
+        )
+        .unwrap();
+
+        (db_path, proj_alpha_key, proj_beta_key, created_at_us)
+    }
+
+    fn run_products_cmd_capture(
+        runtime: &asupersync::runtime::Runtime,
+        cx: &asupersync::Cx,
+        pool: &mcp_agent_mail_db::DbPool,
+        action: ProductsCommand,
+    ) -> (CliResult<()>, String) {
+        use ftui_runtime::stdio_capture::StdioCapture;
+
+        let capture = StdioCapture::install().unwrap();
+        let res =
+            runtime.block_on(async { handle_products_with(cx, pool, None, None, action).await });
+        let mut sink = Vec::new();
+        capture.drain(&mut sink).unwrap();
+        drop(capture);
+
+        (res, String::from_utf8_lossy(&sink).trim().to_string())
+    }
+
+    #[test]
+    fn products_local_parity_smoke_json() {
+        let _lock = ARCHIVE_TEST_LOCK.lock().unwrap();
+        use asupersync::runtime::RuntimeBuilder;
+        use mcp_agent_mail_db::sqlmodel::Value;
+
+        let root = tempfile::tempdir().unwrap();
+        let (db_path, proj_alpha_key, proj_beta_key, created_at_us) = seed_products_cli_db(&root);
+
+        let pool_cfg = mcp_agent_mail_db::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            acquire_timeout_ms: 5_000,
+            max_lifetime_ms: 60_000,
+            run_migrations: true,
+        };
+        let pool = mcp_agent_mail_db::DbPool::new(&pool_cfg).unwrap();
+        let cx = asupersync::Cx::for_request();
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+
+        // Ensure (create)
+        let (res, out) = run_products_cmd_capture(
+            &runtime,
+            &cx,
+            &pool,
+            ProductsCommand::Ensure {
+                product_key: Some("abcdef1234".to_string()),
+                name: Some("My   Product".to_string()),
+                json: true,
+            },
+        );
+        res.unwrap();
+        let ensure_json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(ensure_json["product_uid"].as_str(), Some("abcdef1234"));
+        assert_eq!(ensure_json["name"].as_str(), Some("My Product"));
+
+        // Normalize created_at for stable snapshots.
+        let conn =
+            sqlmodel_sqlite::SqliteConnection::open_file(db_path.display().to_string()).unwrap();
+        conn.execute_sync(
+            "UPDATE products SET created_at = ? WHERE product_uid = ?",
+            &[
+                Value::BigInt(created_at_us),
+                Value::Text("abcdef1234".to_string()),
+            ],
+        )
+        .unwrap();
+
+        // Ensure (existing) should now have deterministic created_at
+        let (res, out) = run_products_cmd_capture(
+            &runtime,
+            &cx,
+            &pool,
+            ProductsCommand::Ensure {
+                product_key: Some("abcdef1234".to_string()),
+                name: None,
+                json: true,
+            },
+        );
+        res.unwrap();
+        let ensure_json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let expected_created_at = mcp_agent_mail_db::micros_to_iso(created_at_us);
+        assert_eq!(
+            ensure_json["created_at"].as_str(),
+            Some(expected_created_at.as_str())
+        );
+
+        // Link into both projects
+        run_products_cmd_capture(
+            &runtime,
+            &cx,
+            &pool,
+            ProductsCommand::Link {
+                product_key: "abcdef1234".to_string(),
+                project: proj_alpha_key.clone(),
+                json: false,
+            },
+        )
+        .0
+        .unwrap();
+        run_products_cmd_capture(
+            &runtime,
+            &cx,
+            &pool,
+            ProductsCommand::Link {
+                product_key: "abcdef1234".to_string(),
+                project: proj_beta_key.clone(),
+                json: false,
+            },
+        )
+        .0
+        .unwrap();
+
+        // Status JSON should include both projects
+        let (res, out) = run_products_cmd_capture(
+            &runtime,
+            &cx,
+            &pool,
+            ProductsCommand::Status {
+                product_key: "abcdef1234".to_string(),
+                json: true,
+            },
+        );
+        res.unwrap();
+        let mut status_json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            status_json["product"]["product_uid"].as_str(),
+            Some("abcdef1234")
+        );
+        let projects = status_json["projects"].as_array_mut().unwrap();
+        projects.sort_by_key(|p| p["id"].as_i64().unwrap_or_default());
+        assert_eq!(projects.len(), 2);
+        assert_eq!(projects[0]["slug"].as_str(), Some("proj-alpha"));
+        assert_eq!(projects[1]["slug"].as_str(), Some("proj-beta"));
+
+        // Search JSON should find only the unicorn message.
+        let (res, out) = run_products_cmd_capture(
+            &runtime,
+            &cx,
+            &pool,
+            ProductsCommand::Search {
+                product_key: "abcdef1234".to_string(),
+                query: "unicorn".to_string(),
+                limit: 20,
+                json: true,
+            },
+        );
+        res.unwrap();
+        let search_json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let arr = search_json["result"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"].as_i64(), Some(10));
+        assert_eq!(arr[0]["project_id"].as_i64(), Some(1));
+
+        // Inbox JSON (all)
+        let (res, out) = run_products_cmd_capture(
+            &runtime,
+            &cx,
+            &pool,
+            ProductsCommand::Inbox {
+                product_key: "abcdef1234".to_string(),
+                agent: "GreenCastle".to_string(),
+                limit: 20,
+                urgent_only: false,
+                all: false,
+                include_bodies: false,
+                no_bodies: false,
+                since_ts: None,
+                json: true,
+            },
+        );
+        res.unwrap();
+        let inbox_json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let arr = inbox_json.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0]["id"].as_i64(), Some(20));
+        assert_eq!(arr[1]["id"].as_i64(), Some(10));
+        assert_eq!(arr[2]["id"].as_i64(), Some(11));
+        assert!(arr[0].get("body_md").is_none(), "bodies default off");
+
+        // Inbox urgent-only should include only the high message.
+        let (res, out) = run_products_cmd_capture(
+            &runtime,
+            &cx,
+            &pool,
+            ProductsCommand::Inbox {
+                product_key: "abcdef1234".to_string(),
+                agent: "GreenCastle".to_string(),
+                limit: 20,
+                urgent_only: true,
+                all: false,
+                include_bodies: false,
+                no_bodies: false,
+                since_ts: None,
+                json: true,
+            },
+        );
+        res.unwrap();
+        let inbox_json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let arr = inbox_json.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"].as_i64(), Some(10));
+
+        // Summarize-thread requires server tool; with server disabled, should return exit code 2.
+        let (res, out) = run_products_cmd_capture(
+            &runtime,
+            &cx,
+            &pool,
+            ProductsCommand::SummarizeThread {
+                product_key: "abcdef1234".to_string(),
+                thread_id: "thread-1".to_string(),
+                per_thread_limit: 50,
+                no_llm: true,
+                json: false,
+            },
+        );
+        let err = res.unwrap_err();
+        assert!(matches!(err, CliError::ExitCode(2)));
+        assert!(out.contains("Server unavailable; summarization requires server tool."));
+    }
+
+    // -----------------------------------------------------------------------
     // Error path tests (validation logic, not full execution)
     // -----------------------------------------------------------------------
 
@@ -2540,6 +3510,792 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
 // Archive commands
 // ---------------------------------------------------------------------------
 
+const ARCHIVE_DIR_NAME: &str = "archived_mailbox_states";
+const ARCHIVE_METADATA_FILENAME: &str = "metadata.json";
+const ARCHIVE_SNAPSHOT_RELATIVE: &str = "snapshot/mailbox.sqlite3";
+const ARCHIVE_STORAGE_DIRNAME: &str = "storage_repo";
+
+fn detect_project_root() -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let resolved = cwd.canonicalize().unwrap_or(cwd);
+
+    // Archive root detection (where `archived_mailbox_states/` is created):
+    // 1) Cargo.toml (Rust repos)
+    // 2) pyproject.toml (legacy Python repos)
+    // 3) .git (fallback)
+    for candidate in resolved.ancestors() {
+        if candidate.join("Cargo.toml").exists() {
+            return candidate.to_path_buf();
+        }
+    }
+    for candidate in resolved.ancestors() {
+        if candidate.join("pyproject.toml").exists() {
+            return candidate.to_path_buf();
+        }
+    }
+    for candidate in resolved.ancestors() {
+        if candidate.join(".git").exists() {
+            return candidate.to_path_buf();
+        }
+    }
+
+    resolved
+}
+
+fn archive_states_dir(create: bool) -> CliResult<PathBuf> {
+    let root = detect_project_root();
+    let archive_dir = root.join(ARCHIVE_DIR_NAME);
+    if create {
+        std::fs::create_dir_all(&archive_dir)?;
+    }
+    Ok(archive_dir)
+}
+
+fn slugify(value: &str) -> String {
+    let trimmed = value.trim();
+    let mut out = String::with_capacity(trimmed.len());
+    let mut last_was_dash = false;
+
+    for b in trimmed.bytes() {
+        let lower = b.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() {
+            out.push(lower as char);
+            last_was_dash = false;
+            continue;
+        }
+        if !out.is_empty() && !last_was_dash {
+            out.push('-');
+            last_was_dash = true;
+        }
+    }
+
+    while out.ends_with('-') {
+        out.pop();
+    }
+
+    if out.is_empty() {
+        "project".to_string()
+    } else {
+        out
+    }
+}
+
+fn compose_archive_basename(
+    timestamp: DateTime<Utc>,
+    project_filters: &[String],
+    scrub_preset: &str,
+    label: Option<&str>,
+) -> String {
+    let ts_segment = timestamp.format("%Y%m%d-%H%M%SZ").to_string();
+    let projects_segment = if project_filters.is_empty() {
+        "all-projects".to_string()
+    } else {
+        project_filters
+            .iter()
+            .map(|v| slugify(v))
+            .collect::<Vec<_>>()
+            .join("-")
+    };
+    let preset_segment = slugify(scrub_preset);
+
+    let mut segments = vec![
+        "mailbox-state".to_string(),
+        ts_segment,
+        projects_segment,
+        preset_segment,
+    ];
+    if let Some(label) = label {
+        segments.push(slugify(label));
+    }
+    segments.join("-")
+}
+
+fn ensure_unique_archive_path(base_dir: &Path, base_name: &str) -> PathBuf {
+    let mut candidate = base_dir.join(format!("{base_name}.zip"));
+    let mut counter = 1;
+    while candidate.exists() {
+        candidate = base_dir.join(format!("{base_name}-{counter:02}.zip"));
+        counter += 1;
+    }
+    candidate
+}
+
+fn detect_git_head(repo_path: &Path) -> Option<String> {
+    let git_dir = repo_path.join(".git");
+    if !git_dir.exists() {
+        return None;
+    }
+
+    let head_path = git_dir.join("HEAD");
+    let head_contents = std::fs::read_to_string(head_path).ok()?;
+    let head_contents = head_contents.trim();
+    if head_contents.is_empty() {
+        return None;
+    }
+
+    if let Some(ref_name) = head_contents.strip_prefix("ref:") {
+        let ref_name = ref_name.trim();
+        let ref_path = git_dir.join(ref_name);
+        if ref_path.exists() {
+            if let Ok(value) = std::fs::read_to_string(ref_path) {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+
+        let packed_refs = git_dir.join("packed-refs");
+        if packed_refs.exists() {
+            if let Ok(text) = std::fs::read_to_string(packed_refs) {
+                for line in text.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    let Some((commit, reference)) = line.split_once(' ') else {
+                        continue;
+                    };
+                    if reference.trim() == ref_name {
+                        return Some(commit.trim().to_string());
+                    }
+                }
+            }
+        }
+
+        return None;
+    }
+
+    Some(head_contents.to_string())
+}
+
+fn next_backup_path(path: &Path, timestamp: &str) -> PathBuf {
+    let filename = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "backup".to_string());
+    let mut candidate = path.with_file_name(format!("{filename}.backup-{timestamp}"));
+    let mut counter = 1;
+    while candidate.exists() {
+        candidate = path.with_file_name(format!("{filename}.backup-{timestamp}-{counter:02}"));
+        counter += 1;
+    }
+    candidate
+}
+
+fn sort_json_keys(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<String> = map.keys().cloned().collect();
+            keys.sort();
+            let mut sorted = serde_json::Map::new();
+            for key in keys {
+                if let Some(v) = map.get(&key) {
+                    sorted.insert(key, sort_json_keys(v));
+                }
+            }
+            serde_json::Value::Object(sorted)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(sort_json_keys).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+fn iso_from_micros(micros: i64) -> String {
+    DateTime::<Utc>::from_timestamp_micros(micros)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, false))
+        .unwrap_or_default()
+}
+
+fn projects_included_from_snapshot(snapshot_path: &Path) -> CliResult<Vec<serde_json::Value>> {
+    let path_str = snapshot_path.display().to_string();
+    let conn = sqlmodel_sqlite::SqliteConnection::open_file(&path_str)
+        .map_err(|e| CliError::Other(format!("cannot open snapshot for metadata: {e}")))?;
+    let rows = conn
+        .query_sync(
+            "SELECT slug, human_key, created_at FROM projects ORDER BY id",
+            &[],
+        )
+        .map_err(|e| CliError::Other(format!("SELECT projects failed: {e}")))?;
+
+    let mut out = Vec::new();
+    for row in &rows {
+        let slug: String = row.get_named("slug").unwrap_or_default();
+        let human_key: String = row.get_named("human_key").unwrap_or_default();
+        let created_at: i64 = row.get_named("created_at").unwrap_or(0);
+        out.push(serde_json::json!({
+            "slug": slug,
+            "human_key": human_key,
+            "created_at": if created_at == 0 {
+                String::new()
+            } else {
+                iso_from_micros(created_at)
+            },
+        }));
+    }
+    Ok(out)
+}
+
+fn load_archive_metadata(zip_path: &Path) -> (serde_json::Value, Option<String>) {
+    use std::io::Read;
+
+    let file = match std::fs::File::open(zip_path) {
+        Ok(f) => f,
+        Err(e) => {
+            return (
+                serde_json::Value::Object(serde_json::Map::new()),
+                Some(format!("Invalid metadata: {e}")),
+            );
+        }
+    };
+
+    let mut archive = match zip::ZipArchive::new(file) {
+        Ok(a) => a,
+        Err(e) => {
+            return (
+                serde_json::Value::Object(serde_json::Map::new()),
+                Some(format!("Invalid metadata: {e}")),
+            );
+        }
+    };
+
+    let mut meta_file = match archive.by_name(ARCHIVE_METADATA_FILENAME) {
+        Ok(f) => f,
+        Err(zip::result::ZipError::FileNotFound) => {
+            return (
+                serde_json::Value::Object(serde_json::Map::new()),
+                Some(format!("{ARCHIVE_METADATA_FILENAME} missing")),
+            );
+        }
+        Err(e) => {
+            return (
+                serde_json::Value::Object(serde_json::Map::new()),
+                Some(format!("Invalid metadata: {e}")),
+            );
+        }
+    };
+
+    let mut contents = String::new();
+    if let Err(e) = meta_file.read_to_string(&mut contents) {
+        return (
+            serde_json::Value::Object(serde_json::Map::new()),
+            Some(format!("Invalid metadata: {e}")),
+        );
+    }
+
+    match serde_json::from_str::<serde_json::Value>(&contents) {
+        Ok(value) => (value, None),
+        Err(e) => (
+            serde_json::Value::Object(serde_json::Map::new()),
+            Some(format!("Invalid metadata: {e}")),
+        ),
+    }
+}
+
+fn resolve_archive_path(candidate: &Path) -> CliResult<PathBuf> {
+    if candidate.exists() {
+        return Ok(candidate
+            .canonicalize()
+            .unwrap_or_else(|_| candidate.to_path_buf()));
+    }
+    let archive_dir = archive_states_dir(false)?;
+    let fallback = match candidate.file_name() {
+        Some(name) => archive_dir.join(name),
+        None => archive_dir.join(candidate),
+    };
+    if fallback.exists() {
+        return Ok(fallback.canonicalize().unwrap_or(fallback));
+    }
+    Err(CliError::InvalidArgument(format!(
+        "Archive '{}' not found (checked {} and {}).",
+        candidate.display(),
+        candidate.display(),
+        fallback.display()
+    )))
+}
+
+fn collect_files(base: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> CliResult<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(base, &path, out)?;
+        } else if path.is_file() {
+            if let Ok(rel) = path.strip_prefix(base) {
+                out.push(rel.to_path_buf());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn file_mode(path: &Path) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path)
+        .map(|m| m.mode() & 0o777)
+        .unwrap_or(0o644)
+}
+
+#[cfg(not(unix))]
+fn file_mode(_path: &Path) -> u32 {
+    0o644
+}
+
+fn confirm(prompt: &str, default: bool) -> CliResult<bool> {
+    use std::io::Write;
+
+    let suffix = if default { "[Y/n]" } else { "[y/N]" };
+    ftui_runtime::ftui_println!("{prompt} {suffix}");
+    let _ = std::io::stdout().flush();
+
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let input = input.trim().to_ascii_lowercase();
+    if input.is_empty() {
+        return Ok(default);
+    }
+    if input == "y" || input == "yes" {
+        return Ok(true);
+    }
+    if input == "n" || input == "no" {
+        return Ok(false);
+    }
+    Ok(default)
+}
+
+#[allow(dead_code)]
+fn archive_save_state(
+    source_db: &Path,
+    storage_root: &Path,
+    projects: Vec<String>,
+    scrub_preset: String,
+    label: Option<String>,
+) -> CliResult<PathBuf> {
+    use chrono::Timelike;
+    use std::io::Write;
+
+    if source_db.to_string_lossy() == ":memory:" {
+        return Err(CliError::Other(
+            "cannot archive an in-memory database (:memory:)".to_string(),
+        ));
+    }
+
+    let preset = match share::normalize_scrub_preset(&scrub_preset) {
+        Ok(p) => p,
+        Err(_) => {
+            ftui_runtime::ftui_eprintln!(
+                "Invalid scrub preset '{scrub_preset}'. Choose one of: {}.",
+                share::SCRUB_PRESETS.join(", ")
+            );
+            return Err(CliError::ExitCode(1));
+        }
+    };
+    let preset_str = preset.as_str().to_string();
+
+    if !source_db.exists() {
+        return Err(CliError::Other(format!(
+            "database not found: {}",
+            source_db.display()
+        )));
+    }
+    if !storage_root.exists() {
+        return Err(CliError::Other(format!(
+            "Storage root {} does not exist; cannot archive.",
+            storage_root.display()
+        )));
+    }
+
+    let archive_dir = archive_states_dir(true)?;
+    let timestamp = Utc::now();
+    let timestamp = timestamp.with_nanosecond(0).unwrap_or(timestamp);
+    let base_name = compose_archive_basename(timestamp, &projects, &preset_str, label.as_deref());
+    let destination = ensure_unique_archive_path(&archive_dir, &base_name);
+
+    let temp_dir = tempfile::Builder::new()
+        .prefix("mailbox-archive-")
+        .tempdir()?;
+    let snapshot_path = temp_dir.path().join("mailbox.sqlite3");
+
+    ftui_runtime::ftui_println!("Creating mailbox archive...");
+    let context = share::create_snapshot_context(source_db, &snapshot_path, &projects, preset)?;
+
+    let snapshot_size = std::fs::metadata(&snapshot_path)?.len();
+    let destination_name = destination
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "mailbox-state.zip".to_string());
+    let projects_included = projects_included_from_snapshot(&snapshot_path).unwrap_or_else(|_| {
+        context
+            .scope
+            .projects
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "slug": p.slug.clone(),
+                    "human_key": p.human_key.clone(),
+                    "created_at": "",
+                })
+            })
+            .collect()
+    });
+
+    let projects_requested = projects.clone();
+    let label_value = label.clone().unwrap_or_default();
+    let source_path = source_db.display().to_string();
+
+    let metadata = serde_json::json!({
+        "version": 1,
+        "created_at": timestamp.to_rfc3339_opts(chrono::SecondsFormat::Secs, false),
+        "projects_requested": projects_requested,
+        "projects_included": projects_included,
+        "projects_removed": context.scope.removed_count,
+        "scrub_preset": preset_str.clone(),
+        "scrub_summary": context.scrub_summary,
+        "fts_enabled": context.fts_enabled,
+        "database": {
+            "source_path": source_path,
+            "snapshot": ARCHIVE_SNAPSHOT_RELATIVE,
+            "size_bytes": snapshot_size,
+        },
+        "storage": {
+            "source_path": storage_root.display().to_string(),
+            "git_head": detect_git_head(storage_root),
+            "archive_dir": ARCHIVE_STORAGE_DIRNAME,
+        },
+        "label": label_value,
+        "tooling": {
+            "package": "mcp-agent-mail",
+            "version": env!("CARGO_PKG_VERSION"),
+            "python": "",
+        },
+        "notes": [
+            format!("Restore with `mcp-agent-mail archive restore {}`", destination_name)
+        ],
+    });
+    let sorted_metadata = sort_json_keys(&metadata);
+    let metadata_json =
+        serde_json::to_string_pretty(&sorted_metadata).unwrap_or_else(|_| "{}".to_string());
+
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Write to a temp file under the archive directory, then move into place (atomic).
+    let zip_dir = tempfile::Builder::new()
+        .prefix("mailbox-archive-zip-")
+        .tempdir_in(&archive_dir)?;
+    let temp_zip_path = zip_dir.path().join("mailbox-state.zip");
+
+    use zip::DateTime;
+    use zip::write::SimpleFileOptions;
+
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_zip_path)?;
+    let mut zip = zip::ZipWriter::new(file);
+    let fixed_time = DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0)
+        .map_err(|e| CliError::Other(format!("zip time error: {e}")))?;
+    let base_options = SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .compression_level(Some(9))
+        .last_modified_time(fixed_time);
+
+    // metadata.json
+    zip.start_file(ARCHIVE_METADATA_FILENAME, base_options)
+        .map_err(|e| CliError::Other(format!("zip write error: {e}")))?;
+    zip.write_all(metadata_json.as_bytes())?;
+
+    // snapshot/mailbox.sqlite3
+    let snapshot_zip_name = ARCHIVE_SNAPSHOT_RELATIVE.replace('\\', "/");
+    let snapshot_mode = file_mode(&snapshot_path);
+    zip.start_file(
+        snapshot_zip_name,
+        base_options.unix_permissions(snapshot_mode),
+    )
+    .map_err(|e| CliError::Other(format!("zip write error: {e}")))?;
+    let mut snapshot_file = std::fs::File::open(&snapshot_path)?;
+    std::io::copy(&mut snapshot_file, &mut zip)?;
+
+    // storage_repo/*
+    let mut files = Vec::new();
+    collect_files(storage_root, storage_root, &mut files)?;
+    files.sort();
+    for rel in files {
+        let full_path = storage_root.join(&rel);
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        let zip_name = format!("{ARCHIVE_STORAGE_DIRNAME}/{rel_str}");
+        let mode = file_mode(&full_path);
+
+        zip.start_file(zip_name, base_options.unix_permissions(mode))
+            .map_err(|e| CliError::Other(format!("zip write error: {e}")))?;
+        let mut f = std::fs::File::open(&full_path)?;
+        std::io::copy(&mut f, &mut zip)?;
+    }
+
+    zip.finish()
+        .map_err(|e| CliError::Other(format!("zip finalize error: {e}")))?;
+
+    std::fs::rename(&temp_zip_path, &destination)?;
+
+    let size_bytes = std::fs::metadata(&destination)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let projects_desc = if projects.is_empty() {
+        vec!["all".to_string()]
+    } else {
+        projects
+    };
+
+    ftui_runtime::ftui_println!("✓ Mailbox state saved to: {}", destination.display());
+    ftui_runtime::ftui_println!(
+        "Preset: {} | Projects: {} | Size: {}",
+        preset_str,
+        projects_desc.join(", "),
+        format_bytes(size_bytes),
+    );
+    ftui_runtime::ftui_println!(
+        "Restore later with: mcp-agent-mail archive restore {}",
+        destination_name
+    );
+
+    Ok(destination)
+}
+
+#[allow(dead_code)]
+fn archive_restore_state(
+    archive_file: PathBuf,
+    database_path: &Path,
+    storage_root: &Path,
+    force: bool,
+    dry_run: bool,
+) -> CliResult<()> {
+    use std::io::IsTerminal;
+
+    let archive_path = resolve_archive_path(&archive_file)?;
+    let (meta, meta_error) = load_archive_metadata(&archive_path);
+    if let Some(err) = meta_error {
+        ftui_runtime::ftui_eprintln!("Warning: {err}");
+    }
+
+    if database_path.to_string_lossy() == ":memory:" {
+        return Err(CliError::Other(
+            "cannot restore into an in-memory database (:memory:)".to_string(),
+        ));
+    }
+
+    let database_path = database_path.to_path_buf();
+    let storage_root = storage_root.to_path_buf();
+
+    let archive_db_path = meta
+        .get("database")
+        .and_then(|v| v.get("source_path"))
+        .and_then(|v| v.as_str());
+    let archive_storage_path = meta
+        .get("storage")
+        .and_then(|v| v.get("source_path"))
+        .and_then(|v| v.as_str());
+
+    if let Some(path) = archive_db_path {
+        if path != database_path.display().to_string() {
+            ftui_runtime::ftui_eprintln!(
+                "Archive was created from database {path}, current config is {}. Continuing...",
+                database_path.display()
+            );
+        }
+    }
+    if let Some(path) = archive_storage_path {
+        if path != storage_root.display().to_string() {
+            ftui_runtime::ftui_eprintln!(
+                "Archive used storage root {path}, current config is {}. Continuing...",
+                storage_root.display()
+            );
+        }
+    }
+
+    // Planned operations (and safety backups)
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let mut planned_ops: Vec<String> = Vec::new();
+    if database_path.exists() {
+        planned_ops.push(format!(
+            "backup {} -> {}",
+            database_path.display(),
+            next_backup_path(&database_path, &timestamp).display()
+        ));
+    }
+    for suffix in ["-wal", "-shm"] {
+        let wal_path = PathBuf::from(format!("{}{}", database_path.display(), suffix));
+        if wal_path.exists() {
+            planned_ops.push(format!(
+                "backup {} -> {}",
+                wal_path.display(),
+                next_backup_path(&wal_path, &timestamp).display()
+            ));
+        }
+    }
+    if storage_root.exists() {
+        planned_ops.push(format!(
+            "backup {} -> {}",
+            storage_root.display(),
+            next_backup_path(&storage_root, &timestamp).display()
+        ));
+    }
+    planned_ops.push(format!("restore snapshot -> {}", database_path.display()));
+    planned_ops.push(format!(
+        "restore storage repo -> {}",
+        storage_root.display()
+    ));
+
+    if dry_run {
+        ftui_runtime::ftui_println!("Dry-run plan:");
+        for op in &planned_ops {
+            ftui_runtime::ftui_println!("  - {op}");
+        }
+        return Ok(());
+    }
+
+    if !force {
+        if !std::io::stdin().is_terminal() {
+            return Err(CliError::Other(
+                "refusing to prompt on non-interactive stdin; pass --force / -f to apply"
+                    .to_string(),
+            ));
+        }
+        ftui_runtime::ftui_println!("The following operations will be performed:");
+        for op in &planned_ops {
+            ftui_runtime::ftui_println!("  - {op}");
+        }
+        if !confirm("Proceed with restore?", false)? {
+            return Err(CliError::ExitCode(1));
+        }
+    }
+
+    // Open archive for restore.
+    let file = std::fs::File::open(&archive_path)?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| CliError::Other(format!("{e}")))?;
+
+    // Ensure snapshot exists.
+    let snapshot_entry_name = ARCHIVE_SNAPSHOT_RELATIVE;
+    if archive.by_name(snapshot_entry_name).is_err() {
+        return Err(CliError::Other(format!(
+            "Snapshot missing inside archive ({snapshot_entry_name})."
+        )));
+    }
+    // Ensure storage exists.
+    let prefix_string = format!("{ARCHIVE_STORAGE_DIRNAME}/");
+    let mut has_storage = false;
+    for i in 0..archive.len() {
+        if let Ok(file) = archive.by_index(i) {
+            if file.name().starts_with(&prefix_string) {
+                has_storage = true;
+                break;
+            }
+        }
+    }
+    if !has_storage {
+        return Err(CliError::Other(format!(
+            "Storage repository missing inside archive ({ARCHIVE_STORAGE_DIRNAME})."
+        )));
+    }
+
+    // Back up existing files/dirs.
+    let mut backup_paths: Vec<PathBuf> = Vec::new();
+    if database_path.exists() {
+        let backup = next_backup_path(&database_path, &timestamp);
+        std::fs::rename(&database_path, &backup)?;
+        backup_paths.push(backup);
+    }
+    for suffix in ["-wal", "-shm"] {
+        let wal_path = PathBuf::from(format!("{}{}", database_path.display(), suffix));
+        if wal_path.exists() {
+            let backup = next_backup_path(&wal_path, &timestamp);
+            std::fs::rename(&wal_path, &backup)?;
+            backup_paths.push(backup);
+        }
+    }
+    if storage_root.exists() {
+        let backup = next_backup_path(&storage_root, &timestamp);
+        std::fs::rename(&storage_root, &backup)?;
+        backup_paths.push(backup);
+    }
+
+    // Restore snapshot.
+    if let Some(parent) = database_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    {
+        let mut snapshot_file = archive
+            .by_name(snapshot_entry_name)
+            .map_err(|e| CliError::Other(format!("{e}")))?;
+        let mut out = std::fs::File::create(&database_path)?;
+        std::io::copy(&mut snapshot_file, &mut out)?;
+    }
+
+    // Restore storage repo entries.
+    if let Some(parent) = storage_root.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::create_dir_all(&storage_root)?;
+
+    let prefix_path = Path::new(ARCHIVE_STORAGE_DIRNAME);
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| CliError::Other(format!("{e}")))?;
+        let Some(enclosed) = file.enclosed_name().map(|p| p.to_path_buf()) else {
+            continue;
+        };
+        if !enclosed.starts_with(prefix_path) {
+            continue;
+        }
+        let rel = match enclosed.strip_prefix(prefix_path) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        let out_path = storage_root.join(rel);
+        if file.is_dir() {
+            std::fs::create_dir_all(&out_path)?;
+            continue;
+        }
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut out = std::fs::File::create(&out_path)?;
+        std::io::copy(&mut file, &mut out)?;
+
+        #[cfg(unix)]
+        if let Some(mode) = file.unix_mode() {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode));
+        }
+    }
+
+    ftui_runtime::ftui_println!("✓ Restore complete from {}.", archive_path.display());
+    if !backup_paths.is_empty() {
+        ftui_runtime::ftui_println!("Backups preserved at:");
+        for path in &backup_paths {
+            ftui_runtime::ftui_println!("  - {}", path.display());
+        }
+    }
+    ftui_runtime::ftui_println!(
+        "Database: {}\nStorage root: {}\nNeed to revert? Use the backups above or rerun with another archive.",
+        database_path.display(),
+        storage_root.display()
+    );
+
+    Ok(())
+}
+
 fn handle_archive(action: ArchiveCommand) -> CliResult<()> {
     match action {
         ArchiveCommand::Save {
@@ -2551,98 +4307,153 @@ fn handle_archive(action: ArchiveCommand) -> CliResult<()> {
             let source_path = cfg
                 .sqlite_path()
                 .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
-            let source = std::path::Path::new(&source_path);
-            if !source.exists() {
-                return Err(CliError::Other(format!(
-                    "database not found: {source_path}"
-                )));
+            if source_path == ":memory:" {
+                return Err(CliError::Other(
+                    "cannot archive an in-memory database (:memory:)".to_string(),
+                ));
             }
+            let source_db = PathBuf::from(&source_path);
 
             let config = Config::from_env();
-            let archive_dir = config.storage_root.join("backups");
-            std::fs::create_dir_all(&archive_dir)?;
+            let storage_root = config.storage_root;
 
-            let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-            let label_part = label
-                .as_deref()
-                .map(|l| format!("_{}", safe_component(l)))
-                .unwrap_or_default();
-            let archive_name = format!("archive_{timestamp}{label_part}.sqlite3");
-            let archive_path = archive_dir.join(&archive_name);
-
-            ftui_runtime::ftui_println!("Creating archive snapshot...");
-            let preset = scrub_preset
-                .as_deref()
-                .map(share::normalize_scrub_preset)
-                .transpose()?;
-
-            share::create_sqlite_snapshot(source, &archive_path, true)?;
-
-            if !projects.is_empty() {
-                share::apply_project_scope(&archive_path, &projects)?;
-            }
-            if let Some(preset) = preset {
-                share::scrub_snapshot(&archive_path, preset)?;
-            }
-
-            let size = std::fs::metadata(&archive_path)?.len();
-            ftui_runtime::ftui_println!(
-                "Archive saved: {} ({} bytes)",
-                archive_path.display(),
-                size
-            );
+            let _path =
+                archive_save_state(&source_db, &storage_root, projects, scrub_preset, label)?;
             Ok(())
         }
         ArchiveCommand::List { limit, json } => {
-            let config = Config::from_env();
-            let archive_dir = config.storage_root.join("backups");
+            #[derive(Debug, Serialize)]
+            struct ArchiveListEntry {
+                file: String,
+                path: String,
+                size_bytes: u64,
+                created_at: String,
+                scrub_preset: String,
+                projects: Vec<String>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                error: Option<String>,
+            }
+
+            if limit < 0 {
+                return Err(CliError::InvalidArgument(
+                    "--limit/-n must be >= 0".to_string(),
+                ));
+            }
+
+            let archive_dir = archive_states_dir(false)?;
             if !archive_dir.exists() {
-                if json {
-                    ftui_runtime::ftui_println!("[]");
-                } else {
-                    ftui_runtime::ftui_println!("No archives found.");
-                }
+                ftui_runtime::ftui_println!(
+                    "Archive directory {} does not exist yet.",
+                    archive_dir.display()
+                );
                 return Ok(());
             }
-            let mut entries: Vec<(String, u64, std::time::SystemTime)> = Vec::new();
+
+            let mut files: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
             for entry in std::fs::read_dir(&archive_dir)?.flatten() {
                 let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("sqlite3") {
-                    if let Ok(meta) = path.metadata() {
-                        let name = path
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("?")
-                            .to_string();
-                        let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-                        entries.push((name, meta.len(), modified));
-                    }
+                if path.extension().and_then(|s| s.to_str()) != Some("zip") {
+                    continue;
                 }
+                let modified = path
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                files.push((path, modified));
             }
-            entries.sort_by_key(|x| std::cmp::Reverse(x.2));
-            if let Some(n) = limit {
-                entries.truncate(n as usize);
+            files.sort_by_key(|(_, m)| std::cmp::Reverse(*m));
+
+            if files.is_empty() {
+                ftui_runtime::ftui_println!(
+                    "No saved mailbox states found under {}.",
+                    archive_dir.display()
+                );
+                return Ok(());
+            }
+
+            let files = if limit > 0 {
+                files.into_iter().take(limit as usize).collect::<Vec<_>>()
+            } else {
+                files
+            };
+
+            let mut entries: Vec<ArchiveListEntry> = Vec::new();
+            for (path, modified) in files {
+                let file_name = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                let size_bytes = path.metadata().map(|m| m.len()).unwrap_or(0);
+                let (meta, error) = load_archive_metadata(&path);
+
+                let created_at = meta
+                    .get("created_at")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| {
+                        let dt = DateTime::<Utc>::from(modified);
+                        dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
+                    });
+
+                let scrub_preset = meta
+                    .get("scrub_preset")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let projects = meta
+                    .get("projects_requested")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| vec!["all".to_string()]);
+
+                entries.push(ArchiveListEntry {
+                    file: file_name,
+                    path: path.display().to_string(),
+                    size_bytes,
+                    created_at,
+                    scrub_preset,
+                    projects,
+                    error,
+                });
             }
 
             if json {
-                let arr: Vec<serde_json::Value> = entries
-                    .iter()
-                    .map(|(name, size, _)| serde_json::json!({"name": name, "size": size}))
-                    .collect();
                 ftui_runtime::ftui_println!(
                     "{}",
-                    serde_json::to_string_pretty(&arr).unwrap_or_default()
+                    serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string())
                 );
-            } else {
-                if entries.is_empty() {
-                    ftui_runtime::ftui_println!("No archives found.");
-                    return Ok(());
-                }
-                ftui_runtime::ftui_println!("{:<50} {:>12}", "NAME", "SIZE");
-                for (name, size, _) in &entries {
-                    ftui_runtime::ftui_println!("{:<50} {:>12}", name, format_bytes(*size));
-                }
+                return Ok(());
             }
+
+            ftui_runtime::ftui_println!(
+                "{:<32} {:<25} {:>10} {:<9} {:<20} {}",
+                "File",
+                "Created (UTC)",
+                "Size",
+                "Preset",
+                "Projects",
+                "Notes"
+            );
+            for entry in &entries {
+                ftui_runtime::ftui_println!(
+                    "{:<32} {:<25} {:>10} {:<9} {:<20} {}",
+                    &entry.file[..entry.file.len().min(32)],
+                    &entry.created_at[..entry.created_at.len().min(25)],
+                    format_bytes(entry.size_bytes),
+                    entry.scrub_preset,
+                    entry.projects.join(", "),
+                    entry.error.clone().unwrap_or_default()
+                );
+            }
+            ftui_runtime::ftui_println!(
+                "Archives live under {}. Restore with `mcp-agent-mail archive restore <file>`.",
+                archive_dir.display()
+            );
             Ok(())
         }
         ArchiveCommand::Restore {
@@ -2650,35 +4461,20 @@ fn handle_archive(action: ArchiveCommand) -> CliResult<()> {
             force,
             dry_run,
         } => {
-            if !archive_file.exists() {
-                return Err(CliError::InvalidArgument(format!(
-                    "archive not found: {}",
-                    archive_file.display()
-                )));
-            }
-
             let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-            let dest_path = cfg
+            let db_path = cfg
                 .sqlite_path()
                 .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
-
-            ftui_runtime::ftui_println!("Restore: {} -> {}", archive_file.display(), dest_path);
-
-            if dry_run {
-                ftui_runtime::ftui_println!("Dry run — no changes made.");
-                return Ok(());
-            }
-
-            if std::path::Path::new(&dest_path).exists() && !force {
+            if db_path == ":memory:" {
                 return Err(CliError::Other(
-                    "destination database already exists. Pass --force / -f to overwrite."
-                        .to_string(),
+                    "cannot restore into an in-memory database (:memory:)".to_string(),
                 ));
             }
+            let database_path = PathBuf::from(&db_path);
 
-            std::fs::copy(&archive_file, &dest_path)?;
-            ftui_runtime::ftui_println!("Database restored successfully.");
-            Ok(())
+            let config = Config::from_env();
+            let storage_root = config.storage_root;
+            archive_restore_state(archive_file, &database_path, &storage_root, force, dry_run)
         }
     }
 }
@@ -2881,139 +4677,745 @@ fn handle_doctor_restore(backup_path: PathBuf, dry_run: bool, _yes: bool) -> Cli
 // Products commands
 // ---------------------------------------------------------------------------
 
-fn handle_products(action: ProductsCommand) -> CliResult<()> {
-    let conn = open_db_sync()?;
+static PRODUCTS_HTTP_CLIENT: OnceLock<asupersync::http::h1::HttpClient> = OnceLock::new();
+static PRODUCT_UID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+fn products_http_client() -> &'static asupersync::http::h1::HttpClient {
+    PRODUCTS_HTTP_CLIENT.get_or_init(asupersync::http::h1::HttpClient::new)
+}
+
+fn collapse_whitespace(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_hex_uid(candidate: &str) -> bool {
+    let s = candidate.trim();
+    if s.len() < 8 || s.len() > 64 {
+        return false;
+    }
+    s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn generate_product_uid(now_micros: i64) -> String {
+    let seq = PRODUCT_UID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = u64::from(std::process::id());
+    let raw = format!("{now_micros:x}{pid:x}{seq:x}");
+    let mut out = String::with_capacity(20);
+    for ch in raw.chars() {
+        if ch.is_ascii_hexdigit() {
+            out.push(ch.to_ascii_lowercase());
+        }
+        if out.len() == 20 {
+            break;
+        }
+    }
+    while out.len() < 20 {
+        out.push('0');
+    }
+    out
+}
+
+fn buffer_to_text_trim(buf: &ftui::Buffer) -> String {
+    let mut lines: Vec<String> = Vec::with_capacity(buf.height() as usize);
+    for y in 0..buf.height() {
+        let mut line = String::with_capacity(buf.width() as usize);
+        for x in 0..buf.width() {
+            let cell = buf.get(x, y).expect("buffer cell");
+            if cell.is_continuation() {
+                continue;
+            }
+            if cell.is_empty() {
+                line.push(' ');
+            } else if let Some(c) = cell.content.as_char() {
+                line.push(c);
+            } else {
+                // Unknown content (grapheme ID etc). Keep width-correct placeholder.
+                let w = cell.content.width();
+                for _ in 0..w.max(1) {
+                    line.push('?');
+                }
+            }
+        }
+        lines.push(line.trim_end().to_string());
+    }
+    while matches!(lines.last(), Some(s) if s.trim().is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
+fn render_table_text(title: Option<&str>, headers: &[&str], rows: Vec<Vec<String>>) -> String {
+    use ftui::layout::{Constraint, Rect};
+    use ftui::widgets::Widget;
+    use ftui::widgets::block::Block;
+    use ftui::widgets::borders::BorderType;
+    use ftui::widgets::table::{Row, Table};
+
+    let col_count = headers.len();
+    let widths = (0..col_count)
+        .map(|idx| match idx {
+            // Heuristic widths: keep IDs compact, give text columns room.
+            0 => Constraint::FitContentBounded { min: 2, max: 14 },
+            1 => Constraint::FitContentBounded { min: 2, max: 16 },
+            2 => Constraint::FitContentBounded { min: 4, max: 72 },
+            3 => Constraint::FitContentBounded { min: 4, max: 28 },
+            4 => Constraint::FitContentBounded { min: 4, max: 40 },
+            _ => Constraint::FitContentBounded { min: 2, max: 80 },
+        })
+        .collect::<Vec<_>>();
+
+    let row_count = rows.len();
+    let header = Row::new(headers.to_vec());
+    let ftui_rows = rows.into_iter().map(Row::new).collect::<Vec<_>>();
+
+    let mut table = Table::new(ftui_rows, widths)
+        .header(header)
+        .column_spacing(2);
+    if let Some(t) = title {
+        table = table.block(Block::bordered().border_type(BorderType::Ascii).title(t));
+    }
+
+    // Render headless to a buffer and print as text. Keep the width stable for tests.
+    let width: u16 = 120;
+    let height = (row_count + 4).clamp(6, 200).try_into().unwrap_or(200u16);
+
+    let mut pool = ftui::GraphemePool::new();
+    let mut frame = ftui::Frame::new(width, height, &mut pool);
+    let area = Rect::new(0, 0, width, height);
+    table.render(area, &mut frame);
+
+    buffer_to_text_trim(&frame.buffer)
+}
+
+fn print_table(title: Option<&str>, headers: &[&str], rows: Vec<Vec<String>>) {
+    let rendered = render_table_text(title, headers, rows);
+    ftui_runtime::ftui_println!("{rendered}");
+}
+
+async fn try_call_server_tool(
+    server_url: &str,
+    bearer: Option<&str>,
+    tool_name: &str,
+    arguments: serde_json::Value,
+) -> Option<serde_json::Value> {
+    use asupersync::http::h1::Method;
+
+    let req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": format!("cli-{tool_name}"),
+        "method": "tools/call",
+        "params": {
+            "name": tool_name,
+            "arguments": arguments,
+        }
+    });
+    let body = serde_json::to_vec(&req).ok()?;
+
+    let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
+    if let Some(tok) = bearer.filter(|s| !s.is_empty()) {
+        headers.push(("Authorization".to_string(), format!("Bearer {tok}")));
+    }
+
+    let resp = products_http_client()
+        .request(Method::Post, server_url, headers, body)
+        .await
+        .ok()?;
+    if resp.status != 200 {
+        return None;
+    }
+
+    let v: serde_json::Value = serde_json::from_slice(&resp.body).ok()?;
+    v.get("result").cloned()
+}
+
+fn coerce_tool_result_json(result: serde_json::Value) -> Option<serde_json::Value> {
+    match result {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => serde_json::from_str(&s).ok(),
+        serde_json::Value::Object(map) => {
+            if let Some(v) = map.get("structured_content") {
+                return Some(v.clone());
+            }
+            if let Some(content) = map.get("content") {
+                // FastMCP-style: { content: [{ type: "text", text: "..." }] }
+                if let Some(text) = content
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|v| v.get("text"))
+                    .and_then(|v| v.as_str())
+                {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
+                        return Some(parsed);
+                    }
+                }
+            }
+            Some(serde_json::Value::Object(map))
+        }
+        other => Some(other),
+    }
+}
+
+async fn get_product_by_key(
+    cx: &asupersync::Cx,
+    pool: &mcp_agent_mail_db::DbPool,
+    key: &str,
+) -> CliResult<Option<mcp_agent_mail_db::ProductRow>> {
+    use mcp_agent_mail_db::sqlmodel::Model;
+    use mcp_agent_mail_db::sqlmodel::Value;
+
+    let conn = match pool.acquire(cx).await {
+        asupersync::Outcome::Ok(c) => c,
+        asupersync::Outcome::Err(e) => {
+            return Err(CliError::Other(format!("db acquire failed: {e}")));
+        }
+        asupersync::Outcome::Cancelled(_) => {
+            return Err(CliError::Other("request cancelled".to_string()));
+        }
+        asupersync::Outcome::Panicked(p) => {
+            return Err(CliError::Other(format!("internal panic: {}", p.message())));
+        }
+    };
+
+    let sql = "SELECT * FROM products WHERE product_uid = ? OR name = ? LIMIT 1";
+    let params = [Value::Text(key.to_string()), Value::Text(key.to_string())];
+    let rows = conn
+        .query_sync(sql, &params)
+        .map_err(|e| CliError::Other(format!("product lookup failed: {e}")))?;
+    let Some(row) = rows.into_iter().next() else {
+        return Ok(None);
+    };
+    let product = mcp_agent_mail_db::ProductRow::from_row(&row)
+        .map_err(|e| CliError::Other(format!("bad product row: {e}")))?;
+    Ok(Some(product))
+}
+
+async fn get_project_record(
+    cx: &asupersync::Cx,
+    pool: &mcp_agent_mail_db::DbPool,
+    identifier: &str,
+) -> CliResult<mcp_agent_mail_db::ProjectRow> {
+    let raw = identifier.trim();
+    let mut canonical = raw.to_string();
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        if let Ok(resolved) = path.canonicalize() {
+            canonical = resolved.display().to_string();
+        }
+    }
+    let slug = mcp_agent_mail_core::compute_project_slug(&canonical);
+
+    let out = mcp_agent_mail_db::queries::get_project_by_slug(cx, pool, &slug).await;
+    match out {
+        asupersync::Outcome::Ok(row) => return Ok(row),
+        asupersync::Outcome::Err(_) => {}
+        asupersync::Outcome::Cancelled(_) => {
+            return Err(CliError::Other("request cancelled".to_string()));
+        }
+        asupersync::Outcome::Panicked(p) => {
+            return Err(CliError::Other(format!("internal panic: {}", p.message())));
+        }
+    }
+
+    let out = mcp_agent_mail_db::queries::get_project_by_human_key(cx, pool, &canonical).await;
+    match out {
+        asupersync::Outcome::Ok(row) => return Ok(row),
+        asupersync::Outcome::Err(_) => {}
+        asupersync::Outcome::Cancelled(_) => {
+            return Err(CliError::Other("request cancelled".to_string()));
+        }
+        asupersync::Outcome::Panicked(p) => {
+            return Err(CliError::Other(format!("internal panic: {}", p.message())));
+        }
+    }
+
+    if canonical != raw {
+        let out = mcp_agent_mail_db::queries::get_project_by_human_key(cx, pool, raw).await;
+        match out {
+            asupersync::Outcome::Ok(row) => return Ok(row),
+            asupersync::Outcome::Err(_) => {}
+            asupersync::Outcome::Cancelled(_) => {
+                return Err(CliError::Other("request cancelled".to_string()));
+            }
+            asupersync::Outcome::Panicked(p) => {
+                return Err(CliError::Other(format!("internal panic: {}", p.message())));
+            }
+        }
+    }
+
+    Err(CliError::Other(format!("Project '{raw}' not found")))
+}
+
+async fn ensure_product_local(
+    cx: &asupersync::Cx,
+    pool: &mcp_agent_mail_db::DbPool,
+    product_key: Option<&str>,
+    name: Option<&str>,
+) -> CliResult<mcp_agent_mail_db::ProductRow> {
+    let key_raw = product_key.or(name).unwrap_or("").trim();
+    if key_raw.is_empty() {
+        ftui_runtime::ftui_eprintln!("Provide a product_key or --name.");
+        return Err(CliError::ExitCode(2));
+    }
+
+    if let Some(existing) = get_product_by_key(cx, pool, key_raw).await? {
+        return Ok(existing);
+    }
+
+    let now = mcp_agent_mail_db::now_micros();
+    let uid = match product_key {
+        Some(pk) if is_hex_uid(pk) => pk.trim().to_ascii_lowercase(),
+        _ => generate_product_uid(now),
+    };
+    let display_name_raw = name.unwrap_or(key_raw);
+    let mut display_name = collapse_whitespace(display_name_raw)
+        .chars()
+        .take(255)
+        .collect::<String>();
+    if display_name.is_empty() {
+        display_name = uid.clone();
+    }
+
+    let out = mcp_agent_mail_db::queries::ensure_product(
+        cx,
+        pool,
+        Some(uid.as_str()),
+        Some(display_name.as_str()),
+    )
+    .await;
+    match out {
+        asupersync::Outcome::Ok(row) => Ok(row),
+        asupersync::Outcome::Err(e) => Err(CliError::Other(format!("ensure product failed: {e}"))),
+        asupersync::Outcome::Cancelled(_) => Err(CliError::Other("request cancelled".to_string())),
+        asupersync::Outcome::Panicked(p) => {
+            Err(CliError::Other(format!("internal panic: {}", p.message())))
+        }
+    }
+}
+
+fn handle_products(action: ProductsCommand) -> CliResult<()> {
+    use asupersync::runtime::RuntimeBuilder;
+
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .map_err(|e| CliError::Other(format!("failed to build runtime: {e}")))?;
+    runtime.block_on(async move { handle_products_async(action).await })
+}
+
+async fn handle_products_async(action: ProductsCommand) -> CliResult<()> {
+    let config = Config::from_env();
+    let server_url = format!(
+        "http://{}:{}{}",
+        config.http_host, config.http_port, config.http_path
+    );
+    let bearer = config.http_bearer_token.as_deref();
+
+    let cx = asupersync::Cx::for_request();
+    let pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    let pool = mcp_agent_mail_db::get_or_create_pool(&pool_cfg)
+        .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?;
+
+    handle_products_with(&cx, &pool, Some(server_url.as_str()), bearer, action).await
+}
+
+async fn handle_products_with(
+    cx: &asupersync::Cx,
+    pool: &mcp_agent_mail_db::DbPool,
+    server_url: Option<&str>,
+    bearer: Option<&str>,
+    action: ProductsCommand,
+) -> CliResult<()> {
     match action {
-        ProductsCommand::Ensure { product_key, name } => {
-            let key = product_key
-                .unwrap_or_else(|| name.clone().unwrap_or_else(|| "default".to_string()));
-            // Check if product table exists (may not in all schemas)
-            let tables = conn
-                .query_sync(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='products'",
-                    &[],
-                )
-                .unwrap_or_default();
-            if tables.is_empty() {
-                // Create products table
-                conn.execute_raw(
-                    "CREATE TABLE IF NOT EXISTS products (\
-                     id INTEGER PRIMARY KEY AUTOINCREMENT, \
-                     key TEXT UNIQUE NOT NULL, \
-                     name TEXT DEFAULT '', \
-                     created_at INTEGER DEFAULT 0)",
-                )
-                .map_err(|e| CliError::Other(format!("create products table: {e}")))?;
+        ProductsCommand::Ensure {
+            product_key,
+            name,
+            json,
+        } => {
+            let key_raw = product_key
+                .as_deref()
+                .or(name.as_deref())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if key_raw.is_empty() {
+                ftui_runtime::ftui_eprintln!("Provide a product_key or --name.");
+                return Err(CliError::ExitCode(2));
             }
 
-            let now_us = mcp_agent_mail_db::timestamps::now_micros();
-            let display_name = name.unwrap_or_else(|| key.clone());
-            conn.execute_raw(&format!(
-                "INSERT OR IGNORE INTO products (key, name, created_at) VALUES ('{}', '{}', {})",
-                key.replace('\'', "''"),
-                display_name.replace('\'', "''"),
-                now_us
-            ))
-            .map_err(|e| CliError::Other(format!("ensure product: {e}")))?;
+            // Prefer server tool to ensure strict uid policy (legacy behavior).
+            let mut args = serde_json::Map::new();
+            if let Some(pk) = &product_key {
+                args.insert(
+                    "product_key".to_string(),
+                    serde_json::Value::String(pk.clone()),
+                );
+            }
+            if let Some(n) = &name {
+                args.insert("name".to_string(), serde_json::Value::String(n.clone()));
+            }
+            let server_result = if let Some(url) = server_url {
+                try_call_server_tool(
+                    url,
+                    bearer,
+                    "ensure_product",
+                    serde_json::Value::Object(args),
+                )
+                .await
+                .and_then(coerce_tool_result_json)
+            } else {
+                None
+            };
 
-            ftui_runtime::ftui_println!("Product ensured: {key}");
+            let payload = if let Some(v) = server_result {
+                v
+            } else {
+                let row =
+                    ensure_product_local(cx, pool, product_key.as_deref(), name.as_deref()).await?;
+                serde_json::json!({
+                    "id": row.id.unwrap_or(0),
+                    "product_uid": row.product_uid,
+                    "name": row.name,
+                    "created_at": mcp_agent_mail_db::micros_to_iso(row.created_at),
+                })
+            };
+
+            if json {
+                ftui_runtime::ftui_println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                );
+                return Ok(());
+            }
+
+            let created_at = payload
+                .get("created_at")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let rows = vec![
+                vec![
+                    "id".to_string(),
+                    payload.get("id").cloned().unwrap_or_default().to_string(),
+                ],
+                vec![
+                    "product_uid".to_string(),
+                    payload
+                        .get("product_uid")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                ],
+                vec![
+                    "name".to_string(),
+                    payload
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                ],
+                vec!["created_at".to_string(), created_at.to_string()],
+            ];
+            print_table(Some("Product"), &["Field", "Value"], rows);
             Ok(())
         }
         ProductsCommand::Link {
             product_key,
             project,
+            json,
         } => {
-            let tables = conn
-                .query_sync(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='product_links'",
-                    &[],
-                )
-                .unwrap_or_default();
-            if tables.is_empty() {
-                conn.execute_raw(
-                    "CREATE TABLE IF NOT EXISTS product_links (\
-                     id INTEGER PRIMARY KEY AUTOINCREMENT, \
-                     product_key TEXT NOT NULL, \
-                     project_slug TEXT NOT NULL, \
-                     created_at INTEGER DEFAULT 0, \
-                     UNIQUE(product_key, project_slug))",
-                )
-                .map_err(|e| CliError::Other(format!("create product_links table: {e}")))?;
-            }
+            let prod = get_product_by_key(cx, pool, product_key.trim())
+                .await?
+                .ok_or_else(|| CliError::Other(format!("Product '{product_key}' not found")))?;
+            let proj = get_project_record(cx, pool, &project).await?;
 
-            let now_us = mcp_agent_mail_db::timestamps::now_micros();
-            conn.execute_raw(&format!(
-                "INSERT OR IGNORE INTO product_links (product_key, project_slug, created_at) \
-                 VALUES ('{}', '{}', {})",
-                product_key.replace('\'', "''"),
-                project.replace('\'', "''"),
-                now_us
-            ))
-            .map_err(|e| CliError::Other(format!("link product: {e}")))?;
+            let prod_id = prod.id.unwrap_or(0);
+            let proj_id = proj.id.unwrap_or(0);
 
-            ftui_runtime::ftui_println!("Linked product '{product_key}' to project '{project}'.");
-            Ok(())
-        }
-        ProductsCommand::Status { product_key } => {
-            // Show product and linked projects
-            let rows = conn
-                .query_sync(
-                    "SELECT pl.project_slug FROM product_links pl WHERE pl.product_key = ?",
-                    &[sqlmodel_core::Value::Text(product_key.clone())],
-                )
-                .unwrap_or_default();
-
-            ftui_runtime::ftui_println!("Product: {product_key}");
-            if rows.is_empty() {
-                ftui_runtime::ftui_println!("  No linked projects.");
-            } else {
-                ftui_runtime::ftui_println!("  Linked projects:");
-                for r in &rows {
-                    let slug: String = r.get_named("project_slug").unwrap_or_default();
-                    ftui_runtime::ftui_println!("    - {slug}");
+            let out =
+                mcp_agent_mail_db::queries::link_product_to_projects(cx, pool, prod_id, &[proj_id])
+                    .await;
+            match out {
+                asupersync::Outcome::Ok(_) => {}
+                asupersync::Outcome::Err(e) => {
+                    return Err(CliError::Other(format!("link failed: {e}")));
+                }
+                asupersync::Outcome::Cancelled(_) => {
+                    return Err(CliError::Other("request cancelled".to_string()));
+                }
+                asupersync::Outcome::Panicked(p) => {
+                    return Err(CliError::Other(format!("internal panic: {}", p.message())));
                 }
             }
+
+            let payload = serde_json::json!({
+                "product_uid": prod.product_uid,
+                "product_name": prod.name,
+                "project_slug": proj.slug,
+            });
+
+            if json {
+                ftui_runtime::ftui_println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                );
+                return Ok(());
+            }
+
+            ftui_runtime::ftui_println!(
+                "Linked project '{}' into product '{}' ({}).",
+                payload
+                    .get("project_slug")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
+                payload
+                    .get("product_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
+                payload
+                    .get("product_uid")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
+            );
+            Ok(())
+        }
+        ProductsCommand::Status { product_key, json } => {
+            let prod = get_product_by_key(cx, pool, product_key.trim())
+                .await?
+                .ok_or_else(|| {
+                    ftui_runtime::ftui_eprintln!("Product '{product_key}' not found.");
+                    CliError::ExitCode(2)
+                })?;
+            let prod_id = prod.id.unwrap_or(0);
+            let projects =
+                match mcp_agent_mail_db::queries::list_product_projects(cx, pool, prod_id).await {
+                    asupersync::Outcome::Ok(v) => v,
+                    asupersync::Outcome::Err(e) => {
+                        return Err(CliError::Other(format!("status query failed: {e}")));
+                    }
+                    asupersync::Outcome::Cancelled(_) => {
+                        return Err(CliError::Other("request cancelled".to_string()));
+                    }
+                    asupersync::Outcome::Panicked(p) => {
+                        return Err(CliError::Other(format!("internal panic: {}", p.message())));
+                    }
+                };
+
+            let payload = serde_json::json!({
+                "product": {
+                    "id": prod.id.unwrap_or(0),
+                    "product_uid": prod.product_uid,
+                    "name": prod.name,
+                    "created_at": mcp_agent_mail_db::micros_to_iso(prod.created_at),
+                },
+                "projects": projects.iter().map(|p| serde_json::json!({
+                    "id": p.id.unwrap_or(0),
+                    "slug": p.slug,
+                    "human_key": p.human_key,
+                })).collect::<Vec<_>>(),
+            });
+
+            if json {
+                ftui_runtime::ftui_println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                );
+                return Ok(());
+            }
+
+            let prod_title = payload
+                .get("product")
+                .and_then(|p| p.get("name"))
+                .and_then(|v| v.as_str())
+                .map(|n| format!("Product: {n}"))
+                .unwrap_or_else(|| "Product".to_string());
+
+            let p = payload.get("product").cloned().unwrap_or_default();
+            let rows = vec![
+                vec![
+                    "id".to_string(),
+                    p.get("id").cloned().unwrap_or_default().to_string(),
+                ],
+                vec![
+                    "product_uid".to_string(),
+                    p.get("product_uid")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                ],
+                vec![
+                    "name".to_string(),
+                    p.get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                ],
+                vec![
+                    "created_at".to_string(),
+                    p.get("created_at")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                ],
+            ];
+            print_table(Some(&prod_title), &["Field", "Value"], rows);
+            ftui_runtime::ftui_println!();
+
+            let proj_rows = payload
+                .get("projects")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| {
+                    vec![
+                        p.get("id").cloned().unwrap_or_default().to_string(),
+                        p.get("slug")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        p.get("human_key")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            print_table(
+                Some("Linked Projects"),
+                &["id", "slug", "human_key"],
+                proj_rows,
+            );
             Ok(())
         }
         ProductsCommand::Search {
             product_key,
             query,
             limit,
+            json,
         } => {
-            // Search messages across linked projects
-            let rows = conn
-                .query_sync(
-                    "SELECT m.id, m.subject, m.importance, m.created_ts, \
-                            sa.name AS sender_name, p.slug AS project_slug \
-                     FROM messages m \
-                     JOIN agents sa ON sa.id = m.sender_id \
-                     JOIN projects p ON p.id = m.project_id \
-                     JOIN product_links pl ON pl.project_slug = p.slug \
-                     WHERE pl.product_key = ? \
-                       AND (m.subject LIKE '%' || ? || '%' OR m.body_md LIKE '%' || ? || '%') \
-                     ORDER BY m.created_ts DESC \
-                     LIMIT ?",
-                    &[
-                        sqlmodel_core::Value::Text(product_key),
-                        sqlmodel_core::Value::Text(query.clone()),
-                        sqlmodel_core::Value::Text(query),
-                        sqlmodel_core::Value::BigInt(limit),
-                    ],
-                )
-                .unwrap_or_default();
+            let Some(sanitized) = mcp_agent_mail_db::queries::sanitize_fts_query(&query) else {
+                ftui_runtime::ftui_println!("Query '{query}' cannot produce search results.");
+                return Ok(());
+            };
 
-            if rows.is_empty() {
-                ftui_runtime::ftui_println!("No matching messages.");
+            let prod = get_product_by_key(cx, pool, product_key.trim())
+                .await?
+                .ok_or_else(|| {
+                    ftui_runtime::ftui_eprintln!("Product '{product_key}' not found.");
+                    CliError::ExitCode(2)
+                })?;
+            let prod_id = prod.id.unwrap_or(0);
+            let projects =
+                match mcp_agent_mail_db::queries::list_product_projects(cx, pool, prod_id).await {
+                    asupersync::Outcome::Ok(v) => v,
+                    asupersync::Outcome::Err(e) => {
+                        return Err(CliError::Other(format!("project list failed: {e}")));
+                    }
+                    asupersync::Outcome::Cancelled(_) => {
+                        return Err(CliError::Other("request cancelled".to_string()));
+                    }
+                    asupersync::Outcome::Panicked(p) => {
+                        return Err(CliError::Other(format!("internal panic: {}", p.message())));
+                    }
+                };
+            let project_ids = projects.iter().filter_map(|p| p.id).collect::<Vec<_>>();
+            if project_ids.is_empty() {
+                ftui_runtime::ftui_println!("No results.");
                 return Ok(());
             }
-            for r in &rows {
+
+            use mcp_agent_mail_db::sqlmodel::Value;
+            let conn = match pool.acquire(cx).await {
+                asupersync::Outcome::Ok(c) => c,
+                asupersync::Outcome::Err(e) => {
+                    return Err(CliError::Other(format!("db acquire failed: {e}")));
+                }
+                asupersync::Outcome::Cancelled(_) => {
+                    return Err(CliError::Other("request cancelled".to_string()));
+                }
+                asupersync::Outcome::Panicked(p) => {
+                    return Err(CliError::Other(format!("internal panic: {}", p.message())));
+                }
+            };
+
+            let limit_i64 = limit.max(0);
+            let placeholders = std::iter::repeat_n("?", project_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT m.id, m.subject, m.created_ts, a.name AS sender_name, m.project_id \
+                 FROM fts_messages \
+                 JOIN messages m ON m.id = fts_messages.message_id \
+                 JOIN agents a ON a.id = m.sender_id \
+                 WHERE m.project_id IN ({placeholders}) AND fts_messages MATCH ? \
+                 ORDER BY bm25(fts_messages) ASC, m.id ASC \
+                 LIMIT ?"
+            );
+            let mut params: Vec<Value> = project_ids.into_iter().map(Value::BigInt).collect();
+            params.push(Value::Text(sanitized));
+            params.push(Value::BigInt(limit_i64));
+
+            let rows = conn.query_sync(&sql, &params).unwrap_or_default(); // legacy: fail closed to empty
+
+            let mut out = Vec::new();
+            for r in rows {
                 let id: i64 = r.get_named("id").unwrap_or(0);
                 let subject: String = r.get_named("subject").unwrap_or_default();
-                let sender: String = r.get_named("sender_name").unwrap_or_default();
-                let proj: String = r.get_named("project_slug").unwrap_or_default();
-                ftui_runtime::ftui_println!("  [{}] {} ({}) — {}", id, subject, sender, proj);
+                let from: String = r.get_named("sender_name").unwrap_or_default();
+                let project_id: i64 = r.get_named("project_id").unwrap_or(0);
+                let created_ts: i64 = r.get_named("created_ts").unwrap_or(0);
+                out.push(serde_json::json!({
+                    "project_id": project_id,
+                    "id": id,
+                    "subject": subject,
+                    "from": from,
+                    "created_ts": mcp_agent_mail_db::micros_to_iso(created_ts),
+                }));
             }
+
+            if out.is_empty() {
+                ftui_runtime::ftui_println!("No results.");
+                return Ok(());
+            }
+
+            let payload = serde_json::json!({ "result": out });
+            if json {
+                ftui_runtime::ftui_println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                );
+                return Ok(());
+            }
+
+            let title = format!("Product search: '{query}'");
+            let rows = payload
+                .get("result")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| {
+                    vec![
+                        r.get("project_id").cloned().unwrap_or_default().to_string(),
+                        r.get("id").cloned().unwrap_or_default().to_string(),
+                        r.get("subject")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        r.get("from")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        r.get("created_ts")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            print_table(
+                Some(&title),
+                &["project_id", "id", "subject", "from", "created_ts"],
+                rows,
+            );
             Ok(())
         }
         ProductsCommand::Inbox {
@@ -3021,103 +5423,322 @@ fn handle_products(action: ProductsCommand) -> CliResult<()> {
             agent,
             limit,
             urgent_only,
-            all: _,
+            all,
             include_bodies,
-            no_bodies: _,
+            no_bodies,
             since_ts,
+            json,
         } => {
-            let mut sql = String::from(
-                "SELECT m.id, m.subject, m.importance, m.created_ts, m.body_md, \
-                        sa.name AS sender_name, p.slug AS project_slug \
-                 FROM messages m \
-                 JOIN inbox i ON i.message_id = m.id \
-                 JOIN agents recv_a ON recv_a.id = i.agent_id \
-                 JOIN agents sa ON sa.id = m.sender_id \
-                 JOIN projects p ON p.id = m.project_id \
-                 JOIN product_links pl ON pl.project_slug = p.slug \
-                 WHERE pl.product_key = ? AND recv_a.name = ?",
-            );
-            let mut params: Vec<sqlmodel_core::Value> = vec![
-                sqlmodel_core::Value::Text(product_key),
-                sqlmodel_core::Value::Text(agent),
-            ];
-            if urgent_only {
-                sql.push_str(" AND m.importance IN ('high', 'urgent')");
-            }
-            if let Some(ref ts) = since_ts {
-                if let Some(us) = mcp_agent_mail_db::timestamps::iso_to_micros(ts) {
-                    sql.push_str(" AND m.created_ts > ?");
-                    params.push(sqlmodel_core::Value::BigInt(us));
+            let urgent_only = resolve_bool(urgent_only, all, false);
+            let include_bodies = resolve_bool(include_bodies, no_bodies, false);
+
+            // Prefer server tool, but fall back to local DB if server is unreachable or
+            // returns an empty result set.
+            let server_result = if let Some(url) = server_url {
+                try_call_server_tool(
+                    url,
+                    bearer,
+                    "fetch_inbox_product",
+                    serde_json::json!({
+                        "product_key": product_key,
+                        "agent_name": agent,
+                        "limit": limit,
+                        "urgent_only": urgent_only,
+                        "include_bodies": include_bodies,
+                        "since_ts": since_ts.clone().unwrap_or_default(),
+                    }),
+                )
+                .await
+                .and_then(coerce_tool_result_json)
+            } else {
+                None
+            };
+
+            let mut items: Vec<serde_json::Value> = match server_result {
+                Some(v) => match v {
+                    serde_json::Value::Array(a) => a,
+                    serde_json::Value::Object(obj) => obj
+                        .get("result")
+                        .and_then(|r| r.as_array())
+                        .cloned()
+                        .unwrap_or_default(),
+                    _ => Vec::new(),
+                },
+                None => Vec::new(),
+            };
+
+            if items.is_empty() {
+                // Local fallback.
+                if let Some(prod) = get_product_by_key(cx, pool, product_key.trim()).await? {
+                    let prod_id = prod.id.unwrap_or(0);
+                    let projects =
+                        match mcp_agent_mail_db::queries::list_product_projects(cx, pool, prod_id)
+                            .await
+                        {
+                            asupersync::Outcome::Ok(v) => v,
+                            asupersync::Outcome::Err(e) => {
+                                return Err(CliError::Other(format!("project list failed: {e}")));
+                            }
+                            asupersync::Outcome::Cancelled(_) => {
+                                return Err(CliError::Other("request cancelled".to_string()));
+                            }
+                            asupersync::Outcome::Panicked(p) => {
+                                return Err(CliError::Other(format!(
+                                    "internal panic: {}",
+                                    p.message()
+                                )));
+                            }
+                        };
+
+                    let since_micros = since_ts
+                        .as_deref()
+                        .and_then(mcp_agent_mail_db::iso_to_micros);
+                    let max_messages = usize::try_from(limit.max(0)).unwrap_or(0);
+
+                    let mut merged: Vec<(i64, i64, serde_json::Value)> = Vec::new();
+                    for p in projects {
+                        let project_id = p.id.unwrap_or(0);
+                        let agent_row = match mcp_agent_mail_db::queries::get_agent(
+                            cx, pool, project_id, &agent,
+                        )
+                        .await
+                        {
+                            asupersync::Outcome::Ok(a) => a,
+                            _ => continue, // legacy: skip missing agent in project
+                        };
+                        let rows = match mcp_agent_mail_db::queries::fetch_inbox(
+                            cx,
+                            pool,
+                            project_id,
+                            agent_row.id.unwrap_or(0),
+                            urgent_only,
+                            since_micros,
+                            max_messages,
+                        )
+                        .await
+                        {
+                            asupersync::Outcome::Ok(v) => v,
+                            _ => continue,
+                        };
+                        for row in rows {
+                            let msg = row.message;
+                            let id = msg.id.unwrap_or(0);
+                            let created_ts = msg.created_ts;
+                            let mut obj = serde_json::json!({
+                                "id": id,
+                                "project_id": msg.project_id,
+                                "subject": msg.subject,
+                                "importance": msg.importance,
+                                "ack_required": msg.ack_required != 0,
+                                "created_ts": mcp_agent_mail_db::micros_to_iso(created_ts),
+                                "from": row.sender_name,
+                                "kind": row.kind,
+                            });
+                            if include_bodies {
+                                obj.as_object_mut().unwrap().insert(
+                                    "body_md".to_string(),
+                                    serde_json::Value::String(msg.body_md),
+                                );
+                            }
+                            merged.push((created_ts, id, obj));
+                        }
+                    }
+
+                    merged.sort_by(|(a_ts, a_id, _), (b_ts, b_id, _)| {
+                        b_ts.cmp(a_ts).then_with(|| a_id.cmp(b_id))
+                    });
+                    items = merged
+                        .into_iter()
+                        .take(max_messages)
+                        .map(|(_, _, v)| v)
+                        .collect();
                 }
             }
-            sql.push_str(" ORDER BY m.created_ts DESC LIMIT ?");
-            params.push(sqlmodel_core::Value::BigInt(limit));
 
-            let rows = conn.query_sync(&sql, &params).unwrap_or_default();
-
-            if rows.is_empty() {
-                ftui_runtime::ftui_println!("No messages.");
+            if items.is_empty() {
+                ftui_runtime::ftui_println!("No messages found.");
                 return Ok(());
             }
-            for r in &rows {
-                let id: i64 = r.get_named("id").unwrap_or(0);
-                let subject: String = r.get_named("subject").unwrap_or_default();
-                let sender: String = r.get_named("sender_name").unwrap_or_default();
-                let importance: String = r.get_named("importance").unwrap_or_default();
+
+            if json {
                 ftui_runtime::ftui_println!(
-                    "  [{}] {} (from {}) [{}]",
-                    id,
-                    subject,
-                    sender,
-                    importance
+                    "{}",
+                    serde_json::to_string_pretty(&items).unwrap_or_default()
                 );
-                if include_bodies {
-                    let body: String = r.get_named("body_md").unwrap_or_default();
-                    for line in body.lines().take(5) {
-                        ftui_runtime::ftui_println!("    {line}");
-                    }
-                }
+                return Ok(());
             }
+
+            let title = format!("Inbox for {agent} in product '{product_key}'");
+            let rows = items
+                .iter()
+                .map(|r| {
+                    vec![
+                        r.get("project_id").cloned().unwrap_or_default().to_string(),
+                        r.get("id").cloned().unwrap_or_default().to_string(),
+                        r.get("subject")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        r.get("from")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        r.get("importance")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        r.get("created_ts")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            print_table(
+                Some(&title),
+                &[
+                    "project_id",
+                    "id",
+                    "subject",
+                    "from",
+                    "importance",
+                    "created_ts",
+                ],
+                rows,
+            );
             Ok(())
         }
         ProductsCommand::SummarizeThread {
-            product_key: _,
+            product_key,
             thread_id,
             per_thread_limit,
-            no_llm: _,
+            no_llm,
+            json,
         } => {
-            let limit = per_thread_limit.unwrap_or(50);
-            let rows = conn
-                .query_sync(
-                    "SELECT m.id, m.subject, m.body_md, m.created_ts, \
-                            sa.name AS sender_name \
-                     FROM messages m \
-                     JOIN agents sa ON sa.id = m.sender_id \
-                     WHERE m.thread_id = ? \
-                     ORDER BY m.created_ts ASC \
-                     LIMIT ?",
-                    &[
-                        sqlmodel_core::Value::Text(thread_id.clone()),
-                        sqlmodel_core::Value::BigInt(limit),
-                    ],
+            let server_result = if let Some(url) = server_url {
+                try_call_server_tool(
+                    url,
+                    bearer,
+                    "summarize_thread_product",
+                    serde_json::json!({
+                        "product_key": product_key,
+                        "thread_id": thread_id,
+                        "include_examples": true,
+                        "llm_mode": !no_llm,
+                        "per_thread_limit": per_thread_limit,
+                    }),
                 )
-                .unwrap_or_default();
+                .await
+                .and_then(coerce_tool_result_json)
+            } else {
+                None
+            };
 
-            if rows.is_empty() {
-                ftui_runtime::ftui_println!("No messages found for thread: {thread_id}");
+            let Some(payload) = server_result else {
+                ftui_runtime::ftui_println!(
+                    "Server unavailable; summarization requires server tool. Try again when server is running."
+                );
+                return Err(CliError::ExitCode(2));
+            };
+
+            if json {
+                ftui_runtime::ftui_println!(
+                    "{}",
+                    serde_json::to_string_pretty(&payload).unwrap_or_default()
+                );
                 return Ok(());
             }
 
-            ftui_runtime::ftui_println!("Thread: {thread_id} ({} messages)", rows.len());
-            ftui_runtime::ftui_println!("---");
-            for r in &rows {
-                let sender: String = r.get_named("sender_name").unwrap_or_default();
-                let subject: String = r.get_named("subject").unwrap_or_default();
-                let body: String = r.get_named("body_md").unwrap_or_default();
-                ftui_runtime::ftui_println!("{sender}: {subject}");
-                let preview: String = body.lines().take(3).collect::<Vec<_>>().join(" ");
-                if !preview.is_empty() {
-                    ftui_runtime::ftui_println!("  {preview}");
+            let summary = payload.get("summary").cloned().unwrap_or_default();
+            let participants = summary
+                .get("participants")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+
+            let kv_rows = vec![
+                vec!["participants".to_string(), participants],
+                vec![
+                    "total_messages".to_string(),
+                    summary
+                        .get("total_messages")
+                        .cloned()
+                        .unwrap_or_default()
+                        .to_string(),
+                ],
+                vec![
+                    "open_actions".to_string(),
+                    summary
+                        .get("open_actions")
+                        .cloned()
+                        .unwrap_or_default()
+                        .to_string(),
+                ],
+                vec![
+                    "done_actions".to_string(),
+                    summary
+                        .get("done_actions")
+                        .cloned()
+                        .unwrap_or_default()
+                        .to_string(),
+                ],
+            ];
+            let title = format!("Thread summary: {thread_id}");
+            print_table(Some(&title), &["Key", "Value"], kv_rows);
+
+            if let Some(points) = summary.get("key_points").and_then(|v| v.as_array()) {
+                if !points.is_empty() {
+                    let rows = points
+                        .iter()
+                        .map(|p| vec![p.as_str().unwrap_or("").to_string()])
+                        .collect::<Vec<_>>();
+                    ftui_runtime::ftui_println!();
+                    print_table(Some("Key Points"), &["point"], rows);
+                }
+            }
+            if let Some(items) = summary.get("action_items").and_then(|v| v.as_array()) {
+                if !items.is_empty() {
+                    let rows = items
+                        .iter()
+                        .map(|p| vec![p.as_str().unwrap_or("").to_string()])
+                        .collect::<Vec<_>>();
+                    ftui_runtime::ftui_println!();
+                    print_table(Some("Action Items"), &["item"], rows);
+                }
+            }
+            if let Some(examples) = payload.get("examples").and_then(|v| v.as_array()) {
+                if !examples.is_empty() {
+                    let rows = examples
+                        .iter()
+                        .map(|e| {
+                            vec![
+                                e.get("id").cloned().unwrap_or_default().to_string(),
+                                e.get("subject")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                e.get("from")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                e.get("created_ts")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                            ]
+                        })
+                        .collect::<Vec<_>>();
+                    ftui_runtime::ftui_println!();
+                    print_table(
+                        Some("Examples"),
+                        &["id", "subject", "from", "created_ts"],
+                        rows,
+                    );
                 }
             }
             Ok(())
@@ -3302,13 +5923,17 @@ fn guess_content_type(path: &Path) -> &'static str {
 }
 
 fn format_bytes(bytes: u64) -> String {
-    if bytes < 1024 {
-        format!("{bytes} B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else if bytes < 1024 * 1024 * 1024 {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
-    } else {
-        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    let units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut current = bytes as f64;
+    for (idx, unit) in units.iter().enumerate() {
+        let is_last = idx == units.len() - 1;
+        if current < 1024.0 || is_last {
+            if *unit == "B" {
+                return format!("{bytes} {unit}");
+            }
+            return format!("{:.1} {unit}", current);
+        }
+        current /= 1024.0;
     }
+    format!("{bytes} B")
 }

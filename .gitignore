@@ -17,3 +17,9 @@ tests/artifacts/
 
 # bv (beads viewer) local config and caches
 .bv/
+
+# Profiling artifacts
+perf.data
+
+# Conformance scratch runs (legacy python reference generator)
+crates/mcp-agent-mail-conformance/tests/conformance/python_reference/_scratch/

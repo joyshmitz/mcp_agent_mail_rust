@@ -1,10 +1,12 @@
 #![forbid(unsafe_code)]
 
 use asupersync::http::h1::listener::Http1Listener;
+use asupersync::http::h1::HttpClient;
 use asupersync::http::h1::types::{
     Method as Http1Method, Request as Http1Request, Response as Http1Response, default_reason,
 };
 use asupersync::runtime::RuntimeBuilder;
+use asupersync::time::{timeout, wall_now};
 use asupersync::{Budget, Cx};
 use fastmcp::prelude::*;
 use fastmcp_core::{McpError, McpErrorCode, SessionState, block_on};
@@ -13,6 +15,8 @@ use fastmcp_server::Session;
 use fastmcp_transport::http::{
     HttpHandlerConfig, HttpMethod as McpHttpMethod, HttpRequest, HttpRequestHandler, HttpResponse,
 };
+use jsonwebtoken::jwk::JwkSet;
+use jsonwebtoken::{DecodingKey, Validation};
 use mcp_agent_mail_db::{
     DbPoolConfig, QueryTracker, active_tracker, create_pool, set_active_tracker,
 };
@@ -34,7 +38,7 @@ use mcp_agent_mail_tools::{
     UninstallPrecommitGuard, ViewsAckOverdueResource, ViewsAckRequiredResource,
     ViewsAcksStaleResource, ViewsUrgentUnreadResource, Whois, clusters,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -372,6 +376,21 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+const JWKS_CACHE_TTL: Duration = Duration::from_secs(60);
+const JWKS_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone)]
+struct JwtContext {
+    roles: Vec<String>,
+    sub: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct JwksCacheEntry {
+    fetched_at: Instant,
+    jwks: Arc<JwkSet>,
+}
+
 struct HttpState {
     router: Arc<fastmcp_server::Router>,
     server_info: fastmcp_protocol::ServerInfo,
@@ -380,6 +399,8 @@ struct HttpState {
     rate_limiter: Arc<RateLimiter>,
     request_timeout_secs: u64,
     handler: Arc<HttpRequestHandler>,
+    jwks_http_client: HttpClient,
+    jwks_cache: Mutex<Option<JwksCacheEntry>>,
 }
 
 impl HttpState {
@@ -404,6 +425,8 @@ impl HttpState {
             rate_limiter: Arc::new(RateLimiter::new()),
             request_timeout_secs: 30,
             handler,
+            jwks_http_client: HttpClient::new(),
+            jwks_cache: Mutex::new(None),
         }
     }
 
@@ -445,7 +468,7 @@ impl HttpState {
             return resp;
         }
 
-        if let Some(resp) = self.check_rbac_and_rate_limit(&req, &json_rpc) {
+        if let Some(resp) = self.check_rbac_and_rate_limit(&req, &json_rpc).await {
             return resp;
         }
 
@@ -546,7 +569,195 @@ impl HttpState {
         None
     }
 
-    fn check_rbac_and_rate_limit(
+    async fn fetch_jwks(&self, url: &str, force: bool) -> Result<Arc<JwkSet>, ()> {
+        if !force {
+            let cached = self
+                .jwks_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(entry) = cached {
+                if entry.fetched_at.elapsed() < JWKS_CACHE_TTL {
+                    return Ok(entry.jwks);
+                }
+            }
+        }
+
+        let fut = Box::pin(self.jwks_http_client.get(url));
+        let Ok(Ok(resp)) = timeout(wall_now(), JWKS_FETCH_TIMEOUT, fut).await else {
+            return Err(());
+        };
+        if resp.status != 200 {
+            return Err(());
+        }
+        let jwks: JwkSet = serde_json::from_slice(&resp.body).map_err(|_| ())?;
+        let jwks = Arc::new(jwks);
+
+        {
+            let mut cache = self
+                .jwks_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *cache = Some(JwksCacheEntry {
+                fetched_at: Instant::now(),
+                jwks: Arc::clone(&jwks),
+            });
+        }
+        Ok(jwks)
+    }
+
+    fn parse_bearer_token(req: &Http1Request) -> Result<&str, ()> {
+        let Some(auth) = header_value(req, "authorization") else {
+            return Err(());
+        };
+        let auth = auth.trim();
+        let Some(token) = auth.strip_prefix("Bearer ").map(str::trim) else {
+            return Err(());
+        };
+        if token.is_empty() {
+            return Err(());
+        }
+        Ok(token)
+    }
+
+    fn jwt_algorithms(&self) -> Vec<jsonwebtoken::Algorithm> {
+        let mut algorithms: Vec<jsonwebtoken::Algorithm> = self
+            .config
+            .http_jwt_algorithms
+            .iter()
+            .filter_map(|s| s.parse::<jsonwebtoken::Algorithm>().ok())
+            .collect();
+        if algorithms.is_empty() {
+            algorithms.push(jsonwebtoken::Algorithm::HS256);
+        }
+        algorithms
+    }
+
+    async fn jwt_decoding_key(&self, kid: Option<&str>) -> Result<DecodingKey, ()> {
+        if let Some(jwks_url) = self
+            .config
+            .http_jwt_jwks_url
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            // Cache JWKS fetches; if kid is missing from the cached set, force refresh once.
+            let jwks = self.fetch_jwks(jwks_url, false).await?;
+            let jwk = if let Some(kid) = kid {
+                if let Some(jwk) = jwks.find(kid).cloned() {
+                    jwk
+                } else {
+                    let jwks = self.fetch_jwks(jwks_url, true).await?;
+                    jwks.find(kid).cloned().ok_or(())?
+                }
+            } else {
+                jwks.keys.first().cloned().ok_or(())?
+            };
+            DecodingKey::from_jwk(&jwk).map_err(|_| ())
+        } else if let Some(secret) = self
+            .config
+            .http_jwt_secret
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            Ok(DecodingKey::from_secret(secret.as_bytes()))
+        } else {
+            Err(())
+        }
+    }
+
+    fn jwt_validation(mut algorithms: Vec<jsonwebtoken::Algorithm>) -> Validation {
+        if algorithms.is_empty() {
+            algorithms.push(jsonwebtoken::Algorithm::HS256);
+        }
+
+        let mut validation = Validation::new(algorithms[0]);
+        validation.algorithms = algorithms;
+        validation.required_spec_claims = HashSet::new();
+        validation.leeway = 0;
+        validation.validate_nbf = true;
+        // Legacy behavior: only validate audience when configured.
+        validation.validate_aud = false;
+        validation
+    }
+
+    fn validate_jwt_claims(&self, claims: &serde_json::Value) -> Result<(), ()> {
+        if let Some(expected) = self
+            .config
+            .http_jwt_issuer
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            let iss = claims.get("iss").and_then(|v| v.as_str()).unwrap_or("");
+            if iss != expected {
+                return Err(());
+            }
+        }
+
+        if let Some(expected) = self
+            .config
+            .http_jwt_audience
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            let ok = match claims.get("aud") {
+                Some(serde_json::Value::String(s)) => s == expected,
+                Some(serde_json::Value::Array(items)) => items
+                    .iter()
+                    .any(|v| v.as_str().is_some_and(|s| s == expected)),
+                _ => false,
+            };
+            if !ok {
+                return Err(());
+            }
+        }
+
+        Ok(())
+    }
+
+    fn jwt_roles_from_claims(&self, claims: &serde_json::Value) -> Vec<String> {
+        let mut roles = match claims.get(&self.config.http_jwt_role_claim) {
+            Some(serde_json::Value::String(s)) => vec![s.clone()],
+            Some(serde_json::Value::Array(items)) => items
+                .iter()
+                .map(|v| v.as_str().map_or_else(|| v.to_string(), ToString::to_string))
+                .collect(),
+            _ => Vec::new(),
+        };
+        roles.retain(|r| !r.trim().is_empty());
+        roles.sort();
+        roles.dedup();
+        if roles.is_empty() {
+            roles.push(self.config.http_rbac_default_role.clone());
+        }
+        roles
+    }
+
+    fn jwt_sub_from_claims(claims: &serde_json::Value) -> Option<String> {
+        claims
+            .get("sub")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string)
+            .filter(|s| !s.is_empty())
+    }
+
+    async fn decode_jwt(&self, req: &Http1Request) -> Result<JwtContext, ()> {
+        let token = Self::parse_bearer_token(req)?;
+        let algorithms = self.jwt_algorithms();
+        let header = jsonwebtoken::decode_header(token).map_err(|_| ())?;
+        let key = self.jwt_decoding_key(header.kid.as_deref()).await?;
+        let validation = Self::jwt_validation(algorithms);
+        let token_data =
+            jsonwebtoken::decode::<serde_json::Value>(token, &key, &validation).map_err(|_| ())?;
+        let claims = token_data.claims;
+
+        self.validate_jwt_claims(&claims)?;
+        let roles = self.jwt_roles_from_claims(&claims);
+        let sub = Self::jwt_sub_from_claims(&claims);
+
+        Ok(JwtContext { roles, sub })
+    }
+
+    async fn check_rbac_and_rate_limit(
         &self,
         req: &Http1Request,
         json_rpc: &JsonRpcRequest,
@@ -554,31 +765,30 @@ impl HttpState {
         let (kind, tool_name) = classify_request(json_rpc);
         let is_local_ok = self.allow_local_unauthenticated(req);
 
-        if self.config.http_jwt_enabled && !is_local_ok {
-            return Some(self.error_response(
-                req,
-                401,
-                "JWT auth is enabled but not implemented in Rust yet.",
-            ));
-        }
+        let (roles, jwt_sub) = if self.config.http_jwt_enabled {
+            match self.decode_jwt(req).await {
+                Ok(ctx) => (ctx.roles, ctx.sub),
+                Err(()) => return Some(self.error_response(req, 401, "Unauthorized")),
+            }
+        } else {
+            (vec![self.config.http_rbac_default_role.clone()], None)
+        };
 
-        // RBAC (JWT not implemented yet)
+        // RBAC (mirrors legacy python behavior)
         if self.config.http_rbac_enabled
             && !is_local_ok
             && matches!(kind, RequestKind::Tools | RequestKind::Resources)
         {
-            let roles = [self.config.http_rbac_default_role.clone()];
             let is_reader = roles
                 .iter()
                 .any(|r| self.config.http_rbac_reader_roles.contains(r));
             let is_writer = roles
                 .iter()
-                .any(|r| self.config.http_rbac_writer_roles.contains(r));
+                .any(|r| self.config.http_rbac_writer_roles.contains(r))
+                || roles.is_empty();
 
             if kind == RequestKind::Resources {
-                if !is_reader && !is_writer {
-                    return Some(self.error_response(req, 403, "Forbidden"));
-                }
+                // Legacy python allows resources regardless of role membership.
             } else if kind == RequestKind::Tools {
                 if let Some(ref name) = tool_name {
                     if self.config.http_rbac_readonly_tools.contains(name) {
@@ -597,7 +807,7 @@ impl HttpState {
         // Rate limiting (memory backend only)
         if self.config.http_rate_limit_enabled {
             let (rpm, burst) = rate_limits_for(&self.config, kind);
-            let identity = rate_limit_identity(req, None);
+            let identity = rate_limit_identity(req, jwt_sub.as_deref());
             let endpoint = tool_name.as_deref().unwrap_or("*");
             let key = format!("{kind}:{endpoint}:{identity}");
 
@@ -1622,7 +1832,7 @@ mod tests {
             &[("X-Forwarded-For", "1.2.3.4")],
             Some(peer),
         );
-        assert!(state.check_rbac_and_rate_limit(&req1, &json_rpc).is_none());
+        assert!(block_on(state.check_rbac_and_rate_limit(&req1, &json_rpc)).is_none());
 
         let req2 = make_request_with_peer_addr(
             Http1Method::Post,
@@ -1630,10 +1840,241 @@ mod tests {
             &[("X-Forwarded-For", "5.6.7.8")],
             Some(peer),
         );
-        let resp = state
-            .check_rbac_and_rate_limit(&req2, &json_rpc)
+        let resp = block_on(state.check_rbac_and_rate_limit(&req2, &json_rpc))
             .expect("rate limit should trigger");
         assert_eq!(resp.status, 429);
+    }
+
+    #[test]
+    fn jwt_enabled_requires_bearer_token() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let json_rpc = JsonRpcRequest::new("tools/list", None, 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(peer));
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc))
+            .expect("jwt should require Authorization header");
+        assert_eq!(resp.status, 401);
+    }
+
+    #[test]
+    fn jwt_hs256_secret_allows_valid_token() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let claims = serde_json::json!({ "sub": "user-123", "role": "writer" });
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        let token = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(b"secret"),
+        )
+        .expect("encode token");
+        let auth = format!("Bearer {token}");
+
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth.as_str())],
+            Some(peer),
+        );
+        let json_rpc = JsonRpcRequest::new("tools/list", None, 1);
+        assert!(block_on(state.check_rbac_and_rate_limit(&req, &json_rpc)).is_none());
+    }
+
+    #[test]
+    fn jwt_roles_enforced_for_tools() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_rbac_enabled: true,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let claims = serde_json::json!({ "sub": "user-123", "role": "reader" });
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        let token = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(b"secret"),
+        )
+        .expect("encode token");
+        let auth = format!("Bearer {token}");
+
+        let params = serde_json::json!({ "name": "send_message", "arguments": {} });
+        let json_rpc = JsonRpcRequest::new("tools/call", Some(params), 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth.as_str())],
+            Some(peer),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc))
+            .expect("reader should be forbidden for send_message");
+        assert_eq!(resp.status, 403);
+    }
+
+    #[test]
+    fn rate_limiting_uses_jwt_sub_identity() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_rbac_enabled: false,
+            http_rate_limit_enabled: true,
+            http_rate_limit_tools_per_minute: 1,
+            http_rate_limit_tools_burst: 1,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let claims = serde_json::json!({ "sub": "user-123", "role": "writer" });
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        let token = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_secret(b"secret"),
+        )
+        .expect("encode token");
+        let auth = format!("Bearer {token}");
+
+        let params = serde_json::json!({ "name": "health_check", "arguments": {} });
+        let json_rpc = JsonRpcRequest::new("tools/call", Some(params), 1);
+
+        let req1 = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth.as_str())],
+            Some(SocketAddr::from(([10, 0, 0, 1], 1111))),
+        );
+        assert!(block_on(state.check_rbac_and_rate_limit(&req1, &json_rpc)).is_none());
+
+        let req2 = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth.as_str())],
+            Some(SocketAddr::from(([10, 0, 0, 2], 2222))),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req2, &json_rpc))
+            .expect("rate limit should trigger by sub identity");
+        assert_eq!(resp.status, 429);
+    }
+
+    #[test]
+    fn jwt_hs256_jwks_allows_valid_token() {
+        use base64::Engine as _;
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        let secret = b"secret";
+        let k = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret);
+        let jwks = serde_json::json!({
+            "keys": [{
+                "kty": "oct",
+                "alg": "HS256",
+                "kid": "kid-1",
+                "k": k,
+            }]
+        });
+        let jwks_bytes = serde_json::to_vec(&jwks).expect("jwks json");
+
+        // Run a tiny blocking HTTP server on a dedicated OS thread. Using a separate
+        // thread avoids in-process deadlocks when both client and server are driven by
+        // a single-threaded async runtime.
+        std::thread::scope(|s| {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind jwks listener");
+            listener
+                .set_nonblocking(true)
+                .expect("set_nonblocking");
+            let addr = listener.local_addr().expect("listener addr");
+            let jwks_body = jwks_bytes.clone();
+            let accepted = Arc::new(AtomicBool::new(false));
+            let accepted2 = Arc::clone(&accepted);
+
+            s.spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    match listener.accept() {
+                        Ok((mut stream, _peer)) => {
+                            accepted2.store(true, Ordering::SeqCst);
+                            let status = "200 OK";
+                            let body: &[u8] = jwks_body.as_slice();
+
+                            let header = format!(
+                                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(header.as_bytes());
+                            let _ = stream.write_all(body);
+                            let _ = stream.flush();
+                            return;
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() > deadline {
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => return,
+                    }
+                }
+            });
+
+            let jwks_url = format!("http://{addr}/jwks");
+            let config = mcp_agent_mail_core::Config {
+                http_jwt_enabled: true,
+                http_jwt_algorithms: vec!["HS256".to_string()],
+                http_jwt_secret: None,
+                http_jwt_jwks_url: Some(jwks_url.clone()),
+                http_rbac_enabled: false,
+                ..Default::default()
+            };
+            let state = build_state(config);
+
+            runtime.block_on(async move {
+                let jwks = state.fetch_jwks(&jwks_url, true).await;
+                assert!(
+                    jwks.is_ok(),
+                    "fetch_jwks failed: {jwks:?}; accepted={}",
+                    accepted.load(Ordering::SeqCst)
+                );
+
+                let claims = serde_json::json!({ "sub": "user-123", "role": "writer" });
+                let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+                header.kid = Some("kid-1".to_string());
+                let token = jsonwebtoken::encode(
+                    &header,
+                    &claims,
+                    &jsonwebtoken::EncodingKey::from_secret(secret),
+                )
+                .expect("encode token");
+                let auth = format!("Bearer {token}");
+                let req = make_request_with_peer_addr(
+                    Http1Method::Post,
+                    "/api/",
+                    &[("Authorization", auth.as_str())],
+                    Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+                );
+                let json_rpc = JsonRpcRequest::new("tools/list", None, 1);
+                assert!(state.check_rbac_and_rate_limit(&req, &json_rpc).await.is_none());
+            });
+        });
     }
 
     // -- TOON wrapping tests --

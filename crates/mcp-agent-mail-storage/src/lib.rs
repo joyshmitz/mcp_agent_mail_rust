@@ -161,6 +161,7 @@ enum WbqMsg {
     // messages small and avoids repeatedly moving ~KB-sized values around.
     Op(Box<WriteOp>),
     Flush(std::sync::mpsc::SyncSender<()>),
+    Shutdown,
 }
 
 struct WriteBehindQueue {
@@ -198,12 +199,12 @@ pub fn wbq_start() {
 pub fn wbq_enqueue(op: WriteOp) -> bool {
     wbq_start();
     let wbq = WBQ.get().expect("WBQ must be initialised");
-    {
-        let mut s = wbq.stats.lock().unwrap_or_else(|e| e.into_inner());
-        s.enqueued += 1;
-    }
     match wbq.sender.try_send(WbqMsg::Op(Box::new(op))) {
-        Ok(()) => true,
+        Ok(()) => {
+            let mut s = wbq.stats.lock().unwrap_or_else(|e| e.into_inner());
+            s.enqueued += 1;
+            true
+        }
         Err(_) => {
             let mut s = wbq.stats.lock().unwrap_or_else(|e| e.into_inner());
             s.fallbacks += 1;
@@ -213,19 +214,32 @@ pub fn wbq_enqueue(op: WriteOp) -> bool {
 }
 
 /// Block until all pending write ops have been drained.
+///
+/// Uses a blocking `send` so the Flush message is guaranteed to enter the
+/// channel even when it is temporarily full.  If the drain thread has
+/// panicked (receiver dropped), `send` returns `Err` immediately – no
+/// deadlock risk.
 pub fn wbq_flush() {
     if let Some(wbq) = WBQ.get() {
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
-        if wbq.sender.try_send(WbqMsg::Flush(done_tx)).is_ok() {
+        if wbq.sender.send(WbqMsg::Flush(done_tx)).is_ok() {
             let _ = done_rx.recv_timeout(Duration::from_secs(30));
         }
     }
 }
 
-/// Drain remaining ops and join the worker thread.
+/// Drain remaining ops, stop the drain thread, and join it.
+///
+/// Sends a `Shutdown` message after flushing so the drain thread exits
+/// its loop.  Without this, the thread would block on `recv_timeout`
+/// indefinitely because the sender lives in a `OnceLock` static and is
+/// never dropped.
 pub fn wbq_shutdown() {
     if let Some(wbq) = WBQ.get() {
         wbq_flush();
+        // Tell the drain thread to exit.  Use blocking `send` so it is
+        // guaranteed to be delivered (same rationale as wbq_flush).
+        let _ = wbq.sender.send(WbqMsg::Shutdown);
         let handle = {
             let mut guard = wbq.drain_handle.lock().unwrap_or_else(|e| e.into_inner());
             guard.take()
@@ -246,6 +260,7 @@ pub fn wbq_stats() -> WbqStats {
 fn wbq_drain_loop(rx: std::sync::mpsc::Receiver<WbqMsg>, stats: Arc<Mutex<WbqStats>>) {
     let flush_interval = Duration::from_millis(WBQ_FLUSH_INTERVAL_MS);
     let mut flush_waiters: Vec<std::sync::mpsc::SyncSender<()>> = Vec::new();
+    let mut shutting_down = false;
 
     loop {
         let mut batch: Vec<Box<WriteOp>> = Vec::new();
@@ -253,6 +268,7 @@ fn wbq_drain_loop(rx: std::sync::mpsc::Receiver<WbqMsg>, stats: Arc<Mutex<WbqSta
         match rx.recv_timeout(flush_interval) {
             Ok(WbqMsg::Op(op)) => batch.push(op),
             Ok(WbqMsg::Flush(done_tx)) => flush_waiters.push(done_tx),
+            Ok(WbqMsg::Shutdown) => shutting_down = true,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 for w in flush_waiters.drain(..) {
                     let _ = w.try_send(());
@@ -262,10 +278,12 @@ fn wbq_drain_loop(rx: std::sync::mpsc::Receiver<WbqMsg>, stats: Arc<Mutex<WbqSta
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
 
+        // Drain remaining items from the channel (up to batch cap).
         while batch.len() < WBQ_DRAIN_BATCH_CAP {
             match rx.try_recv() {
                 Ok(WbqMsg::Op(op)) => batch.push(op),
                 Ok(WbqMsg::Flush(done_tx)) => flush_waiters.push(done_tx),
+                Ok(WbqMsg::Shutdown) => shutting_down = true,
                 Err(_) => break,
             }
         }
@@ -288,8 +306,13 @@ fn wbq_drain_loop(rx: std::sync::mpsc::Receiver<WbqMsg>, stats: Arc<Mutex<WbqSta
         for w in flush_waiters.drain(..) {
             let _ = w.try_send(());
         }
+
+        if shutting_down {
+            break;
+        }
     }
 
+    // Drain any remaining messages after the loop exits.
     for msg in rx.try_iter() {
         match msg {
             WbqMsg::Op(op) => {
@@ -298,6 +321,7 @@ fn wbq_drain_loop(rx: std::sync::mpsc::Receiver<WbqMsg>, stats: Arc<Mutex<WbqSta
             WbqMsg::Flush(done_tx) => {
                 let _ = done_tx.try_send(());
             }
+            WbqMsg::Shutdown => {} // already shutting down
         }
     }
 }

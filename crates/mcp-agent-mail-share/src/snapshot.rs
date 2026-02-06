@@ -170,10 +170,10 @@ mod tests {
         let name: String = rows[0].get_named("name").unwrap();
         assert_eq!(name, "hello");
 
-        // Backup API should produce a byte-identical copy.
-        let source_bytes = std::fs::read(&source).unwrap();
-        let dest_bytes = std::fs::read(&dest).unwrap();
-        assert_eq!(source_bytes, dest_bytes);
+        // Verify integrity on the copied DB (byte-identical is not guaranteed).
+        let rows = copy_conn.query_sync("PRAGMA integrity_check", &[]).unwrap();
+        let result: String = rows[0].get_named("integrity_check").unwrap();
+        assert_eq!(result, "ok");
     }
 
     #[test]

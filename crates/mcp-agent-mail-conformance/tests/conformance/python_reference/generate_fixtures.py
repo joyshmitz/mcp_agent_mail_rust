@@ -21,7 +21,13 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "python_reference.json"
+_DEFAULT_FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "python_reference.json"
+# Allow callers (e.g. Rust CLI wrapper) to redirect fixture output to a temp file,
+# so tests don't need to touch the tracked fixture under `tests/conformance/fixtures/`.
+if "MCP_AGENT_MAIL_CONFORMANCE_FIXTURE_PATH" in os.environ:
+    FIXTURES = Path(os.environ["MCP_AGENT_MAIL_CONFORMANCE_FIXTURE_PATH"]).expanduser()
+else:
+    FIXTURES = _DEFAULT_FIXTURES
 
 LEGACY_VERSION = "legacy-python@0.3.0"
 GENERATED_AT = "1970-01-01T00:00:00Z"  # keep diffs clean
@@ -701,6 +707,7 @@ def main() -> None:
         print(f"[fixture-gen] ERROR: {exc}", file=sys.stderr)
         raise
 
+    FIXTURES.parent.mkdir(parents=True, exist_ok=True)
     FIXTURES.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     print(f"Wrote fixtures to {FIXTURES}")
 

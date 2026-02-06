@@ -182,7 +182,7 @@ pub(crate) mod tool_util {
         };
         let project = db_outcome_to_mcp_result(out)?;
         // Populate cache on miss
-        mcp_agent_mail_db::read_cache().put_project(&project.slug, &project);
+        mcp_agent_mail_db::read_cache().put_project(&project);
         Ok(project)
     }
 
@@ -200,7 +200,7 @@ pub(crate) mod tool_util {
             mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, agent_name).await;
         let agent = db_outcome_to_mcp_result(out)?;
         // Populate cache on miss
-        mcp_agent_mail_db::read_cache().put_agent(project_id, &agent.name, &agent);
+        mcp_agent_mail_db::read_cache().put_agent(&agent);
         Ok(agent)
     }
 

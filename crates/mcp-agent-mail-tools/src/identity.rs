@@ -291,7 +291,7 @@ Check that all parameters have valid values."
 
     // Invalidate + repopulate read cache after mutation
     mcp_agent_mail_db::read_cache().invalidate_agent(project_id, &row.name);
-    mcp_agent_mail_db::read_cache().put_agent(project_id, &row.name, &row);
+    mcp_agent_mail_db::read_cache().put_agent(&row);
 
     // Write agent profile to git archive (best-effort)
     let config = Config::from_env();
@@ -440,7 +440,7 @@ Choose a different name (or omit the name to auto-generate one)."
 
     // Invalidate + repopulate read cache after mutation
     mcp_agent_mail_db::read_cache().invalidate_agent(project_id, &row.name);
-    mcp_agent_mail_db::read_cache().put_agent(project_id, &row.name, &row);
+    mcp_agent_mail_db::read_cache().put_agent(&row);
 
     // Write agent profile to git archive (best-effort)
     let config = Config::from_env();

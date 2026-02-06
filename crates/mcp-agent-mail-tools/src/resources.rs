@@ -12,9 +12,9 @@
 use fastmcp::McpErrorCode;
 use fastmcp::prelude::*;
 use mcp_agent_mail_core::Config;
-use mcp_agent_mail_db::micros_to_iso;
+use mcp_agent_mail_db::{iso_to_micros, micros_to_iso};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -30,6 +30,15 @@ fn split_param_and_query(input: &str) -> (String, HashMap<String, String>) {
     } else {
         (input.to_string(), HashMap::new())
     }
+}
+
+/// Parse a boolean query parameter, accepting the same truthy values as Python:
+/// `"1"`, `"true"`, `"t"`, `"yes"`, `"y"` (case-insensitive, whitespace-trimmed).
+fn parse_bool_param(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "true" | "1" | "t" | "yes" | "y"
+    )
 }
 
 fn parse_query(query: &str) -> HashMap<String, String> {
@@ -1873,9 +1882,9 @@ pub async fn product_details(ctx: &McpContext, key: String) -> McpResult<String>
 
         let sql = "SELECT * FROM products WHERE product_uid = ? OR name = ? LIMIT 1";
         let params = [Value::Text(key.to_string()), Value::Text(key.to_string())];
-        let rows = conn
-            .query_sync(sql, &params)
-            .map_err(|e| McpError::internal_error(e.to_string()))?;
+    let rows = conn
+        .query_sync(sql, &params)
+        .map_err(|e| McpError::internal_error(e.to_string()))?;
         let Some(row) = rows.into_iter().next() else {
             return Ok(None);
         };
@@ -2039,7 +2048,7 @@ pub async fn thread_details(ctx: &McpContext, thread_id: String) -> McpResult<St
     let (thread_id_str, query) = split_param_and_query(&thread_id);
 
     let project_key = query.get("project").cloned().unwrap_or_default();
-    let include_bodies = query.get("include_bodies").is_some_and(|v| v == "true");
+    let include_bodies = query.get("include_bodies").is_some_and(|v| parse_bool_param(v));
 
     if project_key.is_empty() {
         return Err(McpError::new(
@@ -2172,7 +2181,9 @@ pub async fn inbox(ctx: &McpContext, agent: String) -> McpResult<String> {
     let (agent_name, query) = split_param_and_query(&agent);
 
     let project_key = query.get("project").cloned().unwrap_or_default();
-    let include_bodies = query.get("include_bodies").is_some_and(|v| v == "true");
+    let include_bodies = query.get("include_bodies").is_some_and(|v| parse_bool_param(v));
+    let urgent_only = query.get("urgent_only").is_some_and(|v| parse_bool_param(v));
+    let since_ts: Option<i64> = query.get("since_ts").and_then(|v| iso_to_micros(v));
     let limit = query
         .get("limit")
         .and_then(|v| v.parse::<usize>().ok())
@@ -2217,8 +2228,8 @@ pub async fn inbox(ctx: &McpContext, agent: String) -> McpResult<String> {
             &pool,
             project_id,
             agent_id,
-            false, // urgent_only
-            None,  // since_ts
+            urgent_only,
+            since_ts,
             limit,
         )
         .await,
@@ -2612,7 +2623,8 @@ pub async fn outbox(ctx: &McpContext, agent: String) -> McpResult<String> {
         .get("limit")
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
-    let _include_bodies = query.get("include_bodies").is_some_and(|v| v == "true");
+    let include_bodies = query.get("include_bodies").is_some_and(|v| parse_bool_param(v));
+    let since_ts: Option<i64> = query.get("since_ts").and_then(|v| iso_to_micros(v));
 
     if project_key.is_empty() {
         return Err(McpError::new(
@@ -2658,19 +2670,40 @@ pub async fn outbox(ctx: &McpContext, agent: String) -> McpResult<String> {
     };
 
     let limit_i64 = i64::try_from(limit).unwrap_or(20);
-    let sql = "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
-               m.importance, m.ack_required, m.created_ts, m.attachments \
-               FROM messages m \
-               WHERE m.sender_id = ? AND m.project_id = ? \
-               ORDER BY m.created_ts DESC LIMIT ?";
-    let params = [
-        Value::BigInt(agent_id),
-        Value::BigInt(project_id),
-        Value::BigInt(limit_i64),
-    ];
+    #[allow(clippy::option_if_let_else)]
+    let (sql, params): (String, Vec<Value>) = if let Some(ts) = since_ts {
+        (
+            "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
+             m.importance, m.ack_required, m.created_ts, m.attachments \
+             FROM messages m \
+             WHERE m.sender_id = ? AND m.project_id = ? AND m.created_ts > ? \
+             ORDER BY m.created_ts DESC LIMIT ?"
+                .to_string(),
+            vec![
+                Value::BigInt(agent_id),
+                Value::BigInt(project_id),
+                Value::BigInt(ts),
+                Value::BigInt(limit_i64),
+            ],
+        )
+    } else {
+        (
+            "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
+             m.importance, m.ack_required, m.created_ts, m.attachments \
+             FROM messages m \
+             WHERE m.sender_id = ? AND m.project_id = ? \
+             ORDER BY m.created_ts DESC LIMIT ?"
+                .to_string(),
+            vec![
+                Value::BigInt(agent_id),
+                Value::BigInt(project_id),
+                Value::BigInt(limit_i64),
+            ],
+        )
+    };
 
     let rows = conn
-        .query_sync(sql, &params)
+        .query_sync(&sql, &params)
         .map_err(|e| McpError::internal_error(e.to_string()))?;
 
     let mut messages: Vec<OutboxMessageEntry> = Vec::new();
@@ -2680,7 +2713,11 @@ pub async fn outbox(ctx: &McpContext, agent: String) -> McpResult<String> {
         let sender_id: i64 = row.get_named("sender_id").unwrap_or(0);
         let thread_id: Option<String> = row.get_named("thread_id").ok();
         let subject: String = row.get_named("subject").unwrap_or_default();
-        let body_md: String = row.get_named("body_md").unwrap_or_default();
+        let body_md: String = if include_bodies {
+            row.get_named("body_md").unwrap_or_default()
+        } else {
+            String::new()
+        };
         let importance: String = row.get_named("importance").unwrap_or_default();
         let ack_required: i64 = row.get_named("ack_required").unwrap_or(0);
         let attachments_json: String = row.get_named("attachments").unwrap_or_default();
@@ -3035,6 +3072,10 @@ pub async fn views_ack_overdue(ctx: &McpContext, agent: String) -> McpResult<Str
         .get("limit")
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
+    let _ttl_minutes: u64 = query
+        .get("ttl_minutes")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
 
     if project_key.is_empty() {
         return Err(McpError::new(
@@ -3124,12 +3165,6 @@ fn reservation_system_time_to_micros(t: SystemTime) -> Option<i64> {
     i64::try_from(dur.as_micros()).ok()
 }
 
-fn reservation_mtime_micros(path: &Path) -> Option<i64> {
-    let meta = std::fs::metadata(path).ok()?;
-    let modified = meta.modified().ok()?;
-    reservation_system_time_to_micros(modified)
-}
-
 fn reservation_path_to_slash_string(path: &Path) -> String {
     path.to_string_lossy()
         .replace('\\', "/")
@@ -3148,37 +3183,86 @@ fn reservation_git_pathspec(workspace_rel: &Path, normalized_pattern: &str) -> S
     out
 }
 
-fn reservation_git_latest_activity_micros(
-    repo_root: &Path,
-    pathspec: &str,
-    use_glob_magic: bool,
-) -> Option<i64> {
-    if pathspec.trim().is_empty() {
+fn reservation_git_latest_activity_micros(repo_root: &Path, pathspecs: &[String]) -> Option<i64> {
+    if pathspecs.is_empty() {
         return None;
     }
 
-    let arg = if use_glob_magic {
-        format!(":(glob){pathspec}")
-    } else {
-        pathspec.to_string()
-    };
+    // Chunk to avoid exceeding OS arg limits when globs expand to many matches.
+    let mut best: Option<i64> = None;
+    for chunk in pathspecs.chunks(128) {
+        let Ok(out) = Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["log", "-1", "--format=%ct", "--"])
+            .args(chunk)
+            .output()
+        else {
+            continue;
+        };
 
-    // `git log -1 --format=%ct -- <pathspec>` returns commit unix seconds.
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["log", "-1", "--format=%ct", "--"])
-        .arg(arg)
-        .output()
-        .ok()?;
+        if !out.status.success() {
+            continue;
+        }
 
-    if !out.status.success() {
-        return None;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let Ok(secs) = stdout.trim().parse::<i64>() else {
+            continue;
+        };
+        let micros = secs.saturating_mul(1_000_000);
+        best = Some(best.map_or(micros, |prev| prev.max(micros)));
     }
 
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let secs: i64 = stdout.trim().parse().ok()?;
-    Some(secs.saturating_mul(1_000_000))
+    best
+}
+
+fn reservation_pathspec_has_ancestor_dir(spec: &str, kept_dirs: &HashSet<String>) -> bool {
+    let mut cur = spec;
+    while let Some((parent, _)) = cur.rsplit_once('/') {
+        if kept_dirs.contains(parent) {
+            return true;
+        }
+        cur = parent;
+    }
+    false
+}
+
+fn reservation_compress_git_pathspecs(specs: Vec<(String, bool)>) -> Vec<String> {
+    if specs.is_empty() {
+        return Vec::new();
+    }
+
+    // Dedupe and remember "is_dir" if any occurrence was a directory.
+    let mut by_spec: HashMap<String, bool> = HashMap::new();
+    for (spec, is_dir) in specs {
+        let spec = spec.trim().trim_end_matches('/').to_string();
+        if spec.is_empty() {
+            continue;
+        }
+        by_spec
+            .entry(spec)
+            .and_modify(|v| *v = *v || is_dir)
+            .or_insert(is_dir);
+    }
+
+    let mut entries: Vec<(String, bool)> = by_spec.into_iter().collect();
+    entries.sort_by_key(|(spec, _)| spec.len());
+
+    let mut kept_dirs: HashSet<String> = HashSet::new();
+    let mut out: Vec<String> = Vec::with_capacity(entries.len());
+
+    for (spec, is_dir) in entries {
+        if reservation_pathspec_has_ancestor_dir(&spec, &kept_dirs) {
+            continue;
+        }
+
+        if is_dir {
+            kept_dirs.insert(spec.clone());
+        }
+        out.push(spec);
+    }
+
+    out
 }
 
 fn reservation_compute_pattern_activity(
@@ -3196,6 +3280,9 @@ fn reservation_compute_pattern_activity(
         return ReservationPatternActivity::default();
     }
 
+    let want_git = repo_root.is_some() && workspace_rel.is_some();
+    let mut git_specs: Vec<(String, bool)> = Vec::new();
+
     let has_glob = reservation_contains_glob(&normalized);
     let mut matches = false;
     let mut fs_latest: Option<i64> = None;
@@ -3206,8 +3293,34 @@ fn reservation_compute_pattern_activity(
             for entry in iter {
                 let Ok(path) = entry else { continue };
                 matches = true;
-                if let Some(ts) = reservation_mtime_micros(&path) {
-                    fs_latest = Some(fs_latest.map_or(ts, |prev| prev.max(ts)));
+
+                let mut is_dir = false;
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    is_dir = meta.is_dir();
+                    if let Ok(modified) = meta.modified() {
+                        if let Some(ts) = reservation_system_time_to_micros(modified) {
+                            fs_latest = Some(fs_latest.map_or(ts, |prev| prev.max(ts)));
+                        }
+                    }
+                }
+
+                if want_git {
+                    if let Ok(rel_ws) = path.strip_prefix(workspace) {
+                        let rel_slash = reservation_path_to_slash_string(rel_ws);
+                        if rel_slash.is_empty() {
+                            // Edge case: glob yielded the workspace root itself.
+                            let mut spec = reservation_path_to_slash_string(workspace_rel.unwrap())
+                                .trim_end_matches('/')
+                                .to_string();
+                            if spec.is_empty() {
+                                spec = ".".to_string();
+                            }
+                            git_specs.push((spec, true));
+                        } else {
+                            let spec = reservation_git_pathspec(workspace_rel.unwrap(), &rel_slash);
+                            git_specs.push((spec, is_dir));
+                        }
+                    }
                 }
             }
         }
@@ -3215,18 +3328,25 @@ fn reservation_compute_pattern_activity(
         let candidate = workspace.join(&normalized);
         if candidate.exists() {
             matches = true;
-            fs_latest = reservation_mtime_micros(&candidate);
+
+            let mut is_dir = false;
+            if let Ok(meta) = std::fs::metadata(&candidate) {
+                is_dir = meta.is_dir();
+                if let Ok(modified) = meta.modified() {
+                    fs_latest = reservation_system_time_to_micros(modified);
+                }
+            }
+
+            if want_git {
+                let spec = reservation_git_pathspec(workspace_rel.unwrap(), &normalized);
+                git_specs.push((spec, is_dir));
+            }
         }
     }
 
-    let git_activity = if matches {
-        match (repo_root, workspace_rel) {
-            (Some(root), Some(rel)) => {
-                let pathspec = reservation_git_pathspec(rel, &normalized);
-                reservation_git_latest_activity_micros(root, &pathspec, has_glob)
-            }
-            _ => None,
-        }
+    let git_activity = if matches && want_git {
+        let pathspecs = reservation_compress_git_pathspecs(git_specs);
+        reservation_git_latest_activity_micros(repo_root.unwrap(), &pathspecs)
     } else {
         None
     };
@@ -3325,8 +3445,10 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
     let mut mail_activity_cache: HashMap<i64, Option<i64>> = HashMap::new();
     let mut pattern_activity_cache: HashMap<String, ReservationPatternActivity> = HashMap::new();
 
+    // Cleanup only needs unreleased rows (including expired). Released history is unbounded and
+    // scanning it on every resource read can time out on long-lived projects.
     let all_rows = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_file_reservations(ctx.cx(), &pool, project_id, false)
+        mcp_agent_mail_db::queries::list_unreleased_file_reservations(ctx.cx(), &pool, project_id)
             .await,
     )?;
 
@@ -3419,9 +3541,6 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
             continue;
         }
 
-        // Clamp expires_ts to released_ts for archive guard semantics.
-        let expires_clamped = row.expires_ts.min(now_micros);
-
         release_payloads.push(serde_json::json!({
             "id": id,
             "project": project.human_key.clone(),
@@ -3430,7 +3549,7 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
             "exclusive": row.exclusive != 0,
             "reason": row.reason.clone(),
             "created_ts": micros_to_iso(row.created_ts),
-            "expires_ts": micros_to_iso(expires_clamped),
+            "expires_ts": micros_to_iso(row.expires_ts),
             "released_ts": micros_to_iso(now_micros),
         }));
     }
@@ -3467,25 +3586,14 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
         .await,
     )?;
 
-    // Need to get agent names for each reservation
-    let agents = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await,
-    )?;
-
-    let agent_names: HashMap<i64, String> = agents
-        .iter()
-        .filter_map(|row| row.id.map(|id| (id, row.name.clone())))
-        .collect();
-
     // Match Python ordering: created_ts asc (id is usually insertion order but not guaranteed).
     rows.sort_by_key(|r| r.created_ts);
 
     let mut reservations: Vec<FileReservationResourceEntry> = Vec::with_capacity(rows.len());
     for row in rows {
-        let agent_name = agent_names
+        let agent_name = agent_by_id
             .get(&row.agent_id)
-            .cloned()
-            .unwrap_or_else(|| format!("agent_{}", row.agent_id));
+            .map_or_else(|| format!("agent_{}", row.agent_id), |a| a.name.clone());
         let last_agent_activity_ts = agent_by_id
             .get(&row.agent_id)
             .map(|a| micros_to_iso(a.last_active_ts));

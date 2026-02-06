@@ -27,7 +27,7 @@ fastmcp-server = { path = "../fastmcp_rust/crates/fastmcp-server" }
 fastmcp-transport = { path = "../fastmcp_rust/crates/fastmcp-transport" }
 fastmcp-protocol = { path = "../fastmcp_rust/crates/fastmcp-protocol" }
 
-asupersync = { path = "../asupersync" }
+asupersync = { path = "../asupersync", features = ["tls-webpki-roots"] }
 
 sqlmodel = { path = "../sqlmodel_rust/crates/sqlmodel" }
 sqlmodel-core = { path = "../sqlmodel_rust/crates/sqlmodel-core" }
@@ -75,6 +75,7 @@ base64 = "0.22"
 ed25519-dalek = { version = "2", features = ["std"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 criterion = { version = "0.8", features = ["html_reports"] }
+jsonwebtoken = { version = "10.3.0", default-features = false, features = ["rust_crypto"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
