@@ -103,8 +103,8 @@
 | mail status | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (2 integration tests: shows counts, empty project) |
 | migrate | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (10 tests: output parity, idempotent, tables, FTS, negative cases) |
 | clear-and-reset-everything | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (2 integration tests: force+archive, force+no-archive) |
-| lint / typecheck | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
-| projects (mark-identity/discovery-init/adopt) | Implemented | `crates/mcp-agent-mail-cli/src/lib.rs` |
+| lint / typecheck | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs`, `scripts/e2e_cli.sh` (typecheck passes, lint runs clippy) |
+| projects (mark-identity/discovery-init/adopt) | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs`, `tests/integration_runs.rs` (5 tests: mark-identity, discovery-init, adopt dry-run, adopt apply, adopt cross-repo) |
 | doctor check (--verbose, --json) | Verified (Tests) | `crates/mcp-agent-mail-cli/src/lib.rs` (integration test), `tests/cli_json_snapshots.rs` (JSON snapshot) |
 | Guard install/uninstall + conflict detection | Verified (Tests) | `crates/mcp-agent-mail-guard/src/lib.rs`, `tests/e2e/test_guard.sh` (32 E2E assertions: install, check, uninstall, conflict detection, case-insensitive, advisory mode) |
 | Guard status / guard check (Rust native) | Verified (Tests) | `crates/mcp-agent-mail-guard/src/lib.rs`, `tests/e2e/test_guard.sh` (status, check with stdin-nul, advisory mode) |
