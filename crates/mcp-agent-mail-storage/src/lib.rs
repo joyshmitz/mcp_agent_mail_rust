@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
@@ -102,6 +102,219 @@ pub struct NotificationMessage {
     pub from: Option<String>,
     pub subject: Option<String>,
     pub importance: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Write-Behind Queue (WBQ)
+// ---------------------------------------------------------------------------
+//
+// Moves archive file writes (and notification signals) off the tool hot path
+// to a dedicated background OS thread.  The DB is the source of truth; archive
+// writes are best-effort.  The drain worker batches writes and funnels them
+// into async commits via the existing CommitCoalescer.
+
+/// An archive write operation that can be deferred to the background drain
+/// thread.
+#[derive(Debug, Clone)]
+pub enum WriteOp {
+    MessageBundle {
+        project_slug: String,
+        config: Config,
+        message_json: serde_json::Value,
+        body_md: String,
+        sender: String,
+        recipients: Vec<String>,
+    },
+    AgentProfile {
+        project_slug: String,
+        config: Config,
+        agent_json: serde_json::Value,
+    },
+    FileReservation {
+        project_slug: String,
+        config: Config,
+        reservations: Vec<serde_json::Value>,
+    },
+    NotificationSignal {
+        config: Config,
+        project_slug: String,
+        agent_name: String,
+        metadata: Option<NotificationMessage>,
+    },
+    ClearSignal {
+        config: Config,
+        project_slug: String,
+        agent_name: String,
+    },
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct WbqStats {
+    pub enqueued: usize,
+    pub drained: usize,
+    pub errors: usize,
+    pub fallbacks: usize,
+}
+
+enum WbqMsg {
+    Op(WriteOp),
+    Flush(std::sync::mpsc::SyncSender<()>),
+}
+
+struct WriteBehindQueue {
+    sender: std::sync::mpsc::SyncSender<WbqMsg>,
+    drain_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    stats: Arc<Mutex<WbqStats>>,
+}
+
+const WBQ_CHANNEL_CAPACITY: usize = 256;
+const WBQ_DRAIN_BATCH_CAP: usize = 64;
+const WBQ_FLUSH_INTERVAL_MS: u64 = 100;
+
+static WBQ: OnceLock<WriteBehindQueue> = OnceLock::new();
+
+/// Spawn the WBQ drain thread. Safe to call multiple times.
+pub fn wbq_start() {
+    WBQ.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel(WBQ_CHANNEL_CAPACITY);
+        let stats = Arc::new(Mutex::new(WbqStats::default()));
+        let worker_stats = Arc::clone(&stats);
+        let handle = std::thread::Builder::new()
+            .name("wbq-drain".into())
+            .spawn(move || wbq_drain_loop(rx, worker_stats))
+            .expect("failed to spawn WBQ drain worker");
+        WriteBehindQueue {
+            sender: tx,
+            drain_handle: Mutex::new(Some(handle)),
+            stats,
+        }
+    });
+}
+
+/// Enqueue a write op. Returns `false` if the channel is full (caller should
+/// fall back to synchronous write).
+pub fn wbq_enqueue(op: WriteOp) -> bool {
+    wbq_start();
+    let wbq = WBQ.get().expect("WBQ must be initialised");
+    {
+        let mut s = wbq.stats.lock().unwrap_or_else(|e| e.into_inner());
+        s.enqueued += 1;
+    }
+    match wbq.sender.try_send(WbqMsg::Op(op)) {
+        Ok(()) => true,
+        Err(_) => {
+            let mut s = wbq.stats.lock().unwrap_or_else(|e| e.into_inner());
+            s.fallbacks += 1;
+            false
+        }
+    }
+}
+
+/// Block until all pending write ops have been drained.
+pub fn wbq_flush() {
+    if let Some(wbq) = WBQ.get() {
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        if wbq.sender.try_send(WbqMsg::Flush(done_tx)).is_ok() {
+            let _ = done_rx.recv_timeout(Duration::from_secs(30));
+        }
+    }
+}
+
+/// Drain remaining ops and join the worker thread.
+pub fn wbq_shutdown() {
+    if let Some(wbq) = WBQ.get() {
+        wbq_flush();
+        let handle = {
+            let mut guard = wbq.drain_handle.lock().unwrap_or_else(|e| e.into_inner());
+            guard.take()
+        };
+        if let Some(h) = handle {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Snapshot of current WBQ statistics.
+pub fn wbq_stats() -> WbqStats {
+    WBQ.get()
+        .map(|wbq| wbq.stats.lock().unwrap_or_else(|e| e.into_inner()).clone())
+        .unwrap_or_default()
+}
+
+fn wbq_drain_loop(rx: std::sync::mpsc::Receiver<WbqMsg>, stats: Arc<Mutex<WbqStats>>) {
+    let flush_interval = Duration::from_millis(WBQ_FLUSH_INTERVAL_MS);
+    let mut flush_waiters: Vec<std::sync::mpsc::SyncSender<()>> = Vec::new();
+
+    loop {
+        let mut batch: Vec<WriteOp> = Vec::new();
+
+        match rx.recv_timeout(flush_interval) {
+            Ok(WbqMsg::Op(op)) => batch.push(op),
+            Ok(WbqMsg::Flush(done_tx)) => flush_waiters.push(done_tx),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                for w in flush_waiters.drain(..) { let _ = w.try_send(()); }
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+
+        while batch.len() < WBQ_DRAIN_BATCH_CAP {
+            match rx.try_recv() {
+                Ok(WbqMsg::Op(op)) => batch.push(op),
+                Ok(WbqMsg::Flush(done_tx)) => flush_waiters.push(done_tx),
+                Err(_) => break,
+            }
+        }
+
+        let drained = batch.len();
+        let mut errors = 0usize;
+        for op in batch {
+            if let Err(e) = wbq_execute_op(&op) {
+                tracing::warn!("[wbq-drain] op failed: {e}");
+                errors += 1;
+            }
+        }
+
+        {
+            let mut s = stats.lock().unwrap_or_else(|e| e.into_inner());
+            s.drained += drained;
+            s.errors += errors;
+        }
+
+        for w in flush_waiters.drain(..) { let _ = w.try_send(()); }
+    }
+
+    for msg in rx.try_iter() {
+        match msg {
+            WbqMsg::Op(op) => { let _ = wbq_execute_op(&op); }
+            WbqMsg::Flush(done_tx) => { let _ = done_tx.try_send(()); }
+        }
+    }
+}
+
+fn wbq_execute_op(op: &WriteOp) -> Result<()> {
+    match op {
+        WriteOp::MessageBundle { project_slug, config, message_json, body_md, sender, recipients } => {
+            let archive = ensure_archive(config, project_slug)?;
+            write_message_bundle(&archive, config, message_json, body_md, sender, recipients, &[], None)
+        }
+        WriteOp::AgentProfile { project_slug, config, agent_json } => {
+            let archive = ensure_archive(config, project_slug)?;
+            write_agent_profile_with_config(&archive, config, agent_json)
+        }
+        WriteOp::FileReservation { project_slug, config, reservations } => {
+            let archive = ensure_archive(config, project_slug)?;
+            write_file_reservation_records(&archive, config, reservations)
+        }
+        WriteOp::NotificationSignal { config, project_slug, agent_name, metadata } => {
+            emit_notification_signal(config, project_slug, agent_name, metadata.as_ref());
+            Ok(())
+        }
+        WriteOp::ClearSignal { config, project_slug, agent_name } => {
+            clear_notification_signal(config, project_slug, agent_name);
+            Ok(())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -363,7 +576,7 @@ struct CommitRequest {
     rel_paths: Vec<String>,
 }
 
-/// Statistics about commit queue operations.
+/// Statistics about commit queue/coalescer operations.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CommitQueueStats {
     pub enqueued: usize,
@@ -371,6 +584,7 @@ pub struct CommitQueueStats {
     pub commits: usize,
     pub avg_batch_size: f64,
     pub queue_size: usize,
+    pub errors: usize,
 }
 
 /// Commit queue that batches multiple commits to reduce git contention.
@@ -610,6 +824,429 @@ pub fn get_commit_queue() -> &'static Mutex<Option<CommitQueue>> {
     }
     drop(guard);
     &COMMIT_QUEUE
+}
+
+// ---------------------------------------------------------------------------
+// Async commit coalescer (fire-and-forget git commits)
+// ---------------------------------------------------------------------------
+//
+// Architecture for extreme-load resilience:
+//
+//   Tool call:  write files → enqueue_async_commit() → return immediately
+//   Worker:     accumulate requests → batch by repo → single commit per repo
+//
+// Under extreme load (50 agents, 1000s of ops/sec), commits coalesce:
+// - 250ms window → many requests batch into 1 commit per repo
+// - Zero git contention on the tool hot path
+// - If worker dies, fallback to synchronous commit (no data loss)
+
+/// Messages sent to the coalescer worker thread.
+enum CoalescerMsg {
+    /// A commit request to be batched.
+    Commit(CoalescerCommitFields),
+    /// Flush all pending commits and signal completion via the sender.
+    Flush(std::sync::mpsc::SyncSender<()>),
+}
+
+/// Fields for a single commit request within the coalescer pipeline.
+struct CoalescerCommitFields {
+    repo_root: PathBuf,
+    git_author_name: String,
+    git_author_email: String,
+    message: String,
+    rel_paths: Vec<String>,
+}
+
+/// Fire-and-forget git commit coalescer with background worker thread.
+///
+/// All git index+commit operations are offloaded to a dedicated worker thread
+/// that batches requests by repository and commits at a configurable interval.
+/// Tool responses never wait for git — they return as soon as files are on disk.
+///
+/// Under extreme load, this naturally coalesces many small commits into fewer
+/// large ones, dramatically reducing git index.lock contention.
+pub struct CommitCoalescer {
+    sender: std::sync::mpsc::Sender<CoalescerMsg>,
+    stats: Arc<Mutex<CommitQueueStats>>,
+    /// Kept alive to share with worker thread (accessed via Arc clone).
+    _batch_sizes: Arc<Mutex<VecDeque<usize>>>,
+}
+
+/// Default flush interval for the coalescer (250ms).
+///
+/// This is the maximum time a commit request waits before being processed.
+/// Under sustained load, the worker drains all pending requests every interval.
+pub const DEFAULT_COALESCER_FLUSH_MS: u64 = 250;
+
+impl CommitCoalescer {
+    /// Create a new coalescer and spawn the background worker thread.
+    pub fn new(flush_interval: Duration) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stats = Arc::new(Mutex::new(CommitQueueStats::default()));
+        let batch_sizes = Arc::new(Mutex::new(VecDeque::new()));
+
+        let worker_stats = Arc::clone(&stats);
+        let worker_sizes = Arc::clone(&batch_sizes);
+
+        std::thread::Builder::new()
+            .name("commit-coalescer".into())
+            .spawn(move || {
+                coalescer_worker_loop(rx, worker_stats, worker_sizes, flush_interval);
+            })
+            .expect("failed to spawn commit coalescer worker");
+
+        Self {
+            sender: tx,
+            stats,
+            _batch_sizes: batch_sizes,
+        }
+    }
+
+    /// Enqueue a commit request. **Non-blocking, fire-and-forget.**
+    ///
+    /// Files must already be written to disk before calling this.
+    /// The background worker will add them to the git index and commit.
+    ///
+    /// If the worker thread is unreachable (e.g., panicked), falls back to
+    /// a synchronous commit to prevent data loss.
+    pub fn enqueue(
+        &self,
+        repo_root: PathBuf,
+        config: &Config,
+        message: String,
+        rel_paths: Vec<String>,
+    ) {
+        if rel_paths.is_empty() {
+            return;
+        }
+
+        {
+            let mut s = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+            s.enqueued += 1;
+        }
+
+        let msg = CoalescerMsg::Commit(CoalescerCommitFields {
+            repo_root: repo_root.clone(),
+            git_author_name: config.git_author_name.clone(),
+            git_author_email: config.git_author_email.clone(),
+            message: message.clone(),
+            rel_paths: rel_paths.clone(),
+        });
+
+        if self.sender.send(msg).is_err() {
+            // Worker thread died — fallback to synchronous commit so files
+            // that are already on disk still get committed to git.
+            eprintln!("[commit-coalescer] worker unreachable, sync fallback");
+            if let Ok(repo) = Repository::open(&repo_root) {
+                let refs: Vec<&str> = rel_paths.iter().map(String::as_str).collect();
+                let _ = commit_paths(&repo, config, &message, &refs);
+            }
+            let mut s = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+            s.errors += 1;
+        }
+    }
+
+    /// Block until all pending commits are flushed to git.
+    ///
+    /// Use this in tests or during graceful shutdown to ensure all queued
+    /// commits are persisted before proceeding.
+    pub fn flush_sync(&self) {
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        if self.sender.send(CoalescerMsg::Flush(done_tx)).is_ok() {
+            // Wait up to 30s for the worker to process all pending commits.
+            let _ = done_rx.recv_timeout(Duration::from_secs(30));
+        }
+    }
+
+    /// Get coalescer statistics.
+    pub fn stats(&self) -> CommitQueueStats {
+        let mut s = self.stats.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        s.queue_size = 0;
+        s
+    }
+}
+
+/// Background worker loop for the commit coalescer.
+///
+/// Strategy:
+/// 1. Block on channel until a request arrives (or flush interval elapses)
+/// 2. Drain all pending requests (non-blocking)
+/// 3. Group by repo, merge non-conflicting paths into single commits
+/// 4. Commit with retry+jitter on index.lock contention
+/// 5. Repeat
+fn coalescer_worker_loop(
+    rx: std::sync::mpsc::Receiver<CoalescerMsg>,
+    stats: Arc<Mutex<CommitQueueStats>>,
+    batch_sizes: Arc<Mutex<VecDeque<usize>>>,
+    flush_interval: Duration,
+) {
+    let mut flush_waiters: Vec<std::sync::mpsc::SyncSender<()>> = Vec::new();
+
+    loop {
+        let mut pending: HashMap<PathBuf, Vec<CoalescerCommitFields>> = HashMap::new();
+
+        // Phase 1: Block until first message or timeout
+        match rx.recv_timeout(flush_interval) {
+            Ok(CoalescerMsg::Commit(fields)) => {
+                pending
+                    .entry(fields.repo_root.clone())
+                    .or_default()
+                    .push(fields);
+            }
+            Ok(CoalescerMsg::Flush(done_tx)) => {
+                flush_waiters.push(done_tx);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Nothing pending — notify any flush waiters and continue
+                for w in flush_waiters.drain(..) {
+                    let _ = w.try_send(());
+                }
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+
+        // Phase 2: Drain all immediately available messages
+        loop {
+            match rx.try_recv() {
+                Ok(CoalescerMsg::Commit(fields)) => {
+                    pending
+                        .entry(fields.repo_root.clone())
+                        .or_default()
+                        .push(fields);
+                }
+                Ok(CoalescerMsg::Flush(done_tx)) => {
+                    flush_waiters.push(done_tx);
+                }
+                Err(_) => break,
+            }
+        }
+
+        // Phase 3: Commit batches by repo
+        for (repo_root, requests) in &pending {
+            coalescer_commit_batch(repo_root, requests, &stats, &batch_sizes);
+        }
+
+        // Phase 4: Notify flush waiters that all pending work is done
+        for w in flush_waiters.drain(..) {
+            let _ = w.try_send(());
+        }
+    }
+}
+
+/// Commit a batch of requests targeting the same repository.
+///
+/// Merges non-conflicting paths into a single commit. Falls back to
+/// sequential commits if paths conflict (same file modified by multiple requests).
+fn coalescer_commit_batch(
+    repo_root: &Path,
+    requests: &[CoalescerCommitFields],
+    stats: &Arc<Mutex<CommitQueueStats>>,
+    batch_sizes: &Arc<Mutex<VecDeque<usize>>>,
+) {
+    if requests.is_empty() {
+        return;
+    }
+
+    // Use the first request's author info
+    let author_name = &requests[0].git_author_name;
+    let author_email = &requests[0].git_author_email;
+    let config = Config {
+        git_author_name: author_name.clone(),
+        git_author_email: author_email.clone(),
+        ..Config::default()
+    };
+
+    // Check for path conflicts
+    let mut all_paths = HashSet::new();
+    let mut can_merge = true;
+    for req in requests {
+        for p in &req.rel_paths {
+            if !all_paths.insert(p.clone()) {
+                can_merge = false;
+                break;
+            }
+        }
+        if !can_merge {
+            break;
+        }
+    }
+
+    let commit_result = if can_merge && requests.len() > 1 {
+        // Merge all into a single commit
+        let merged_paths: Vec<String> = requests
+            .iter()
+            .flat_map(|r| r.rel_paths.iter().cloned())
+            .collect();
+
+        let summary_lines: Vec<String> = requests
+            .iter()
+            .map(|r| {
+                let first = r.message.lines().next().unwrap_or("");
+                format!("- {first}")
+            })
+            .collect();
+
+        let combined_msg = format!(
+            "batch: {} ops coalesced\n\n{}",
+            requests.len(),
+            summary_lines.join("\n")
+        );
+
+        coalescer_commit_with_retry(repo_root, &config, &combined_msg, &merged_paths)
+            .map(|()| requests.len())
+    } else if requests.len() == 1 {
+        // Single request — commit directly
+        coalescer_commit_with_retry(
+            repo_root,
+            &config,
+            &requests[0].message,
+            &requests[0].rel_paths,
+        )
+        .map(|()| 1)
+    } else {
+        // Path conflicts — commit sequentially
+        let mut total = 0;
+        let mut last_err = None;
+        for req in requests {
+            let r_config = Config {
+                git_author_name: req.git_author_name.clone(),
+                git_author_email: req.git_author_email.clone(),
+                ..Config::default()
+            };
+            match coalescer_commit_with_retry(repo_root, &r_config, &req.message, &req.rel_paths) {
+                Ok(()) => total += 1,
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if let Some(e) = last_err {
+            eprintln!("[commit-coalescer] partial failure in sequential batch: {e}");
+        }
+        Ok(total)
+    };
+
+    // Update stats
+    match commit_result {
+        Ok(batch_size) => {
+            let mut s = stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.commits += 1;
+            s.batched += batch_size;
+
+            let mut sizes = batch_sizes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            sizes.push_back(batch_size);
+            if sizes.len() > 100 {
+                sizes.pop_front();
+            }
+            let avg = if sizes.is_empty() {
+                0.0
+            } else {
+                sizes.iter().sum::<usize>() as f64 / sizes.len() as f64
+            };
+            s.avg_batch_size = (avg * 100.0).round() / 100.0;
+        }
+        Err(e) => {
+            eprintln!("[commit-coalescer] batch commit error: {e}");
+            let mut s = stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.errors += 1;
+        }
+    }
+}
+
+/// Commit with retry and jittered backoff for index.lock contention.
+///
+/// Unlike `commit_paths_with_retry`, this uses jitter to prevent thundering
+/// herd when multiple coalescer batches retry simultaneously.
+fn coalescer_commit_with_retry(
+    repo_root: &Path,
+    config: &Config,
+    message: &str,
+    rel_paths: &[String],
+) -> Result<()> {
+    const MAX_RETRIES: usize = 7;
+
+    for attempt in 0..=MAX_RETRIES {
+        let repo = Repository::open(repo_root)?;
+        let refs: Vec<&str> = rel_paths.iter().map(String::as_str).collect();
+
+        match commit_paths(&repo, config, message, &refs) {
+            Ok(()) => return Ok(()),
+            Err(StorageError::Git(ref git_err)) if is_git_index_lock_error(git_err) => {
+                if attempt >= MAX_RETRIES {
+                    // Last-resort stale lock cleanup
+                    if try_clean_stale_git_lock(repo_root, 30.0) {
+                        let repo2 = Repository::open(repo_root)?;
+                        let refs2: Vec<&str> = rel_paths.iter().map(String::as_str).collect();
+                        return commit_paths(&repo2, config, message, &refs2);
+                    }
+                    return Err(StorageError::GitIndexLock {
+                        message: format!("index.lock contention after {MAX_RETRIES} retries"),
+                        lock_path: repo_root.join(".git").join("index.lock"),
+                        attempts: MAX_RETRIES,
+                    });
+                }
+
+                // Jittered exponential backoff: base * 2^attempt + random jitter
+                let base_ms = 50 * (1u64 << attempt.min(5)); // 50, 100, 200, 400, 800, 1600
+                let jitter = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .subsec_micros() as u64
+                    % (base_ms / 2 + 1);
+                std::thread::sleep(Duration::from_millis(base_ms + jitter));
+
+                // Try cleaning stale locks on later attempts
+                if attempt >= 3 {
+                    let _ = try_clean_stale_git_lock(repo_root, 60.0);
+                }
+            }
+            Err(other) => return Err(other),
+        }
+    }
+
+    unreachable!()
+}
+
+/// Global commit coalescer instance (lazy-initialized).
+static COMMIT_COALESCER: OnceLock<CommitCoalescer> = OnceLock::new();
+
+/// Get the global commit coalescer (spawns worker on first call).
+pub fn get_commit_coalescer() -> &'static CommitCoalescer {
+    COMMIT_COALESCER
+        .get_or_init(|| CommitCoalescer::new(Duration::from_millis(DEFAULT_COALESCER_FLUSH_MS)))
+}
+
+/// Enqueue an async git commit via the global coalescer.
+///
+/// **Non-blocking, fire-and-forget.** Files must already be written to disk.
+/// The background worker will batch-commit them to git.
+///
+/// Use this instead of `commit_paths()` in all tool hot paths.
+pub fn enqueue_async_commit(
+    repo_root: &Path,
+    config: &Config,
+    message: &str,
+    rel_paths: &[String],
+) {
+    get_commit_coalescer().enqueue(
+        repo_root.to_path_buf(),
+        config,
+        message.to_string(),
+        rel_paths.to_vec(),
+    );
+}
+
+/// Block until all pending async commits are flushed to git.
+///
+/// Call this in tests, during graceful shutdown, or before reading git history
+/// that depends on recent writes.
+pub fn flush_async_commits() {
+    get_commit_coalescer().flush_sync();
 }
 
 // ---------------------------------------------------------------------------
@@ -966,16 +1603,12 @@ pub fn write_agent_profile(archive: &ProjectArchive, agent: &serde_json::Value) 
     write_json(&profile_path, agent)?;
 
     let rel = rel_path(&archive.repo_root, &profile_path)?;
-    let repo = Repository::open(&archive.repo_root)?;
-    commit_paths(
-        &repo,
-        // We need a minimal config for the commit author. Since we don't have
-        // the full Config here, we use a placeholder. Callers should use the
-        // version that accepts Config when they have it.
+    enqueue_async_commit(
+        &archive.repo_root,
         &Config::default(),
         &format!("agent: profile {name}"),
-        &[&rel],
-    )?;
+        &[rel],
+    );
 
     Ok(())
 }
@@ -998,8 +1631,12 @@ pub fn write_agent_profile_with_config(
     write_json(&profile_path, agent)?;
 
     let rel = rel_path(&archive.repo_root, &profile_path)?;
-    let repo = Repository::open(&archive.repo_root)?;
-    commit_paths(&repo, config, &format!("agent: profile {name}"), &[&rel])?;
+    enqueue_async_commit(
+        &archive.repo_root,
+        config,
+        &format!("agent: profile {name}"),
+        &[rel],
+    );
 
     Ok(())
 }
@@ -1092,9 +1729,7 @@ pub fn write_file_reservation_records(
     }
 
     let commit_msg = build_file_reservation_commit_message(&entries);
-    let repo = Repository::open(&archive.repo_root)?;
-    let refs: Vec<&str> = rel_paths.iter().map(String::as_str).collect();
-    commit_paths(&repo, config, &commit_msg, &refs)?;
+    enqueue_async_commit(&archive.repo_root, config, &commit_msg, &rel_paths);
 
     Ok(())
 }
@@ -1344,9 +1979,7 @@ pub fn write_message_bundle(
         format!("{subject}\n\n{}\n", body_lines.join("\n"))
     };
 
-    let repo = Repository::open(&archive.repo_root)?;
-    let refs: Vec<&str> = rel_paths.iter().map(String::as_str).collect();
-    commit_paths(&repo, config, &commit_message, &refs)?;
+    enqueue_async_commit(&archive.repo_root, config, &commit_message, &rel_paths);
 
     Ok(())
 }
@@ -2722,7 +3355,12 @@ mod tests {
             subject: Some("Hello World".to_string()),
             importance: Some("high".to_string()),
         };
-        assert!(emit_notification_signal(&config, "test_project", "TestAgent", Some(&meta)));
+        assert!(emit_notification_signal(
+            &config,
+            "test_project",
+            "TestAgent",
+            Some(&meta)
+        ));
 
         let signals = list_pending_signals(&config, Some("test_project"));
         assert_eq!(signals.len(), 1);
@@ -2751,7 +3389,12 @@ mod tests {
             subject: Some("No importance field".to_string()),
             importance: None, // should default to "normal"
         };
-        assert!(emit_notification_signal(&config, "proj1", "Agent1", Some(&meta)));
+        assert!(emit_notification_signal(
+            &config,
+            "proj1",
+            "Agent1",
+            Some(&meta)
+        ));
 
         let signals = list_pending_signals(&config, Some("proj1"));
         assert_eq!(signals.len(), 1);
@@ -2774,7 +3417,12 @@ mod tests {
             subject: None,
             importance: None,
         };
-        assert!(emit_notification_signal(&config, "proj1", "Agent2", Some(&meta)));
+        assert!(emit_notification_signal(
+            &config,
+            "proj1",
+            "Agent2",
+            Some(&meta)
+        ));
 
         let signals = list_pending_signals(&config, Some("proj1"));
         assert_eq!(signals.len(), 1);
@@ -2799,7 +3447,12 @@ mod tests {
             subject: Some("Hello".to_string()),
             importance: Some("high".to_string()),
         };
-        assert!(emit_notification_signal(&config, "test_project", "TestAgent", Some(&meta)));
+        assert!(emit_notification_signal(
+            &config,
+            "test_project",
+            "TestAgent",
+            Some(&meta)
+        ));
 
         let signals = list_pending_signals(&config, Some("test_project"));
         assert_eq!(signals.len(), 1);
@@ -2817,7 +3470,12 @@ mod tests {
         config.notifications_signals_dir = tmp.path().join("signals");
         config.notifications_debounce_ms = 0;
 
-        assert!(emit_notification_signal(&config, "test_project", "TestAgent", None));
+        assert!(emit_notification_signal(
+            &config,
+            "test_project",
+            "TestAgent",
+            None
+        ));
 
         let signals = list_pending_signals(&config, Some("test_project"));
         assert_eq!(signals.len(), 1);
@@ -3305,6 +3963,7 @@ mod tests {
         // Write agent profile (creates a commit)
         let agent = serde_json::json!({"name": "ReadAgent", "program": "test"});
         write_agent_profile_with_config(&archive, &config, &agent).unwrap();
+        flush_async_commits(); // ensure git commit is flushed before reading history
 
         let rel = "projects/read-proj/agents/ReadAgent/profile.json".to_string();
         let commit = find_commit_for_path(&archive, &rel).unwrap();
@@ -3322,6 +3981,7 @@ mod tests {
         // Write something to create commits
         let agent = serde_json::json!({"name": "AuthorAgent", "program": "test"});
         write_agent_profile_with_config(&archive, &config, &agent).unwrap();
+        flush_async_commits(); // ensure git commit is flushed before reading history
 
         let commits = get_commits_by_author(&archive, &config.git_author_name, 10).unwrap();
         assert!(!commits.is_empty());

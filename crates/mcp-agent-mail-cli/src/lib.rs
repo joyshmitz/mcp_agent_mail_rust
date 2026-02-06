@@ -736,10 +736,12 @@ fn handle_share(action: ShareCommand) -> CliResult<()> {
             Ok(())
         }
         ShareCommand::Wizard => {
-            ftui_runtime::ftui_println!("The share wizard is not yet available in the Rust CLI.");
-            ftui_runtime::ftui_println!(
-                "Use `am share export --output <dir>` for non-interactive export."
-            );
+            let script = find_share_wizard_script().ok_or_else(|| {
+                CliError::Other(
+                    "share wizard script not found: scripts/share_to_github_pages.py".to_string(),
+                )
+            })?;
+            run_python_script(&script)?;
             Ok(())
         }
     }
@@ -1450,6 +1452,37 @@ fn handle_typecheck() -> CliResult<()> {
         .status()?;
     if status.success() {
         ftui_runtime::ftui_println!("Type check passed.");
+        Ok(())
+    } else {
+        Err(CliError::ExitCode(status.code().unwrap_or(1)))
+    }
+}
+
+fn find_share_wizard_script() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let mut candidates = Vec::new();
+    candidates.push(cwd.join("scripts/share_to_github_pages.py"));
+
+    // Also check workspace root relative to this crate.
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    if let Some(root) = manifest_dir.parent().and_then(|p| p.parent()) {
+        candidates.push(root.join("scripts/share_to_github_pages.py"));
+    }
+
+    candidates.into_iter().find(|p| p.exists())
+}
+
+fn run_python_script(script: &Path) -> CliResult<()> {
+    let mut cmd = std::process::Command::new("python");
+    cmd.arg(script);
+    let status = match cmd.status() {
+        Ok(status) => status,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            std::process::Command::new("python3").arg(script).status()?
+        }
+        Err(err) => return Err(err.into()),
+    };
+    if status.success() {
         Ok(())
     } else {
         Err(CliError::ExitCode(status.code().unwrap_or(1)))
@@ -3198,6 +3231,7 @@ fn scan_markdown_for_blurbs(
 fn serve_static_dir(dir: &Path, host: &str, port: u16) -> CliResult<()> {
     use asupersync::http::h1::listener::{Http1Listener, Http1ListenerConfig};
     use asupersync::http::h1::types::Response;
+    use asupersync::runtime::RuntimeBuilder;
 
     let dir = dir.to_path_buf();
     let socket_addr: std::net::SocketAddr = format!("{host}:{port}")
@@ -3205,46 +3239,47 @@ fn serve_static_dir(dir: &Path, host: &str, port: u16) -> CliResult<()> {
         .map_err(|e| CliError::InvalidArgument(format!("invalid address: {e}")))?;
 
     // Run the server (blocks until Ctrl+C)
-    asupersync::test_utils::run_test(move || {
-        let dir = dir.clone();
-        async move {
-            let listener = Http1Listener::bind_with_config(
-                socket_addr,
-                move |req| {
-                    let dir = dir.clone();
-                    async move {
-                        let uri = &req.uri;
-                        let path = uri.split('?').next().unwrap_or("/");
-                        let relative = path.trim_start_matches('/');
-                        let file_path = if relative.is_empty() {
-                            dir.join("index.html")
-                        } else {
-                            dir.join(relative)
-                        };
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .map_err(|e| CliError::Other(format!("failed to build runtime: {e}")))?;
+    let handle = runtime.handle();
+    runtime.block_on(async move {
+        let listener = Http1Listener::bind_with_config(
+            socket_addr,
+            move |req| {
+                let dir = dir.clone();
+                async move {
+                    let uri = &req.uri;
+                    let path = uri.split('?').next().unwrap_or("/");
+                    let relative = path.trim_start_matches('/');
+                    let file_path = if relative.is_empty() {
+                        dir.join("index.html")
+                    } else {
+                        dir.join(relative)
+                    };
 
-                        if file_path.exists() && file_path.is_file() {
-                            match std::fs::read(&file_path) {
-                                Ok(content) => {
-                                    let ct = guess_content_type(&file_path);
-                                    let mut resp = Response::new(200, "OK", content);
-                                    resp.headers
-                                        .push(("Content-Type".to_string(), ct.to_string()));
-                                    resp
-                                }
-                                Err(_) => Response::new(500, "Internal Server Error", Vec::new()),
+                    if file_path.exists() && file_path.is_file() {
+                        match std::fs::read(&file_path) {
+                            Ok(content) => {
+                                let ct = guess_content_type(&file_path);
+                                let mut resp = Response::new(200, "OK", content);
+                                resp.headers
+                                    .push(("Content-Type".to_string(), ct.to_string()));
+                                resp
                             }
-                        } else {
-                            Response::new(404, "Not Found", b"Not Found".to_vec())
+                            Err(_) => Response::new(500, "Internal Server Error", Vec::new()),
                         }
+                    } else {
+                        Response::new(404, "Not Found", b"Not Found".to_vec())
                     }
-                },
-                Http1ListenerConfig::default(),
-            )
-            .await
-            .expect("failed to bind HTTP listener");
+                }
+            },
+            Http1ListenerConfig::default(),
+        )
+        .await
+        .expect("failed to bind HTTP listener");
 
-            let _ = listener.run().await;
-        }
+        let _ = listener.run(&handle).await;
     });
 
     Ok(())

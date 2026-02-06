@@ -13,7 +13,9 @@ use fastmcp_server::Session;
 use fastmcp_transport::http::{
     HttpHandlerConfig, HttpMethod as McpHttpMethod, HttpRequest, HttpRequestHandler, HttpResponse,
 };
-use mcp_agent_mail_db::{DbPoolConfig, create_pool};
+use mcp_agent_mail_db::{
+    DbPoolConfig, QueryTracker, active_tracker, create_pool, set_active_tracker,
+};
 use mcp_agent_mail_tools::{
     AcknowledgeMessage, AcquireBuildSlot, AgentsListResource, ConfigEnvironmentQueryResource,
     ConfigEnvironmentResource, CreateAgentIdentity, EnsureProduct, EnsureProject, FetchInbox,
@@ -55,11 +57,6 @@ fn add_tool<T: fastmcp::ToolHandler + 'static>(
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn build_server(config: &mcp_agent_mail_core::Config) -> Server {
-    // Initialize query tracking if instrumentation is enabled
-    if config.instrumentation_enabled {
-        mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
-    }
-
     let server = Server::new("mcp-agent-mail", env!("CARGO_PKG_VERSION"));
 
     let server = add_tool(
@@ -331,10 +328,14 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> Server {
 }
 
 pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
+    mcp_agent_mail_storage::wbq_start();
     build_server(config).run_stdio();
+    mcp_agent_mail_storage::wbq_shutdown();
 }
 
 pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+    mcp_agent_mail_storage::wbq_start();
+
     let server = build_server(config);
     let server_info = server.info().clone();
     let server_capabilities = server.capabilities().clone();
@@ -352,7 +353,8 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
         .build()
         .map_err(|e| map_asupersync_err(&e))?;
 
-    runtime.block_on(async move {
+    let handle = runtime.handle();
+    let result = runtime.block_on(async move {
         let handler_state = Arc::clone(&state);
         let listener = Http1Listener::bind(addr, move |req| {
             let inner = Arc::clone(&handler_state);
@@ -360,11 +362,12 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
         })
         .await?;
 
-        listener.run().await?;
+        listener.run(&handle).await?;
         Ok::<(), std::io::Error>(())
-    })?;
+    });
 
-    Ok(())
+    mcp_agent_mail_storage::wbq_shutdown();
+    result
 }
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -648,6 +651,7 @@ impl HttpState {
             }
             "tools/call" => {
                 let params: fastmcp_protocol::CallToolParams = parse_params(request.params)?;
+                let tool_name = params.name.clone();
                 // Extract format param before dispatch (TOON support)
                 let format_value = params
                     .arguments
@@ -655,7 +659,35 @@ impl HttpState {
                     .and_then(|args| args.get("format"))
                     .and_then(|v| v.as_str())
                     .map(String::from);
-                let out = self.router.handle_tools_call(
+                let project_hint = extract_arg_str(
+                    params.arguments.as_ref(),
+                    &["project_key", "project", "human_key", "project_slug"],
+                )
+                .map(normalize_project_value);
+                let agent_hint = extract_arg_str(
+                    params.arguments.as_ref(),
+                    &[
+                        "agent_name",
+                        "sender_name",
+                        "from_agent",
+                        "requester",
+                        "target",
+                        "to_agent",
+                        "agent",
+                    ],
+                );
+
+                let tracker_state =
+                    if self.config.instrumentation_enabled && active_tracker().is_none() {
+                        let tracker = Arc::new(QueryTracker::new());
+                        tracker.enable(Some(self.config.instrumentation_slow_query_ms));
+                        let guard = set_active_tracker(tracker.clone());
+                        Some((tracker, guard))
+                    } else {
+                        None
+                    };
+
+                let result = self.router.handle_tools_call(
                     &cx,
                     request_id,
                     params,
@@ -663,7 +695,20 @@ impl HttpState {
                     SessionState::new(),
                     None,
                     None,
-                )?;
+                );
+
+                if let Some((tracker, _guard)) = tracker_state {
+                    if self.config.tools_log_enabled {
+                        log_tool_query_stats(
+                            &tool_name,
+                            project_hint.as_deref(),
+                            agent_hint.as_deref(),
+                            &tracker,
+                        );
+                    }
+                }
+
+                let out = result?;
                 let mut value = serde_json::to_value(out).map_err(McpError::from)?;
                 if let Some(ref fmt) = format_value {
                     apply_toon_to_content(&mut value, "content", fmt, &self.config);
@@ -843,6 +888,56 @@ fn extract_format_from_uri(uri: &str) -> Option<String> {
     None
 }
 
+fn extract_arg_str(arguments: Option<&serde_json::Value>, keys: &[&str]) -> Option<String> {
+    let args = arguments?.as_object()?;
+    for key in keys {
+        if let Some(value) = args.get(*key) {
+            if let Some(s) = value.as_str() {
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn normalize_project_value(value: String) -> String {
+    if value.starts_with('/') {
+        mcp_agent_mail_db::queries::generate_slug(&value)
+    } else {
+        value
+    }
+}
+
+fn log_tool_query_stats(
+    tool_name: &str,
+    project: Option<&str>,
+    agent: Option<&str>,
+    tracker: &QueryTracker,
+) {
+    let snapshot = tracker.snapshot();
+    let dict = snapshot.to_dict();
+    let per_table = dict
+        .get("per_table")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let slow_query_ms = dict
+        .get("slow_query_ms")
+        .and_then(serde_json::Value::as_f64);
+
+    tracing::info!(
+        tool = tool_name,
+        project = project.unwrap_or_default(),
+        agent = agent.unwrap_or_default(),
+        queries = snapshot.total,
+        query_time_ms = snapshot.total_time_ms,
+        per_table = ?per_table,
+        slow_query_ms = slow_query_ms,
+        "tool_query_stats"
+    );
+}
+
 /// Apply TOON encoding to the text content blocks in a MCP response value.
 ///
 /// `content_key` is "content" for tool results (`CallToolResult.content`)
@@ -902,11 +997,22 @@ fn map_asupersync_err(err: &asupersync::Error) -> std::io::Error {
 }
 
 fn readiness_check(config: &mcp_agent_mail_core::Config) -> Result<(), String> {
+    let pool_size = config
+        .database_pool_size
+        .unwrap_or(mcp_agent_mail_db::pool::DEFAULT_POOL_SIZE);
+    let max_overflow = config
+        .database_max_overflow
+        .unwrap_or(mcp_agent_mail_db::pool::DEFAULT_MAX_OVERFLOW);
+    let pool_timeout_ms = config
+        .database_pool_timeout
+        .map_or(mcp_agent_mail_db::pool::DEFAULT_POOL_TIMEOUT_MS, |v| {
+            v.saturating_mul(1000)
+        });
     let db_config = DbPoolConfig {
         database_url: config.database_url.clone(),
-        min_connections: config.database_pool_size,
-        max_connections: config.database_pool_size + config.database_max_overflow,
-        acquire_timeout_ms: config.database_pool_timeout.saturating_mul(1000),
+        min_connections: pool_size,
+        max_connections: pool_size + max_overflow,
+        acquire_timeout_ms: pool_timeout_ms,
         max_lifetime_ms: mcp_agent_mail_db::pool::DEFAULT_POOL_RECYCLE_MS,
         run_migrations: true,
     };
