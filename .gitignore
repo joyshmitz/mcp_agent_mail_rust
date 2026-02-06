@@ -14,8 +14,17 @@ _tmp_storage_root/
 # Misc build output
 a.out
 
+# Local env (developer machine / CI)
+.env
+
+# Local server logs
+agent-mail-server*.log
+
 # E2E test artifacts (generated per-run)
 tests/artifacts/
+
+# Crate-local test artifacts (generated per-run)
+crates/**/tests/artifacts/
 
 # bv (beads viewer) local config and caches
 .bv/

@@ -205,5 +205,142 @@ OUT3="$(cat "${NORM3}")"
 e2e_assert_contains "banner includes console layout line" "${OUT3}" "Console:"
 e2e_assert_contains "console layout reflects persisted percent" "${OUT3}" "50%"
 
-e2e_summary
+e2e_case_banner "interactive_change_persists (optional)"
+if [ "${AM_E2E_INTERACTIVE:-0}" = "1" ] || [ "${AM_E2E_INTERACTIVE:-}" = "true" ]; then
+    WORK4="$(e2e_mktemp "e2e_console_interactive")"
+    DB4="${WORK4}/db.sqlite3"
+    STORAGE4="${WORK4}/storage"
+    mkdir -p "${STORAGE4}"
+    PORT4="$(pick_port)"
+    PERSIST_ENV4="${WORK4}/console.env"
+    TRANSCRIPT4="${E2E_ARTIFACT_DIR}/interactive_pty.typescript"
 
+    # Use a Python PTY harness so we can inject keypresses and assert the envfile updates.
+    set +e
+    PY_OUT="$(
+        python3 - <<'PY' "${BIN}" "${PORT4}" "${DB4}" "${STORAGE4}" "${PERSIST_ENV4}" "${TRANSCRIPT4}" 2>&1
+import os
+import pty
+import select
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+bin_path = sys.argv[1]
+port = int(sys.argv[2])
+db_path = sys.argv[3]
+storage_root = sys.argv[4]
+persist_path = sys.argv[5]
+transcript_path = sys.argv[6]
+
+master_fd, slave_fd = pty.openpty()
+
+env = os.environ.copy()
+env.update(
+    {
+        "DATABASE_URL": f"sqlite:////{db_path}",
+        "STORAGE_ROOT": storage_root,
+        "HTTP_HOST": "127.0.0.1",
+        "HTTP_PORT": str(port),
+        "HTTP_RBAC_ENABLED": "0",
+        "HTTP_RATE_LIMIT_ENABLED": "0",
+        "HTTP_JWT_ENABLED": "0",
+        "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED": "0",
+        "CONSOLE_INTERACTIVE": "1",
+        "CONSOLE_AUTO_SAVE": "1",
+        "CONSOLE_PERSIST_PATH": persist_path,
+        # Ensure rich mode is on (the feature under test).
+        "LOG_RICH_ENABLED": "1",
+    }
+)
+
+def preexec():
+    # Give the child a controlling terminal so raw-mode / /dev/tty access works.
+    os.setsid()
+
+proc = subprocess.Popen(
+    [bin_path, "serve", "--host", "127.0.0.1", "--port", str(port)],
+    stdin=slave_fd,
+    stdout=slave_fd,
+    stderr=slave_fd,
+    env=env,
+    preexec_fn=preexec,
+    close_fds=True,
+)
+os.close(slave_fd)
+
+start = time.time()
+buf = bytearray()
+with open(transcript_path, "wb") as tf:
+    # Wait for the port to open.
+    while time.time() - start < 10:
+        try:
+            s = socket.create_connection(("127.0.0.1", port), timeout=0.2)
+            s.close()
+            break
+        except OSError:
+            pass
+        r, _, _ = select.select([master_fd], [], [], 0.05)
+        if r:
+            chunk = os.read(master_fd, 8192)
+            if chunk:
+                buf.extend(chunk)
+                tf.write(chunk)
+    else:
+        raise SystemExit("server did not open port in time")
+
+    # Give the input worker a moment to start, then inject keypresses.
+    time.sleep(0.6)
+    os.write(master_fd, b"+")
+    time.sleep(0.2)
+    os.write(master_fd, b"t")
+
+    # Wait for the persisted envfile to include the updated values.
+    expected = [b"CONSOLE_UI_HEIGHT_PERCENT=38", b"CONSOLE_UI_ANCHOR=top"]
+    while time.time() - start < 12:
+        if os.path.exists(persist_path):
+            content = open(persist_path, "rb").read()
+            if all(e in content for e in expected):
+                break
+        time.sleep(0.1)
+    else:
+        if os.path.exists(persist_path):
+            raise SystemExit(
+                "persist file missing expected keys; content:\n"
+                + open(persist_path, "rb").read().decode("utf-8", errors="replace")
+            )
+        raise SystemExit("persist file was never created")
+
+    # Best-effort teardown.
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait(timeout=2)
+PY
+    )"
+    PY_RC=$?
+    set -e
+
+    e2e_save_artifact "interactive_harness_output.txt" "${PY_OUT}"
+    e2e_copy_artifact "${PERSIST_ENV4}" "interactive_console.env" || true
+    e2e_copy_artifact "${TRANSCRIPT4}" "interactive_pty.typescript" || true
+    if [ "${PY_RC}" -ne 0 ]; then
+        e2e_fail "interactive persistence harness failed (rc=${PY_RC})"
+    else
+        e2e_pass "interactive persistence updated envfile"
+    fi
+else
+    e2e_skip "set AM_E2E_INTERACTIVE=1 to run interactive key-injection"
+fi
+
+e2e_summary

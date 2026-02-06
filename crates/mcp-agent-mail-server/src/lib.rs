@@ -500,6 +500,14 @@ struct DashboardDbStats {
     file_reservations: u64,
     contact_links: u64,
     ack_pending: u64,
+    agents_list: Vec<AgentSummary>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AgentSummary {
+    name: String,
+    program: String,
+    last_active_ts: i64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1100,13 +1108,25 @@ fn render_dashboard_frame(frame: &mut ftui::Frame<'_>, area: Rect, snapshot: &Da
         .style(header_style)
         .render(rows[0], frame);
 
-    let cols = Flex::horizontal()
-        .constraints([
-            Constraint::Percentage(39.0),
-            Constraint::Percentage(33.0),
-            Constraint::Percentage(28.0),
-        ])
-        .split(rows[1]);
+    let has_agents = !snapshot.db.agents_list.is_empty();
+    let cols = if has_agents {
+        Flex::horizontal()
+            .constraints([
+                Constraint::Percentage(32.0),
+                Constraint::Percentage(24.0),
+                Constraint::Percentage(20.0),
+                Constraint::Percentage(24.0),
+            ])
+            .split(rows[1])
+    } else {
+        Flex::horizontal()
+            .constraints([
+                Constraint::Percentage(39.0),
+                Constraint::Percentage(33.0),
+                Constraint::Percentage(28.0),
+            ])
+            .split(rows[1])
+    };
 
     let left = format!(
         "Endpoint: {}\nWeb UI: {}\nAuth: {}\nStorage: {}\nDatabase: {}",
@@ -1170,14 +1190,62 @@ fn render_dashboard_frame(frame: &mut ftui::Frame<'_>, area: Rect, snapshot: &Da
     .style(card_style)
     .render(cols[1], frame);
 
+    // Render agents panel (when agents exist)
+    let traffic_col = if has_agents {
+        let agent_block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .title(" Agents ");
+
+        // Narrow width: collapse to a single summary line
+        if cols[2].width < 22 {
+            let count = snapshot.db.agents_list.len();
+            let summary = if let Some(first) = snapshot.db.agents_list.first() {
+                format!("{count} agents\n{}", first.name)
+            } else {
+                format!("{count} agents")
+            };
+            Paragraph::new(summary)
+                .block(agent_block)
+                .style(card_style)
+                .render(cols[2], frame);
+        } else {
+            let now_us = mcp_agent_mail_db::timestamps::now_micros();
+            let max_rows = if cols[2].height > 6 { 8 } else { 4 };
+            let agent_rows: Vec<Row> = snapshot
+                .db
+                .agents_list
+                .iter()
+                .take(max_rows)
+                .map(|a| {
+                    let ago = relative_time_short(now_us, a.last_active_ts);
+                    Row::new(vec![a.name.clone(), a.program.clone(), ago])
+                })
+                .collect();
+            let dim_style = ftui::Style::default().fg(ftui_extras::theme::fg::MUTED.resolve());
+            Table::new(
+                agent_rows,
+                [
+                    Constraint::FitContentBounded { min: 6, max: 16 },
+                    Constraint::FitContentBounded { min: 4, max: 12 },
+                    Constraint::Fill,
+                ],
+            )
+            .header(Row::new(vec!["Agent", "Program", "Active"]).style(title_style.bold()))
+            .column_spacing(1)
+            .block(agent_block)
+            .style(dim_style)
+            .render(cols[2], frame);
+        }
+        3
+    } else {
+        2
+    };
+
     // Render sparkline for request throughput
     let sparkline_str = {
         use ftui::widgets::sparkline::Sparkline;
         Sparkline::new(&snapshot.sparkline_data)
-            .gradient(
-                ftui::PackedRgba::rgb(60, 120, 200),
-                ftui::PackedRgba::rgb(120, 255, 180),
-            )
+            .gradient(theme::sparkline_lo(), theme::sparkline_hi())
             .render_to_string()
     };
 
@@ -1208,7 +1276,7 @@ fn render_dashboard_frame(frame: &mut ftui::Frame<'_>, area: Rect, snapshot: &Da
         } else {
             good_style
         })
-        .render(cols[2], frame);
+        .render(cols[traffic_col], frame);
 
     let footer_text = snapshot.last_request.as_ref().map_or_else(
         || "Last: no requests observed yet".to_string(),
@@ -1256,6 +1324,22 @@ fn pretty_num(value: u64) -> String {
         out.push(ch);
     }
     out
+}
+
+/// Format a relative time string like "12s ago", "5m ago", "2h ago".
+fn relative_time_short(now_us: i64, ts_us: i64) -> String {
+    let delta_s = (now_us.saturating_sub(ts_us)) / 1_000_000;
+    if delta_s < 0 {
+        "now".to_string()
+    } else if delta_s < 60 {
+        format!("{delta_s}s ago")
+    } else if delta_s < 3600 {
+        format!("{}m ago", delta_s / 60)
+    } else if delta_s < 86400 {
+        format!("{}h ago", delta_s / 3600)
+    } else {
+        format!("{}d ago", delta_s / 86400)
+    }
 }
 
 fn human_uptime(d: Duration) -> String {
@@ -1407,6 +1491,26 @@ fn fetch_dashboard_db_stats(database_url: &str) -> DashboardDbStats {
     let Ok(conn) = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(&path) else {
         return DashboardDbStats::default();
     };
+    let agents_list = conn
+        .query_sync(
+            "SELECT name, program, last_active_ts FROM agents \
+             ORDER BY last_active_ts DESC LIMIT 10",
+            &[],
+        )
+        .ok()
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    Some(AgentSummary {
+                        name: row.get_named::<String>("name").ok()?,
+                        program: row.get_named::<String>("program").ok()?,
+                        last_active_ts: row.get_named::<i64>("last_active_ts").ok()?,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     DashboardDbStats {
         projects: dashboard_count(&conn, "SELECT COUNT(*) AS c FROM projects"),
         agents: dashboard_count(&conn, "SELECT COUNT(*) AS c FROM agents"),
@@ -1422,6 +1526,7 @@ fn fetch_dashboard_db_stats(database_url: &str) -> DashboardDbStats {
              JOIN messages m ON m.id = mr.message_id \
              WHERE m.ack_required = 1 AND mr.ack_ts IS NULL",
         ),
+        agents_list,
     }
 }
 
@@ -7367,5 +7472,54 @@ mod tests {
             out.contains("method='POST'"),
             "KV line should log POST method"
         );
+    }
+
+    // ── Agent activity display tests ──
+
+    #[test]
+    fn relative_time_short_seconds() {
+        let now = 1_000_000_000_000; // 1e12 microseconds
+        assert_eq!(relative_time_short(now, now - 5_000_000), "5s ago");
+        assert_eq!(relative_time_short(now, now - 59_000_000), "59s ago");
+    }
+
+    #[test]
+    fn relative_time_short_minutes() {
+        let now = 1_000_000_000_000;
+        assert_eq!(relative_time_short(now, now - 60_000_000), "1m ago");
+        assert_eq!(relative_time_short(now, now - 300_000_000), "5m ago");
+    }
+
+    #[test]
+    fn relative_time_short_hours() {
+        let now = 1_000_000_000_000;
+        assert_eq!(relative_time_short(now, now - 3_600_000_000), "1h ago");
+        assert_eq!(relative_time_short(now, now - 7_200_000_000), "2h ago");
+    }
+
+    #[test]
+    fn relative_time_short_days() {
+        let now = 1_000_000_000_000;
+        assert_eq!(relative_time_short(now, now - 86_400_000_000), "1d ago");
+    }
+
+    #[test]
+    fn relative_time_short_future_shows_now() {
+        let now = 1_000_000_000_000;
+        assert_eq!(relative_time_short(now, now + 5_000_000), "now");
+    }
+
+    #[test]
+    fn dashboard_db_stats_default_has_empty_agents_list() {
+        let stats = DashboardDbStats::default();
+        assert!(stats.agents_list.is_empty());
+    }
+
+    #[test]
+    fn agent_summary_default_fields() {
+        let a = AgentSummary::default();
+        assert!(a.name.is_empty());
+        assert!(a.program.is_empty());
+        assert_eq!(a.last_active_ts, 0);
     }
 }

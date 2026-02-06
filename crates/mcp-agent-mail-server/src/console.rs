@@ -1136,6 +1136,214 @@ fn colorize_json_line(line: &str) -> String {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// Log Pane (br-1m6a.20): AltScreen LogViewer wrapper
+// ──────────────────────────────────────────────────────────────────────
+
+use ftui::layout::{Constraint, Flex, Rect};
+use ftui::widgets::StatefulWidget;
+use ftui::widgets::Widget;
+use ftui::widgets::block::Block;
+use ftui::widgets::borders::BorderType;
+use ftui::widgets::log_viewer::{LogViewer, LogViewerState, LogWrapMode};
+
+/// Maximum log lines retained in the ring buffer.
+const LOG_PANE_MAX_LINES: usize = 5_000;
+
+/// Wrapper around `ftui::LogViewer` for the right-side log pane.
+pub struct LogPane {
+    viewer: LogViewer,
+    state: LogViewerState,
+}
+
+impl LogPane {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            viewer: LogViewer::new(LOG_PANE_MAX_LINES).wrap_mode(LogWrapMode::CharWrap),
+            state: LogViewerState::default(),
+        }
+    }
+
+    /// Append a log line (plain text or ANSI-stripped).
+    pub fn push(&mut self, line: impl Into<ftui::text::Text>) {
+        self.viewer.push(line);
+    }
+
+    /// Append multiple lines efficiently.
+    pub fn push_many(&mut self, lines: impl IntoIterator<Item = impl Into<ftui::text::Text>>) {
+        self.viewer.push_many(lines);
+    }
+
+    /// Total lines in buffer.
+    pub fn len(&self) -> usize {
+        self.viewer.len()
+    }
+
+    /// Whether buffer is empty.
+    pub fn is_empty(&self) -> bool {
+        self.viewer.is_empty()
+    }
+
+    /// Scroll up by N lines.
+    pub fn scroll_up(&mut self, n: usize) {
+        self.viewer.scroll_up(n);
+    }
+
+    /// Scroll down by N lines.
+    pub fn scroll_down(&mut self, n: usize) {
+        self.viewer.scroll_down(n);
+    }
+
+    /// Jump to top.
+    pub fn scroll_to_top(&mut self) {
+        self.viewer.scroll_to_top();
+    }
+
+    /// Jump to bottom and re-enable follow mode.
+    pub fn scroll_to_bottom(&mut self) {
+        self.viewer.scroll_to_bottom();
+    }
+
+    /// Page up by viewport height.
+    pub fn page_up(&mut self) {
+        self.viewer.page_up(&self.state);
+    }
+
+    /// Page down by viewport height.
+    pub fn page_down(&mut self) {
+        self.viewer.page_down(&self.state);
+    }
+
+    /// Toggle follow (auto-scroll) mode.
+    pub fn toggle_follow(&mut self) {
+        self.viewer.toggle_follow();
+    }
+
+    /// Whether auto-scroll is active.
+    pub fn auto_scroll_enabled(&self) -> bool {
+        self.viewer.auto_scroll_enabled()
+    }
+
+    /// Start a text search, return match count.
+    pub fn search(&mut self, query: &str) -> usize {
+        self.viewer.search(query)
+    }
+
+    /// Jump to next search match.
+    pub fn next_match(&mut self) {
+        self.viewer.next_match();
+    }
+
+    /// Jump to previous search match.
+    pub fn prev_match(&mut self) {
+        self.viewer.prev_match();
+    }
+
+    /// Clear active search.
+    pub fn clear_search(&mut self) {
+        self.viewer.clear_search();
+    }
+
+    /// Current search info: (1-indexed current, total).
+    pub fn search_info(&self) -> Option<(usize, usize)> {
+        self.viewer.search_info()
+    }
+
+    /// Set or clear a filter pattern.
+    pub fn set_filter(&mut self, pattern: Option<&str>) {
+        self.viewer.set_filter(pattern);
+    }
+
+    /// Clear all lines.
+    pub fn clear(&mut self) {
+        self.viewer.clear();
+    }
+
+    /// Render into the given area on a frame.
+    pub fn render(&mut self, area: Rect, frame: &mut ftui::Frame<'_>) {
+        self.viewer.render(area, frame, &mut self.state);
+    }
+}
+
+impl Default for LogPane {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Compute the column widths for a left-split layout.
+///
+/// Returns `(left_width, right_width)` for the HUD and log pane respectively.
+/// If the total width is too small, returns `None` (caller should fall back to inline).
+#[must_use]
+pub fn split_columns(total_width: u16, ratio_percent: u16) -> Option<(u16, u16)> {
+    if total_width < 60 {
+        return None;
+    }
+    let ratio = ratio_percent.clamp(10, 80);
+    // The product of two u16 values divided by 100 always fits in u16.
+    #[allow(clippy::cast_possible_truncation)]
+    let left = (u32::from(total_width) * u32::from(ratio) / 100) as u16;
+    let left = left.max(30).min(total_width.saturating_sub(30));
+    let right = total_width.saturating_sub(left);
+    if right < 20 {
+        return None;
+    }
+    Some((left, right))
+}
+
+/// Render a two-pane split frame: HUD on the left, `LogViewer` on the right.
+///
+/// `render_hud_fn` is a closure that renders the existing HUD into a given area.
+/// This keeps the dashboard rendering logic in lib.rs while letting console.rs
+/// own the split layout and log pane rendering.
+pub fn render_split_frame(
+    frame: &mut ftui::Frame<'_>,
+    area: Rect,
+    ratio_percent: u16,
+    log_pane: &mut LogPane,
+    render_hud_fn: impl FnOnce(&mut ftui::Frame<'_>, Rect),
+) {
+    let Some((left_w, _right_w)) = split_columns(area.width, ratio_percent) else {
+        // Too narrow for split — fall back to full-width HUD.
+        render_hud_fn(frame, area);
+        return;
+    };
+
+    let cols = Flex::horizontal()
+        .constraints([Constraint::Fixed(left_w), Constraint::Fill])
+        .split(area);
+
+    // Left: existing HUD dashboard.
+    render_hud_fn(frame, cols[0]);
+
+    // Right: log viewer with a border.
+    let follow_indicator = if log_pane.auto_scroll_enabled() {
+        " Follow "
+    } else {
+        " Paused "
+    };
+
+    let search_indicator = log_pane
+        .search_info()
+        .map(|(cur, total)| format!(" {cur}/{total} "));
+
+    let mut title = String::from(" Logs ");
+    if let Some(ref si) = search_indicator {
+        title.push_str(si);
+    }
+    title.push_str(follow_indicator);
+
+    let log_block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(&title);
+    let inner = log_block.inner(cols[1]);
+    log_block.render(cols[1], frame);
+
+    log_pane.render(inner, frame);
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Tests
 // ──────────────────────────────────────────────────────────────────────
 
@@ -1685,6 +1893,142 @@ mod tests {
             let panel = render_http_request_panel(100, "GET", "/x", status, 1, "x", true)
                 .unwrap_or_else(|| panic!("{label} panel should render"));
             assert!(panel.contains("38;2;"), "{label}: 24-bit color");
+        }
+    }
+
+    // ── LogPane tests (br-1m6a.20) ──
+
+    #[test]
+    fn log_pane_push_and_len() {
+        let mut pane = LogPane::new();
+        assert!(pane.is_empty());
+        assert_eq!(pane.len(), 0);
+        pane.push("hello");
+        assert_eq!(pane.len(), 1);
+        pane.push("world");
+        assert_eq!(pane.len(), 2);
+        assert!(!pane.is_empty());
+    }
+
+    #[test]
+    fn log_pane_push_many() {
+        let mut pane = LogPane::new();
+        pane.push_many(vec!["a", "b", "c"]);
+        assert_eq!(pane.len(), 3);
+    }
+
+    #[test]
+    fn log_pane_clear() {
+        let mut pane = LogPane::new();
+        pane.push_many(vec!["a", "b"]);
+        assert_eq!(pane.len(), 2);
+        pane.clear();
+        assert!(pane.is_empty());
+    }
+
+    #[test]
+    fn log_pane_search() {
+        let mut pane = LogPane::new();
+        pane.push("INFO: starting");
+        pane.push("ERROR: something failed");
+        pane.push("INFO: done");
+        let count = pane.search("ERROR");
+        assert_eq!(count, 1);
+        assert_eq!(pane.search_info(), Some((1, 1)));
+        pane.clear_search();
+        assert_eq!(pane.search_info(), None);
+    }
+
+    #[test]
+    fn log_pane_filter() {
+        let mut pane = LogPane::new();
+        pane.push("INFO: a");
+        pane.push("ERROR: b");
+        pane.push("INFO: c");
+        pane.set_filter(Some("ERROR"));
+        // Filter is applied; push another line to verify incremental matching.
+        pane.push("ERROR: d");
+        pane.set_filter(None);
+        assert_eq!(pane.len(), 4);
+    }
+
+    #[test]
+    fn log_pane_follow_toggle() {
+        let mut pane = LogPane::new();
+        assert!(pane.auto_scroll_enabled());
+        pane.toggle_follow();
+        assert!(!pane.auto_scroll_enabled());
+        pane.toggle_follow();
+        assert!(pane.auto_scroll_enabled());
+    }
+
+    #[test]
+    fn log_pane_scroll_operations() {
+        let mut pane = LogPane::new();
+        for i in 0..100 {
+            pane.push(format!("line {i}"));
+        }
+        // These should not panic.
+        pane.scroll_up(5);
+        pane.scroll_down(3);
+        pane.scroll_to_top();
+        pane.scroll_to_bottom();
+        pane.page_up();
+        pane.page_down();
+    }
+
+    #[test]
+    fn log_pane_default() {
+        let pane = LogPane::default();
+        assert!(pane.is_empty());
+    }
+
+    // ── split_columns tests (br-1m6a.20) ──
+
+    #[test]
+    fn split_columns_too_narrow_returns_none() {
+        assert!(split_columns(59, 30).is_none());
+        assert!(split_columns(0, 30).is_none());
+    }
+
+    #[test]
+    fn split_columns_normal_width() {
+        let (left, right) = split_columns(100, 30).expect("100 wide should split");
+        assert_eq!(left, 30);
+        assert_eq!(right, 70);
+        assert_eq!(left + right, 100);
+    }
+
+    #[test]
+    fn split_columns_clamps_ratio() {
+        // Ratio below 10% should be clamped to 10%.
+        let (left, _right) = split_columns(100, 5).expect("should split");
+        assert!(left >= 10, "left={left} should be at least 10");
+
+        // Ratio above 80% should be clamped to 80%.
+        let (left, right) = split_columns(100, 95).expect("should split");
+        assert!(right >= 20, "right={right} should be at least 20");
+        assert!(left <= 80, "left={left} should be at most 80");
+    }
+
+    #[test]
+    fn split_columns_60_wide_minimum() {
+        let result = split_columns(60, 30);
+        assert!(result.is_some());
+        let (left, right) = result.unwrap();
+        assert!(left >= 30);
+        assert!(right >= 20);
+        assert_eq!(left + right, 60);
+    }
+
+    #[test]
+    fn split_columns_preserves_total_width() {
+        for w in [60, 80, 100, 120, 160, 200] {
+            for ratio in [10, 20, 30, 50, 70, 80] {
+                if let Some((l, r)) = split_columns(w, ratio) {
+                    assert_eq!(l + r, w, "w={w} ratio={ratio}: {l}+{r} != {w}");
+                }
+            }
         }
     }
 }
