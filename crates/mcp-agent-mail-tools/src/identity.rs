@@ -289,6 +289,10 @@ Check that all parameters have valid values."
 
     let row = db_outcome_to_mcp_result(agent_out)?;
 
+    // Invalidate + repopulate read cache after mutation
+    mcp_agent_mail_db::read_cache().invalidate_agent(project_id, &row.name);
+    mcp_agent_mail_db::read_cache().put_agent(project_id, &row.name, &row);
+
     // Write agent profile to git archive (best-effort)
     let config = Config::from_env();
     let agent_json = serde_json::json!({
@@ -332,6 +336,7 @@ Check that all parameters have valid values."
 ///
 /// # Returns
 /// New agent profile
+#[allow(clippy::too_many_lines)]
 #[tool(description = "Create a new, unique agent identity and persist its profile to Git.")]
 pub async fn create_agent_identity(
     ctx: &McpContext,
@@ -432,6 +437,10 @@ Choose a different name (or omit the name to auto-generate one)."
     .await;
 
     let row = db_outcome_to_mcp_result(agent_out)?;
+
+    // Invalidate + repopulate read cache after mutation
+    mcp_agent_mail_db::read_cache().invalidate_agent(project_id, &row.name);
+    mcp_agent_mail_db::read_cache().put_agent(project_id, &row.name, &row);
 
     // Write agent profile to git archive (best-effort)
     let config = Config::from_env();

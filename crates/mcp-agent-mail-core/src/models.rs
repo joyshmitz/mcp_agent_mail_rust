@@ -445,7 +445,7 @@ pub fn sanitize_agent_name(value: &str) -> Option<String> {
     let mut cleaned: String = value
         .trim()
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
+        .filter(char::is_ascii_alphanumeric)
         .collect();
 
     if cleaned.is_empty() {

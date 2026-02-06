@@ -672,6 +672,10 @@ pub async fn send_message(
     let message_id = message.id.unwrap_or(0);
 
     // Emit notification signals for to/cc recipients only (never bcc).
+    //
+    // IMPORTANT: These must be synchronous so that the `.signal` file exists
+    // immediately when `send_message` returns (conformance parity with legacy
+    // Python implementation + fixture tests).
     let notification_meta = mcp_agent_mail_storage::NotificationMessage {
         id: Some(message_id),
         from: Some(sender_name.clone()),
@@ -681,20 +685,12 @@ pub async fn send_message(
     let mut notified = HashSet::new();
     for name in resolved_to.iter().chain(resolved_cc_recipients.iter()) {
         if notified.insert(name.clone()) {
-            let op = mcp_agent_mail_storage::WriteOp::NotificationSignal {
-                config: config.clone(),
-                project_slug: project.slug.clone(),
-                agent_name: name.clone(),
-                metadata: Some(notification_meta.clone()),
-            };
-            if !mcp_agent_mail_storage::wbq_enqueue(op) {
-                let _ = mcp_agent_mail_storage::emit_notification_signal(
-                    &config,
-                    &project.slug,
-                    name,
-                    Some(&notification_meta),
-                );
-            }
+            let _ = mcp_agent_mail_storage::emit_notification_signal(
+                &config,
+                &project.slug,
+                name,
+                Some(&notification_meta),
+            );
         }
     }
 
@@ -882,9 +878,13 @@ pub async fn reply_message(
         resolved_bcc_recipients.push(agent.name);
     }
 
-    // Create reply message - inherit importance and ack_required from original
+    // Create reply message + recipients in a single DB transaction
+    let recipient_refs: Vec<(i64, &str)> = all_recipients
+        .iter()
+        .map(|(id, kind)| (*id, kind.as_str()))
+        .collect();
     let reply = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::create_message(
+        mcp_agent_mail_db::queries::create_message_with_recipients(
             ctx.cx(),
             &pool,
             project_id,
@@ -895,21 +895,12 @@ pub async fn reply_message(
             &original.importance,
             original.ack_required != 0,
             "[]", // No attachments for reply by default
+            &recipient_refs,
         )
         .await,
     )?;
 
     let reply_id = reply.id.unwrap_or(0);
-
-    // Add recipients
-    let recipient_refs: Vec<(i64, &str)> = all_recipients
-        .iter()
-        .map(|(id, kind)| (*id, kind.as_str()))
-        .collect();
-    db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::add_recipients(ctx.cx(), &pool, reply_id, &recipient_refs)
-            .await,
-    )?;
 
     // Write reply message bundle to git archive (best-effort)
     {

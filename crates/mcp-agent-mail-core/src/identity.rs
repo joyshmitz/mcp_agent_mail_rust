@@ -239,6 +239,9 @@ pub fn compute_project_slug(human_key: &str) -> String {
     }
 
     let mode = config.project_identity_mode;
+    if mode == ProjectIdentityMode::Dir {
+        return slugify(human_key);
+    }
     let target_path = resolve_path(human_key);
 
     let repo_root = git_cmd(&target_path, &["rev-parse", "--show-toplevel"]);

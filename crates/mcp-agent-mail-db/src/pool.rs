@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 ///
 /// Tuned for extreme concurrent load: 8 base + 12 overflow = 20 max connections.
 /// With WAL mode, all 20 can read concurrently; writes serialize through the WAL
-/// writer lock but the 120s busy_timeout (set in PRAGMAs) prevents SQLITE_BUSY.
+/// writer lock but the 120s `busy_timeout` (set in PRAGMAs) prevents `SQLITE_BUSY`.
 pub const DEFAULT_POOL_SIZE: usize = 8;
 pub const DEFAULT_MAX_OVERFLOW: usize = 12;
 pub const DEFAULT_POOL_TIMEOUT_MS: u64 = 60_000;

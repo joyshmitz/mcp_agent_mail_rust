@@ -788,42 +788,15 @@ fn run_fixtures_against_rust_server_router() {
     let cc_signal = signal_root.join("QuietMeadow.signal");
     let bcc_signal = signal_root.join("SilverPeak.signal");
 
-    // Debug: check signal directory structure
-    eprintln!("signal_root: {}", signal_root.display());
-    eprintln!("signal_root exists: {}", signal_root.exists());
-    eprintln!("notif_signals_dir: {}", notif_signals_dir.display());
-    eprintln!(
-        "notif_signals_dir exists: {}",
-        notif_signals_dir.exists()
-    );
-    eprintln!("to_signal path: {}", to_signal.display());
-    eprintln!("project_slug: {project_slug}");
-    eprintln!("send_json: {send_json}");
-    // List files in signals dir recursively
-    fn list_dir_recursive(path: &std::path::Path, indent: usize) {
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    let p = entry.path();
-                    eprintln!(
-                        "{}{}",
-                        " ".repeat(indent),
-                        p.file_name().unwrap_or_default().to_string_lossy()
-                    );
-                    if p.is_dir() {
-                        list_dir_recursive(&p, indent + 2);
-                    }
-                }
-            }
-        }
-    }
-    if notif_signals_dir.exists() {
-        list_dir_recursive(&notif_signals_dir, 2);
-    }
+    // Flush write-behind queue so notification signals are written to disk
+    mcp_agent_mail_storage::wbq_flush();
 
     assert!(to_signal.exists(), "expected CalmRiver signal file");
     assert!(cc_signal.exists(), "expected QuietMeadow signal file");
-    assert!(!bcc_signal.exists(), "did not expect SilverPeak signal file");
+    assert!(
+        !bcc_signal.exists(),
+        "did not expect SilverPeak signal file"
+    );
 
     let to_payload: Value = serde_json::from_str(
         &std::fs::read_to_string(&to_signal).expect("failed to read CalmRiver signal"),

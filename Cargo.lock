@@ -3781,6 +3781,7 @@ dependencies = [
  "insta",
  "mcp-agent-mail-core",
  "mcp-agent-mail-server",
+ "mcp-agent-mail-storage",
  "serde",
  "serde_json",
  "tempfile",

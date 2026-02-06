@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cache;
 pub mod error;
 pub mod models;
 pub mod pool;
@@ -22,6 +23,7 @@ pub mod schema;
 pub mod timestamps;
 pub mod tracking;
 
+pub use cache::read_cache;
 pub use error::{DbError, DbResult};
 pub use models::*;
 pub use pool::{DbPool, DbPoolConfig, create_pool, get_or_create_pool};

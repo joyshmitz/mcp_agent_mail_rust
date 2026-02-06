@@ -16,4 +16,5 @@ insta = { version = "1.38", features = ["json"] }
 fastmcp.workspace = true
 fastmcp-core.workspace = true
 mcp-agent-mail-core.workspace = true
+mcp-agent-mail-storage.workspace = true
 tempfile.workspace = true

@@ -48,6 +48,19 @@ pub struct ConflictHolder {
     pub expires_ts: String,
 }
 
+#[derive(Debug, Clone)]
+struct PendingConflictHolder {
+    agent_id: i64,
+    reservation_id: i64,
+    expires_ts: String,
+}
+
+#[derive(Debug, Clone)]
+struct PendingReservationConflict {
+    path: String,
+    holders: Vec<PendingConflictHolder>,
+}
+
 /// File reservation response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReservationResponse {
@@ -161,19 +174,6 @@ pub async fn file_reservation_paths(
     )?;
 
     let mut paths_to_grant: Vec<&str> = Vec::new();
-
-    #[derive(Debug, Clone)]
-    struct PendingConflictHolder {
-        agent_id: i64,
-        reservation_id: i64,
-        expires_ts: String,
-    }
-
-    #[derive(Debug, Clone)]
-    struct PendingReservationConflict {
-        path: String,
-        holders: Vec<PendingConflictHolder>,
-    }
 
     let mut pending_conflicts: Vec<PendingReservationConflict> = Vec::new();
 

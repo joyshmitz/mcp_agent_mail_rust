@@ -295,18 +295,9 @@ async fn traw_execute(
 /// Generate a URL-safe slug from a human key (path).
 #[must_use]
 pub fn generate_slug(human_key: &str) -> String {
-    human_key
-        .trim_start_matches('/')
-        .to_lowercase()
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
+    // Keep slug semantics identical to the legacy Python `_compute_project_slug` default behavior.
+    // (Collapses runs of non-alphanumerics into a single '-', trims '-', and uses "project" fallback.)
+    mcp_agent_mail_core::compute_project_slug(human_key)
 }
 
 fn map_sql_error(e: &SqlError) -> DbError {
@@ -780,7 +771,7 @@ pub async fn create_message(
     }
 }
 
-/// Create a message AND insert all recipients in a single SQLite transaction.
+/// Create a message AND insert all recipients in a single `SQLite` transaction.
 ///
 /// This eliminates N+2 separate auto-commit writes (1 message INSERT + N
 /// recipient INSERTs) into a single transaction with 1 fsync.
@@ -809,13 +800,13 @@ pub async fn create_message_with_recipients(
 
     let tracked = tracked(&*conn);
 
-    // Begin transaction
-    let tx = match tracked.begin(cx).await {
-        Outcome::Ok(t) => t,
-        Outcome::Err(e) => return Outcome::Err(DbError::Sql(e)),
+    // BEGIN TRANSACTION (manual SQL so we can keep using Connection-based insert!)
+    match tracked.execute(cx, "BEGIN IMMEDIATE", &[]).await {
+        Outcome::Ok(_) => {}
+        Outcome::Err(e) => return Outcome::Err(map_sql_error(&e)),
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
+    }
 
     // Insert message
     let mut row = MessageRow {
@@ -831,22 +822,22 @@ pub async fn create_message_with_recipients(
         attachments: attachments.to_string(),
     };
 
-    let id_out = map_sql_outcome(insert!(&row).execute(cx, &tx).await);
+    let id_out = map_sql_outcome(insert!(&row).execute(cx, &tracked).await);
     let message_id = match id_out {
         Outcome::Ok(id) => {
             row.id = Some(id);
             id
         }
         Outcome::Err(e) => {
-            let _ = tx.rollback(cx).await;
+            let _ = tracked.execute(cx, "ROLLBACK", &[]).await;
             return Outcome::Err(e);
         }
         Outcome::Cancelled(r) => {
-            let _ = tx.rollback(cx).await;
+            let _ = tracked.execute(cx, "ROLLBACK", &[]).await;
             return Outcome::Cancelled(r);
         }
         Outcome::Panicked(p) => {
-            let _ = tx.rollback(cx).await;
+            let _ = tracked.execute(cx, "ROLLBACK", &[]).await;
             return Outcome::Panicked(p);
         }
     };
@@ -861,28 +852,28 @@ pub async fn create_message_with_recipients(
             ack_ts: None,
         };
 
-        let out = map_sql_outcome(insert!(&recip).execute(cx, &tx).await);
+        let out = map_sql_outcome(insert!(&recip).execute(cx, &tracked).await);
         match out {
             Outcome::Ok(_) => {}
             Outcome::Err(e) => {
-                let _ = tx.rollback(cx).await;
+                let _ = tracked.execute(cx, "ROLLBACK", &[]).await;
                 return Outcome::Err(e);
             }
             Outcome::Cancelled(r) => {
-                let _ = tx.rollback(cx).await;
+                let _ = tracked.execute(cx, "ROLLBACK", &[]).await;
                 return Outcome::Cancelled(r);
             }
             Outcome::Panicked(p) => {
-                let _ = tx.rollback(cx).await;
+                let _ = tracked.execute(cx, "ROLLBACK", &[]).await;
                 return Outcome::Panicked(p);
             }
         }
     }
 
-    // Commit (single fsync)
-    match tx.commit(cx).await {
-        Outcome::Ok(()) => Outcome::Ok(row),
-        Outcome::Err(e) => Outcome::Err(DbError::Sql(e)),
+    // COMMIT (single fsync)
+    match tracked.execute(cx, "COMMIT", &[]).await {
+        Outcome::Ok(_) => Outcome::Ok(row),
+        Outcome::Err(e) => Outcome::Err(map_sql_error(&e)),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
     }

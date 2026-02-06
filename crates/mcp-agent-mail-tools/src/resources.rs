@@ -15,6 +15,9 @@ use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::micros_to_iso;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     tool_cluster,
@@ -3068,6 +3071,173 @@ pub async fn views_ack_overdue(ctx: &McpContext, agent: String) -> McpResult<Str
 // File Reservation Resources
 // ============================================================================
 
+#[derive(Debug, Clone, Default)]
+struct ReservationPatternActivity {
+    matches: bool,
+    fs_activity_micros: Option<i64>,
+    git_activity_micros: Option<i64>,
+}
+
+const RESERVATION_GLOB_MARKERS: &[char] = &['*', '?', '['];
+
+fn reservation_contains_glob(pattern: &str) -> bool {
+    RESERVATION_GLOB_MARKERS
+        .iter()
+        .any(|m| pattern.contains(*m))
+}
+
+fn reservation_normalize_pattern(pattern: &str) -> String {
+    let mut s = pattern.trim();
+    while let Some(rest) = s.strip_prefix("./") {
+        s = rest;
+    }
+    s.trim_start_matches('/').trim().to_string()
+}
+
+fn reservation_project_workspace_path(project_human_key: &str) -> Option<PathBuf> {
+    let candidate = PathBuf::from(project_human_key);
+    if candidate.exists() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+fn reservation_open_repo_root(workspace: &Path) -> Option<(PathBuf, PathBuf)> {
+    let repo = git2::Repository::discover(workspace).ok()?;
+    let root = repo.workdir()?.to_path_buf();
+    let root_canon = root.canonicalize().unwrap_or(root);
+    let ws_canon = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+
+    if !ws_canon.starts_with(&root_canon) {
+        return None;
+    }
+
+    let rel = ws_canon.strip_prefix(&root_canon).ok()?.to_path_buf();
+    Some((root_canon, rel))
+}
+
+fn reservation_system_time_to_micros(t: SystemTime) -> Option<i64> {
+    let dur = t.duration_since(UNIX_EPOCH).ok()?;
+    i64::try_from(dur.as_micros()).ok()
+}
+
+fn reservation_mtime_micros(path: &Path) -> Option<i64> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    reservation_system_time_to_micros(modified)
+}
+
+fn reservation_path_to_slash_string(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_string()
+}
+
+fn reservation_git_pathspec(workspace_rel: &Path, normalized_pattern: &str) -> String {
+    let rel = reservation_path_to_slash_string(workspace_rel);
+    let mut out = String::new();
+    if !rel.is_empty() && rel != "." {
+        out.push_str(rel.trim_end_matches('/'));
+        out.push('/');
+    }
+    out.push_str(normalized_pattern.trim_start_matches('/'));
+    out
+}
+
+fn reservation_git_latest_activity_micros(
+    repo_root: &Path,
+    pathspec: &str,
+    use_glob_magic: bool,
+) -> Option<i64> {
+    if pathspec.trim().is_empty() {
+        return None;
+    }
+
+    let arg = if use_glob_magic {
+        format!(":(glob){pathspec}")
+    } else {
+        pathspec.to_string()
+    };
+
+    // `git log -1 --format=%ct -- <pathspec>` returns commit unix seconds.
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["log", "-1", "--format=%ct", "--"])
+        .arg(arg)
+        .output()
+        .ok()?;
+
+    if !out.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let secs: i64 = stdout.trim().parse().ok()?;
+    Some(secs.saturating_mul(1_000_000))
+}
+
+fn reservation_compute_pattern_activity(
+    workspace: Option<&Path>,
+    repo_root: Option<&Path>,
+    workspace_rel: Option<&Path>,
+    pattern_raw: &str,
+) -> ReservationPatternActivity {
+    let Some(workspace) = workspace else {
+        return ReservationPatternActivity::default();
+    };
+
+    let normalized = reservation_normalize_pattern(pattern_raw);
+    if normalized.is_empty() {
+        return ReservationPatternActivity::default();
+    }
+
+    let has_glob = reservation_contains_glob(&normalized);
+    let mut matches = false;
+    let mut fs_latest: Option<i64> = None;
+
+    if has_glob {
+        let glob_pattern = workspace.join(&normalized).to_string_lossy().to_string();
+        if let Ok(iter) = glob::glob(&glob_pattern) {
+            for entry in iter {
+                let Ok(path) = entry else { continue };
+                matches = true;
+                if let Some(ts) = reservation_mtime_micros(&path) {
+                    fs_latest = Some(fs_latest.map_or(ts, |prev| prev.max(ts)));
+                }
+            }
+        }
+    } else {
+        let candidate = workspace.join(&normalized);
+        if candidate.exists() {
+            matches = true;
+            fs_latest = reservation_mtime_micros(&candidate);
+        }
+    }
+
+    let git_activity = if matches {
+        match (repo_root, workspace_rel) {
+            (Some(root), Some(rel)) => {
+                let pathspec = reservation_git_pathspec(rel, &normalized);
+                reservation_git_latest_activity_micros(root, &pathspec, has_glob)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    ReservationPatternActivity {
+        matches,
+        fs_activity_micros: fs_latest,
+        git_activity_micros: git_activity,
+    }
+}
+
 /// File reservation entry (matches Python output format)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileReservationResourceEntry {
@@ -3088,6 +3258,7 @@ pub struct FileReservationResourceEntry {
 }
 
 /// Get file reservations for a project.
+#[allow(clippy::too_many_lines)]
 #[resource(
     uri = "resource://file_reservations/{slug}",
     description = "File reservations in a project"
@@ -3098,19 +3269,195 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
 
     let pool = get_db_pool()?;
 
-    // Find project by slug
-    let projects =
-        db_outcome_to_mcp_result(mcp_agent_mail_db::queries::list_projects(ctx.cx(), &pool).await)?;
-
-    let project = projects
-        .into_iter()
-        .find(|p| p.slug == slug_str)
-        .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Project not found"))?;
+    // Resolve project by slug or human key.
+    let project = if slug_str.starts_with('/') {
+        resolve_project(ctx, &pool, &slug_str).await?
+    } else {
+        match mcp_agent_mail_db::queries::get_project_by_slug(ctx.cx(), &pool, &slug_str).await {
+            asupersync::Outcome::Ok(row) => row,
+            asupersync::Outcome::Err(_) => {
+                return Err(McpError::new(
+                    McpErrorCode::InvalidParams,
+                    "Project not found",
+                ));
+            }
+            asupersync::Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
+            asupersync::Outcome::Panicked(p) => {
+                return Err(McpError::internal_error(format!(
+                    "Internal panic: {}",
+                    p.message()
+                )));
+            }
+        }
+    };
 
     let project_id = project.id.unwrap_or(0);
 
-    // List file reservations
-    let rows = db_outcome_to_mcp_result(
+    let config = Config::from_env();
+    let now_micros = mcp_agent_mail_db::now_micros();
+    let inactivity_seconds =
+        i64::try_from(config.file_reservation_inactivity_seconds).unwrap_or(i64::MAX);
+    let grace_seconds =
+        i64::try_from(config.file_reservation_activity_grace_seconds).unwrap_or(i64::MAX);
+    let inactivity_micros = inactivity_seconds.saturating_mul(1_000_000);
+    let grace_micros = grace_seconds.saturating_mul(1_000_000);
+
+    // Optional workspace and repo roots for filesystem/git activity signals.
+    let workspace = reservation_project_workspace_path(&project.human_key);
+    let repo_info = workspace.as_deref().and_then(reservation_open_repo_root);
+    let repo_root = repo_info.as_ref().map(|(root, _)| root.as_path());
+    let workspace_rel = repo_info.as_ref().map(|(_, rel)| rel.as_path());
+
+    // Cleanup: release any expired (TTL) reservations and any stale reservations.
+    //
+    // Parity with Python: this resource is allowed to perform best-effort cleanup.
+    let mut release_payloads: Vec<serde_json::Value> = Vec::new();
+
+    // We only need agents map + mail cache for stale evaluation.
+    let agent_rows = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await,
+    )?;
+    let agent_by_id: HashMap<i64, mcp_agent_mail_db::AgentRow> = agent_rows
+        .iter()
+        .filter_map(|row| row.id.map(|id| (id, row.clone())))
+        .collect();
+
+    let mut mail_activity_cache: HashMap<i64, Option<i64>> = HashMap::new();
+    let mut pattern_activity_cache: HashMap<String, ReservationPatternActivity> = HashMap::new();
+
+    let all_rows = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::list_file_reservations(ctx.cx(), &pool, project_id, false)
+            .await,
+    )?;
+
+    // Expire TTL-elapsed reservations (released_ts=NULL AND expires_ts < now).
+    for row in all_rows
+        .iter()
+        .filter(|r| r.released_ts.is_none() && r.expires_ts < now_micros)
+    {
+        let Some(id) = row.id else { continue };
+        let updated = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::force_release_reservation(ctx.cx(), &pool, id).await,
+        )?;
+        if updated == 0 {
+            continue;
+        }
+        let agent_name = agent_by_id
+            .get(&row.agent_id)
+            .map_or_else(|| format!("agent_{}", row.agent_id), |a| a.name.clone());
+
+        release_payloads.push(serde_json::json!({
+            "id": id,
+            "project": project.human_key.clone(),
+            "agent": agent_name,
+            "path_pattern": row.path_pattern.clone(),
+            "exclusive": row.exclusive != 0,
+            "reason": row.reason.clone(),
+            "created_ts": micros_to_iso(row.created_ts),
+            "expires_ts": micros_to_iso(row.expires_ts),
+            "released_ts": micros_to_iso(now_micros),
+        }));
+    }
+
+    // Release stale reservations (unreleased + agent inactive + no recent mail/fs/git).
+    for row in all_rows
+        .iter()
+        .filter(|r| r.released_ts.is_none() && r.expires_ts >= now_micros)
+    {
+        let Some(id) = row.id else { continue };
+        let Some(agent) = agent_by_id.get(&row.agent_id) else {
+            continue;
+        };
+
+        let agent_inactive = now_micros.saturating_sub(agent.last_active_ts) > inactivity_micros;
+
+        let mail_activity = if let Some(val) = mail_activity_cache.get(&row.agent_id) {
+            *val
+        } else {
+            let out = db_outcome_to_mcp_result(
+                mcp_agent_mail_db::queries::get_agent_last_mail_activity(
+                    ctx.cx(),
+                    &pool,
+                    row.agent_id,
+                    project_id,
+                )
+                .await,
+            )?;
+            mail_activity_cache.insert(row.agent_id, out);
+            out
+        };
+        let recent_mail =
+            mail_activity.is_some_and(|ts| now_micros.saturating_sub(ts) <= grace_micros);
+
+        let pat_activity = pattern_activity_cache
+            .entry(row.path_pattern.clone())
+            .or_insert_with(|| {
+                reservation_compute_pattern_activity(
+                    workspace.as_deref(),
+                    repo_root,
+                    workspace_rel,
+                    &row.path_pattern,
+                )
+            })
+            .clone();
+        let recent_fs = pat_activity
+            .fs_activity_micros
+            .is_some_and(|ts| now_micros.saturating_sub(ts) <= grace_micros);
+        let recent_git = pat_activity
+            .git_activity_micros
+            .is_some_and(|ts| now_micros.saturating_sub(ts) <= grace_micros);
+
+        let stale = agent_inactive && !(recent_mail || recent_fs || recent_git);
+        if !stale {
+            continue;
+        }
+
+        let updated = db_outcome_to_mcp_result(
+            mcp_agent_mail_db::queries::force_release_reservation(ctx.cx(), &pool, id).await,
+        )?;
+        if updated == 0 {
+            continue;
+        }
+
+        // Clamp expires_ts to released_ts for archive guard semantics.
+        let expires_clamped = row.expires_ts.min(now_micros);
+
+        release_payloads.push(serde_json::json!({
+            "id": id,
+            "project": project.human_key.clone(),
+            "agent": agent.name,
+            "path_pattern": row.path_pattern.clone(),
+            "exclusive": row.exclusive != 0,
+            "reason": row.reason.clone(),
+            "created_ts": micros_to_iso(row.created_ts),
+            "expires_ts": micros_to_iso(expires_clamped),
+            "released_ts": micros_to_iso(now_micros),
+        }));
+    }
+
+    // Best-effort archive artifact writes for any releases.
+    if !release_payloads.is_empty() {
+        match mcp_agent_mail_storage::ensure_archive(&config, &project.slug) {
+            Ok(archive) => {
+                let result = mcp_agent_mail_storage::with_project_lock(&archive, || {
+                    mcp_agent_mail_storage::write_file_reservation_records(
+                        &archive,
+                        &config,
+                        &release_payloads,
+                    )
+                });
+                if let Err(err) = result {
+                    tracing::warn!("Failed to write released reservation artifacts: {err}");
+                }
+            }
+            Err(err) => {
+                tracing::warn!("Failed to ensure archive for reservation cleanup: {err}");
+            }
+        }
+    }
+
+    // List file reservations for the resource output after cleanup.
+    let mut rows = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::list_file_reservations(
             ctx.cx(),
             &pool,
@@ -3125,40 +3472,112 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
         mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await,
     )?;
 
-    let reservations: Vec<FileReservationResourceEntry> = rows
-        .into_iter()
-        .map(|row| {
-            let agent_name = agents
-                .iter()
-                .find(|a| a.id == Some(row.agent_id))
-                .map(|a| a.name.clone())
-                .unwrap_or_default();
-
-            // Compute stale_reasons (simplified - full impl would check activity)
-            let stale_reasons = vec![
-                "agent_recently_active".to_string(),
-                "mail_activity_recent".to_string(),
-                "path_pattern_unmatched".to_string(),
-            ];
-
-            FileReservationResourceEntry {
-                id: row.id.unwrap_or(0),
-                agent: agent_name,
-                path_pattern: row.path_pattern,
-                exclusive: row.exclusive != 0,
-                reason: row.reason,
-                created_ts: None, // Python shows null for timestamps in resource
-                expires_ts: None,
-                released_ts: None,
-                stale: false,
-                stale_reasons,
-                last_agent_activity_ts: None,
-                last_mail_activity_ts: None,
-                last_git_activity_ts: None,
-                last_filesystem_activity_ts: None,
-            }
-        })
+    let agent_names: HashMap<i64, String> = agents
+        .iter()
+        .filter_map(|row| row.id.map(|id| (id, row.name.clone())))
         .collect();
+
+    // Match Python ordering: created_ts asc (id is usually insertion order but not guaranteed).
+    rows.sort_by_key(|r| r.created_ts);
+
+    let mut reservations: Vec<FileReservationResourceEntry> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let agent_name = agent_names
+            .get(&row.agent_id)
+            .cloned()
+            .unwrap_or_else(|| format!("agent_{}", row.agent_id));
+        let last_agent_activity_ts = agent_by_id
+            .get(&row.agent_id)
+            .map(|a| micros_to_iso(a.last_active_ts));
+
+        let mail_activity = if let Some(val) = mail_activity_cache.get(&row.agent_id) {
+            *val
+        } else {
+            let out = db_outcome_to_mcp_result(
+                mcp_agent_mail_db::queries::get_agent_last_mail_activity(
+                    ctx.cx(),
+                    &pool,
+                    row.agent_id,
+                    project_id,
+                )
+                .await,
+            )?;
+            mail_activity_cache.insert(row.agent_id, out);
+            out
+        };
+
+        let pat_activity = if let Some(val) = pattern_activity_cache.get(&row.path_pattern) {
+            val.clone()
+        } else {
+            let computed = reservation_compute_pattern_activity(
+                workspace.as_deref(),
+                repo_root,
+                workspace_rel,
+                &row.path_pattern,
+            );
+            pattern_activity_cache.insert(row.path_pattern.clone(), computed.clone());
+            computed
+        };
+
+        let agent_last_active = agent_by_id.get(&row.agent_id).map(|a| a.last_active_ts);
+        let agent_inactive =
+            agent_last_active.is_some_and(|ts| now_micros.saturating_sub(ts) > inactivity_micros);
+        let recent_mail =
+            mail_activity.is_some_and(|ts| now_micros.saturating_sub(ts) <= grace_micros);
+        let recent_fs = pat_activity
+            .fs_activity_micros
+            .is_some_and(|ts| now_micros.saturating_sub(ts) <= grace_micros);
+        let recent_git = pat_activity
+            .git_activity_micros
+            .is_some_and(|ts| now_micros.saturating_sub(ts) <= grace_micros);
+
+        let stale = row.released_ts.is_none()
+            && agent_inactive
+            && !(recent_mail || recent_fs || recent_git);
+
+        let mut stale_reasons = Vec::new();
+        if agent_inactive {
+            stale_reasons.push(format!("agent_inactive>{inactivity_seconds}s"));
+        } else {
+            stale_reasons.push("agent_recently_active".to_string());
+        }
+        if recent_mail {
+            stale_reasons.push("mail_activity_recent".to_string());
+        } else {
+            stale_reasons.push(format!("no_recent_mail_activity>{grace_seconds}s"));
+        }
+        if pat_activity.matches {
+            if recent_fs {
+                stale_reasons.push("filesystem_activity_recent".to_string());
+            } else {
+                stale_reasons.push(format!("no_recent_filesystem_activity>{grace_seconds}s"));
+            }
+            if recent_git {
+                stale_reasons.push("git_activity_recent".to_string());
+            } else {
+                stale_reasons.push(format!("no_recent_git_activity>{grace_seconds}s"));
+            }
+        } else {
+            stale_reasons.push("path_pattern_unmatched".to_string());
+        }
+
+        reservations.push(FileReservationResourceEntry {
+            id: row.id.unwrap_or(0),
+            agent: agent_name,
+            path_pattern: row.path_pattern,
+            exclusive: row.exclusive != 0,
+            reason: row.reason,
+            created_ts: Some(micros_to_iso(row.created_ts)),
+            expires_ts: Some(micros_to_iso(row.expires_ts)),
+            released_ts: row.released_ts.map(micros_to_iso),
+            stale,
+            stale_reasons,
+            last_agent_activity_ts,
+            last_mail_activity_ts: mail_activity.map(micros_to_iso),
+            last_git_activity_ts: pat_activity.git_activity_micros.map(micros_to_iso),
+            last_filesystem_activity_ts: pat_activity.fs_activity_micros.map(micros_to_iso),
+        });
+    }
 
     tracing::debug!(
         "Getting file reservations for project {} (active_only: {})",

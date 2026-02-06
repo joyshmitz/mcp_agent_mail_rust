@@ -157,7 +157,9 @@ pub struct WbqStats {
 }
 
 enum WbqMsg {
-    Op(WriteOp),
+    // `WriteOp` is large (contains `Config` + payloads). Boxing keeps the channel
+    // messages small and avoids repeatedly moving ~KB-sized values around.
+    Op(Box<WriteOp>),
     Flush(std::sync::mpsc::SyncSender<()>),
 }
 
@@ -200,7 +202,7 @@ pub fn wbq_enqueue(op: WriteOp) -> bool {
         let mut s = wbq.stats.lock().unwrap_or_else(|e| e.into_inner());
         s.enqueued += 1;
     }
-    match wbq.sender.try_send(WbqMsg::Op(op)) {
+    match wbq.sender.try_send(WbqMsg::Op(Box::new(op))) {
         Ok(()) => true,
         Err(_) => {
             let mut s = wbq.stats.lock().unwrap_or_else(|e| e.into_inner());
@@ -246,13 +248,15 @@ fn wbq_drain_loop(rx: std::sync::mpsc::Receiver<WbqMsg>, stats: Arc<Mutex<WbqSta
     let mut flush_waiters: Vec<std::sync::mpsc::SyncSender<()>> = Vec::new();
 
     loop {
-        let mut batch: Vec<WriteOp> = Vec::new();
+        let mut batch: Vec<Box<WriteOp>> = Vec::new();
 
         match rx.recv_timeout(flush_interval) {
             Ok(WbqMsg::Op(op)) => batch.push(op),
             Ok(WbqMsg::Flush(done_tx)) => flush_waiters.push(done_tx),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                for w in flush_waiters.drain(..) { let _ = w.try_send(()); }
+                for w in flush_waiters.drain(..) {
+                    let _ = w.try_send(());
+                }
                 continue;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -281,36 +285,75 @@ fn wbq_drain_loop(rx: std::sync::mpsc::Receiver<WbqMsg>, stats: Arc<Mutex<WbqSta
             s.errors += errors;
         }
 
-        for w in flush_waiters.drain(..) { let _ = w.try_send(()); }
+        for w in flush_waiters.drain(..) {
+            let _ = w.try_send(());
+        }
     }
 
     for msg in rx.try_iter() {
         match msg {
-            WbqMsg::Op(op) => { let _ = wbq_execute_op(&op); }
-            WbqMsg::Flush(done_tx) => { let _ = done_tx.try_send(()); }
+            WbqMsg::Op(op) => {
+                let _ = wbq_execute_op(&op);
+            }
+            WbqMsg::Flush(done_tx) => {
+                let _ = done_tx.try_send(());
+            }
         }
     }
 }
 
 fn wbq_execute_op(op: &WriteOp) -> Result<()> {
     match op {
-        WriteOp::MessageBundle { project_slug, config, message_json, body_md, sender, recipients } => {
+        WriteOp::MessageBundle {
+            project_slug,
+            config,
+            message_json,
+            body_md,
+            sender,
+            recipients,
+        } => {
             let archive = ensure_archive(config, project_slug)?;
-            write_message_bundle(&archive, config, message_json, body_md, sender, recipients, &[], None)
+            write_message_bundle(
+                &archive,
+                config,
+                message_json,
+                body_md,
+                sender,
+                recipients,
+                &[],
+                None,
+            )
         }
-        WriteOp::AgentProfile { project_slug, config, agent_json } => {
+        WriteOp::AgentProfile {
+            project_slug,
+            config,
+            agent_json,
+        } => {
             let archive = ensure_archive(config, project_slug)?;
             write_agent_profile_with_config(&archive, config, agent_json)
         }
-        WriteOp::FileReservation { project_slug, config, reservations } => {
+        WriteOp::FileReservation {
+            project_slug,
+            config,
+            reservations,
+        } => {
             let archive = ensure_archive(config, project_slug)?;
             write_file_reservation_records(&archive, config, reservations)
         }
-        WriteOp::NotificationSignal { config, project_slug, agent_name, metadata } => {
+        WriteOp::NotificationSignal {
+            config,
+            project_slug,
+            agent_name,
+            metadata,
+        } => {
             emit_notification_signal(config, project_slug, agent_name, metadata.as_ref());
             Ok(())
         }
-        WriteOp::ClearSignal { config, project_slug, agent_name } => {
+        WriteOp::ClearSignal {
+            config,
+            project_slug,
+            agent_name,
+        } => {
             clear_notification_signal(config, project_slug, agent_name);
             Ok(())
         }
@@ -4081,5 +4124,221 @@ mod tests {
         // Non-existent agent
         let missing = read_agent_profile(&archive, "Ghost").unwrap();
         assert!(missing.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Write-Behind Queue (WBQ) tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wbq_enqueue_returns_true_when_running() {
+        wbq_start();
+        let op = WriteOp::ClearSignal {
+            config: Config::default(),
+            project_slug: "test-wbq".to_string(),
+            agent_name: "TestAgent".to_string(),
+        };
+        let accepted = wbq_enqueue(op);
+        assert!(
+            accepted,
+            "wbq_enqueue should accept ops when worker is running"
+        );
+    }
+
+    #[test]
+    fn wbq_stats_tracks_enqueues() {
+        wbq_start();
+        let before = wbq_stats();
+        let op = WriteOp::ClearSignal {
+            config: Config::default(),
+            project_slug: "test-stats".to_string(),
+            agent_name: "StatsAgent".to_string(),
+        };
+        wbq_enqueue(op);
+        let after = wbq_stats();
+        assert!(
+            after.enqueued > before.enqueued,
+            "enqueued counter should increase"
+        );
+    }
+
+    #[test]
+    fn wbq_flush_drains_pending() {
+        wbq_start();
+        let op = WriteOp::ClearSignal {
+            config: Config::default(),
+            project_slug: "test-flush".to_string(),
+            agent_name: "FlushAgent".to_string(),
+        };
+        wbq_enqueue(op);
+        wbq_flush();
+        let stats = wbq_stats();
+        assert!(stats.drained > 0, "drain count should be > 0 after flush");
+    }
+
+    #[test]
+    fn wbq_agent_profile_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+
+        wbq_start();
+
+        let agent_json = serde_json::json!({
+            "name": "WbqTestAgent",
+            "program": "test",
+            "model": "test",
+        });
+
+        let op = WriteOp::AgentProfile {
+            project_slug: "wbq-profile-test".to_string(),
+            config: config.clone(),
+            agent_json: agent_json.clone(),
+        };
+
+        let accepted = wbq_enqueue(op);
+        assert!(accepted);
+
+        // Flush to ensure the write completes
+        wbq_flush();
+        // Also flush async git commits
+        flush_async_commits();
+
+        // Verify the profile was written to disk
+        let archive = ensure_archive(&config, "wbq-profile-test").unwrap();
+        let profile_path = archive
+            .root
+            .join("agents")
+            .join("WbqTestAgent")
+            .join("profile.json");
+        assert!(
+            profile_path.exists(),
+            "profile.json should exist after WBQ drain"
+        );
+
+        let content: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&profile_path).unwrap()).unwrap();
+        assert_eq!(content["name"], "WbqTestAgent");
+    }
+
+    #[test]
+    fn wbq_message_bundle_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+
+        wbq_start();
+
+        // Ensure archive exists first
+        let _archive = ensure_archive(&config, "wbq-msg-test").unwrap();
+
+        let msg_json = serde_json::json!({
+            "id": 42,
+            "from": "Sender",
+            "to": ["Receiver"],
+            "subject": "WBQ test message",
+            "created": "2025-01-01T00:00:00+00:00",
+            "thread_id": null,
+            "importance": "normal",
+        });
+
+        let op = WriteOp::MessageBundle {
+            project_slug: "wbq-msg-test".to_string(),
+            config: config.clone(),
+            message_json: msg_json,
+            body_md: "Hello from WBQ".to_string(),
+            sender: "Sender".to_string(),
+            recipients: vec!["Receiver".to_string()],
+        };
+
+        assert!(wbq_enqueue(op));
+        wbq_flush();
+        flush_async_commits();
+
+        // Verify message files exist
+        let archive = ensure_archive(&config, "wbq-msg-test").unwrap();
+        let messages_dir = archive.root.join("messages");
+        assert!(messages_dir.exists(), "messages/ directory should exist");
+    }
+
+    #[test]
+    fn wbq_file_reservation_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+
+        wbq_start();
+
+        let _archive = ensure_archive(&config, "wbq-res-test").unwrap();
+
+        let res_json = serde_json::json!({
+            "id": 1,
+            "agent": "ResAgent",
+            "path_pattern": "src/*.rs",
+            "exclusive": true,
+            "reason": "test",
+            "expires_ts": "2025-12-31T23:59:59+00:00",
+        });
+
+        let op = WriteOp::FileReservation {
+            project_slug: "wbq-res-test".to_string(),
+            config: config.clone(),
+            reservations: vec![res_json],
+        };
+
+        assert!(wbq_enqueue(op));
+        wbq_flush();
+        flush_async_commits();
+
+        let archive = ensure_archive(&config, "wbq-res-test").unwrap();
+        let res_dir = archive.root.join("file_reservations");
+        assert!(res_dir.exists(), "file_reservations/ should exist");
+    }
+
+    #[test]
+    fn wbq_notification_signal_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_debounce_ms = 0; // no debounce for test
+        config.notifications_include_metadata = true;
+        config.notifications_signals_dir = tmp.path().join("signals");
+
+        wbq_start();
+
+        let metadata = NotificationMessage {
+            id: Some(99),
+            from: Some("Sender".to_string()),
+            subject: Some("Signal test".to_string()),
+            importance: Some("high".to_string()),
+        };
+
+        let op = WriteOp::NotificationSignal {
+            config: config.clone(),
+            project_slug: "wbq-signal-test".to_string(),
+            agent_name: "SignalAgent".to_string(),
+            metadata: Some(metadata),
+        };
+
+        assert!(wbq_enqueue(op));
+        wbq_flush();
+
+        let signal_path = config
+            .notifications_signals_dir
+            .join("projects")
+            .join("wbq-signal-test")
+            .join("agents")
+            .join("SignalAgent.signal");
+        assert!(
+            signal_path.exists(),
+            "signal file should exist after WBQ drain"
+        );
+    }
+
+    #[test]
+    fn wbq_backpressure_fallback() {
+        // Verify the stats track fallbacks (we can't easily fill the 256-capacity
+        // channel in a unit test, but we can verify the counter exists)
+        wbq_start();
+        let stats = wbq_stats();
+        // fallbacks should be 0 when the queue isn't full
+        assert_eq!(stats.fallbacks, 0);
     }
 }

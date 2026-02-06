@@ -169,12 +169,21 @@ pub(crate) mod tool_util {
         pool: &DbPool,
         project_key: &str,
     ) -> McpResult<mcp_agent_mail_db::ProjectRow> {
+        // Check read cache first (slug lookups only; ensure_project always hits DB)
+        if !project_key.starts_with('/') {
+            if let Some(cached) = mcp_agent_mail_db::read_cache().get_project(project_key) {
+                return Ok(cached);
+            }
+        }
         let out = if project_key.starts_with('/') {
             mcp_agent_mail_db::queries::ensure_project(ctx.cx(), pool, project_key).await
         } else {
             mcp_agent_mail_db::queries::get_project_by_slug(ctx.cx(), pool, project_key).await
         };
-        db_outcome_to_mcp_result(out)
+        let project = db_outcome_to_mcp_result(out)?;
+        // Populate cache on miss
+        mcp_agent_mail_db::read_cache().put_project(&project.slug, &project);
+        Ok(project)
     }
 
     pub async fn resolve_agent(
@@ -183,9 +192,16 @@ pub(crate) mod tool_util {
         project_id: i64,
         agent_name: &str,
     ) -> McpResult<mcp_agent_mail_db::AgentRow> {
+        // Check read cache first
+        if let Some(cached) = mcp_agent_mail_db::read_cache().get_agent(project_id, agent_name) {
+            return Ok(cached);
+        }
         let out =
             mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, agent_name).await;
-        db_outcome_to_mcp_result(out)
+        let agent = db_outcome_to_mcp_result(out)?;
+        // Populate cache on miss
+        mcp_agent_mail_db::read_cache().put_agent(project_id, &agent.name, &agent);
+        Ok(agent)
     }
 
     #[cfg(test)]
@@ -240,19 +256,19 @@ pub(crate) mod pattern_overlap {
     }
 
     #[derive(Debug, Clone)]
-    pub(crate) struct CompiledPattern {
+    pub struct CompiledPattern {
         norm: String,
         matcher: Option<GlobMatcher>,
     }
 
     impl CompiledPattern {
-        pub(crate) fn new(raw: &str) -> Self {
+        pub fn new(raw: &str) -> Self {
             let norm = normalize_pattern(raw);
             let matcher = Glob::new(&norm).ok().map(|g| g.compile_matcher());
             Self { norm, matcher }
         }
 
-        pub(crate) fn overlaps(&self, other: &Self) -> bool {
+        pub fn overlaps(&self, other: &Self) -> bool {
             if self.norm == other.norm {
                 return true;
             }
