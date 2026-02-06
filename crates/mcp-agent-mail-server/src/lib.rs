@@ -14,13 +14,14 @@ use asupersync::http::h1::listener::Http1Listener;
 use asupersync::http::h1::types::{
     Method as Http1Method, Request as Http1Request, Response as Http1Response, default_reason,
 };
+use asupersync::messaging::RedisClient;
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::time::{timeout, wall_now};
 use asupersync::{Budget, Cx};
 use fastmcp::prelude::*;
 use fastmcp_core::{McpError, McpErrorCode, SessionState, block_on};
-use fastmcp_protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
-use fastmcp_server::Session;
+use fastmcp_protocol::{Icon, JsonRpcError, JsonRpcRequest, JsonRpcResponse, ToolAnnotations};
+use fastmcp_server::{BoxFuture, Session};
 use fastmcp_transport::http::{
     HttpHandlerConfig, HttpMethod as McpHttpMethod, HttpRequest, HttpRequestHandler, HttpResponse,
 };
@@ -51,8 +52,69 @@ use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+struct InstrumentedTool<T> {
+    tool_name: String,
+    inner: T,
+}
+
+impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
+    fn definition(&self) -> Tool {
+        self.inner.definition()
+    }
+
+    fn icon(&self) -> Option<&Icon> {
+        self.inner.icon()
+    }
+
+    fn version(&self) -> Option<&str> {
+        self.inner.version()
+    }
+
+    fn tags(&self) -> &[String] {
+        self.inner.tags()
+    }
+
+    fn annotations(&self) -> Option<&ToolAnnotations> {
+        self.inner.annotations()
+    }
+
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        self.inner.output_schema()
+    }
+
+    fn timeout(&self) -> Option<Duration> {
+        self.inner.timeout()
+    }
+
+    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        mcp_agent_mail_tools::record_call(&self.tool_name);
+        match self.inner.call(ctx, arguments) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                mcp_agent_mail_tools::record_error(&self.tool_name);
+                Err(e)
+            }
+        }
+    }
+
+    fn call_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
+        mcp_agent_mail_tools::record_call(&self.tool_name);
+        Box::pin(async move {
+            let out = self.inner.call_async(ctx, arguments).await;
+            if !matches!(out, fastmcp_core::Outcome::Ok(_)) {
+                mcp_agent_mail_tools::record_error(&self.tool_name);
+            }
+            out
+        })
+    }
+}
 
 fn add_tool<T: fastmcp::ToolHandler + 'static>(
     server: fastmcp_server::ServerBuilder,
@@ -62,7 +124,10 @@ fn add_tool<T: fastmcp::ToolHandler + 'static>(
     tool: T,
 ) -> fastmcp_server::ServerBuilder {
     if config.should_expose_tool(tool_name, cluster) {
-        server.tool(tool)
+        server.tool(InstrumentedTool {
+            tool_name: tool_name.to_string(),
+            inner: tool,
+        })
     } else {
         server
     }
@@ -392,7 +457,6 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
         Ok::<(), std::io::Error>(())
     });
 
-    tool_metrics::shutdown();
     retention::shutdown();
     tool_metrics::shutdown();
     ack_ttl::shutdown();
@@ -418,12 +482,21 @@ struct JwksCacheEntry {
     jwks: Arc<JwkSet>,
 }
 
+#[derive(Debug)]
+enum RateLimitRedisState {
+    Disabled,
+    Uninitialized { url: String },
+    Ready(Arc<RedisClient>),
+    Failed,
+}
+
 struct HttpState {
     router: Arc<fastmcp_server::Router>,
     server_info: fastmcp_protocol::ServerInfo,
     server_capabilities: fastmcp_protocol::ServerCapabilities,
     config: mcp_agent_mail_core::Config,
     rate_limiter: Arc<RateLimiter>,
+    rate_limit_redis: Mutex<RateLimitRedisState>,
     request_timeout_secs: u64,
     handler: Arc<HttpRequestHandler>,
     jwks_http_client: HttpClient,
@@ -450,12 +523,26 @@ impl HttpState {
         if let Some(ref wr) = web_root {
             tracing::info!(root = ?wr, "SPA web root resolved; serving static files");
         }
+        let rate_limit_redis =
+            if config.http_rate_limit_backend == mcp_agent_mail_core::RateLimitBackend::Redis {
+                config
+                    .http_rate_limit_redis_url
+                    .as_ref()
+                    .filter(|s| !s.is_empty())
+                    .map_or_else(
+                        || RateLimitRedisState::Disabled,
+                        |url| RateLimitRedisState::Uninitialized { url: url.clone() },
+                    )
+            } else {
+                RateLimitRedisState::Disabled
+            };
         Self {
             router,
             server_info,
             server_capabilities,
             config,
             rate_limiter: Arc::new(RateLimiter::new()),
+            rate_limit_redis: Mutex::new(rate_limit_redis),
             request_timeout_secs: 30,
             handler,
             jwks_http_client: HttpClient::new(),
@@ -484,7 +571,7 @@ impl HttpState {
         resp
     }
 
-    async fn handle_inner(&self, req: Http1Request) -> Http1Response {
+    async fn handle_inner(&self, mut req: Http1Request) -> Http1Response {
         if let Some(resp) = self.handle_options(&req) {
             return resp;
         }
@@ -517,7 +604,22 @@ impl HttpState {
             return self.error_response(&req, 405, "Method Not Allowed");
         }
 
-        let http_req = to_mcp_http_request(&req, &path);
+        let base_no_slash = normalize_base_path(&self.config.http_path);
+        maybe_inject_localhost_authorization_for_base_passthrough(
+            &self.config,
+            &mut req,
+            &path,
+            &base_no_slash,
+        );
+
+        // Legacy parity: direct POST handler for `/base` forwards to the mounted `/base/` app.
+        let effective_path = if base_no_slash == "/" || path != base_no_slash {
+            path.clone()
+        } else {
+            format!("{base_no_slash}/")
+        };
+
+        let http_req = to_mcp_http_request(&req, &effective_path);
         let json_rpc = match self.handler.parse_request(&http_req) {
             Ok(req) => req,
             Err(err) => {
@@ -948,6 +1050,77 @@ impl HttpState {
         Ok(JwtContext { roles, sub })
     }
 
+    async fn rate_limit_redis_client(&self, cx: &Cx) -> Option<Arc<RedisClient>> {
+        let url = {
+            let guard = self
+                .rate_limit_redis
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+            match &*guard {
+                RateLimitRedisState::Disabled | RateLimitRedisState::Failed => return None,
+                RateLimitRedisState::Ready(client) => return Some(Arc::clone(client)),
+                RateLimitRedisState::Uninitialized { url } => url.clone(),
+            }
+        };
+
+        match RedisClient::connect(cx, &url).await {
+            Ok(client) => {
+                let client = Arc::new(client);
+                {
+                    let mut guard = self
+                        .rate_limit_redis
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *guard = RateLimitRedisState::Ready(Arc::clone(&client));
+                }
+                Some(client)
+            }
+            Err(err) => {
+                tracing::debug!(
+                    error = %err,
+                    "rate limit redis init failed; falling back to memory"
+                );
+                let mut guard = self
+                    .rate_limit_redis
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *guard = RateLimitRedisState::Failed;
+                None
+            }
+        }
+    }
+
+    async fn consume_rate_limit(&self, key: &str, per_minute: u32, burst: u32) -> bool {
+        if per_minute == 0 {
+            return true;
+        }
+
+        let now = rate_limit_now();
+        let budget = if self.request_timeout_secs == 0 {
+            Budget::INFINITE
+        } else {
+            Budget::with_deadline_secs(self.request_timeout_secs)
+        };
+        let cx = Cx::for_request_with_budget(budget);
+
+        let redis = self.rate_limit_redis_client(&cx).await;
+        let has_redis = redis.is_some();
+
+        if let Some(redis) = redis {
+            if let Ok(allowed) =
+                consume_rate_limit_redis(&cx, &redis, key, per_minute, burst, now).await
+            {
+                return allowed;
+            }
+            // Legacy parity: if Redis is configured, periodic cleanup is disabled even when
+            // a specific Redis call fails and we fall back to memory.
+        }
+
+        self.rate_limiter
+            .allow_memory(key, per_minute, burst, now, !has_redis)
+    }
+
     async fn check_rbac_and_rate_limit(
         &self,
         req: &Http1Request,
@@ -995,14 +1168,14 @@ impl HttpState {
             }
         }
 
-        // Rate limiting (memory backend only)
+        // Rate limiting (memory + optional Redis backend)
         if self.config.http_rate_limit_enabled {
             let (rpm, burst) = rate_limits_for(&self.config, kind);
             let identity = rate_limit_identity(req, jwt_sub.as_deref());
             let endpoint = tool_name.as_deref().unwrap_or("*");
             let key = format!("{kind}:{endpoint}:{identity}");
 
-            if !self.rate_limiter.allow(&key, rpm, burst) {
+            if !self.consume_rate_limit(&key, rpm, burst).await {
                 return Some(self.error_response(req, 429, "Rate limit exceeded"));
             }
         }
@@ -1088,9 +1261,6 @@ impl HttpState {
                         None
                     };
 
-                // Record tool call for metrics (mirrors legacy _instrument_tool).
-                mcp_agent_mail_tools::record_call(&tool_name);
-
                 let result = self.router.handle_tools_call(
                     &cx,
                     request_id,
@@ -1115,7 +1285,6 @@ impl HttpState {
                 let out = match result {
                     Ok(v) => v,
                     Err(e) => {
-                        mcp_agent_mail_tools::record_error(&tool_name);
                         return Err(e);
                     }
                 };
@@ -1511,66 +1680,132 @@ fn classify_request(req: &JsonRpcRequest) -> (RequestKind, Option<String>) {
     (RequestKind::Other, None)
 }
 
+const RATE_LIMIT_REDIS_LUA: &str = r"local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local rate = tonumber(ARGV[2])
+local burst = tonumber(ARGV[3])
+local state = redis.call('HMGET', key, 'tokens', 'ts')
+local tokens = tonumber(state[1]) or burst
+local ts = tonumber(state[2]) or now
+local delta = now - ts
+tokens = math.min(burst, tokens + delta * rate)
+local allowed = 0
+if tokens >= 1 then
+  tokens = tokens - 1
+  allowed = 1
+end
+redis.call('HMSET', key, 'tokens', tokens, 'ts', now)
+redis.call('EXPIRE', key, math.ceil(burst / math.max(rate, 0.001)))
+return allowed
+";
+
+async fn consume_rate_limit_redis(
+    cx: &Cx,
+    redis: &RedisClient,
+    key: &str,
+    per_minute: u32,
+    burst: u32,
+    now: f64,
+) -> Result<bool, ()> {
+    if per_minute == 0 {
+        return Ok(true);
+    }
+
+    let rate_per_sec = f64::from(per_minute) / 60.0;
+    let redis_key = format!("rl:{key}");
+    let now_s = now.to_string();
+    let rate_s = rate_per_sec.to_string();
+    let burst_s = burst.to_string();
+
+    let resp = redis
+        .cmd_bytes(
+            cx,
+            &[
+                b"EVAL",
+                RATE_LIMIT_REDIS_LUA.as_bytes(),
+                b"1",
+                redis_key.as_bytes(),
+                now_s.as_bytes(),
+                rate_s.as_bytes(),
+                burst_s.as_bytes(),
+            ],
+        )
+        .await
+        .map_err(|_| ())?;
+    let allowed = resp.as_integer().unwrap_or(0) == 1;
+    Ok(allowed)
+}
+
 struct RateLimiter {
-    buckets: Mutex<HashMap<String, (f64, Instant)>>,
-    last_cleanup: Mutex<Instant>,
+    buckets: Mutex<HashMap<String, (f64, f64)>>,
+    last_cleanup: Mutex<f64>,
 }
 
 impl RateLimiter {
     fn new() -> Self {
+        let now = rate_limit_now();
         Self {
             buckets: Mutex::new(HashMap::new()),
-            last_cleanup: Mutex::new(Instant::now()),
+            last_cleanup: Mutex::new(now),
         }
     }
 
-    fn allow(&self, key: &str, per_minute: u32, burst: u32) -> bool {
+    fn allow_memory(
+        &self,
+        key: &str,
+        per_minute: u32,
+        burst: u32,
+        now: f64,
+        do_cleanup: bool,
+    ) -> bool {
         if per_minute == 0 {
             return true;
         }
         let rate_per_sec = f64::from(per_minute) / 60.0;
         let burst = f64::from(burst.max(1));
-        let now = Instant::now();
 
-        self.cleanup(now);
+        if do_cleanup {
+            self.cleanup(now);
+        }
 
-        let mut buckets = self
-            .buckets
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = buckets.entry(key.to_string()).or_insert((burst, now));
-        let elapsed = now.duration_since(entry.1).as_secs_f64();
-        entry.0 = (entry.0 + elapsed * rate_per_sec).min(burst);
-        entry.1 = now;
+        {
+            let mut buckets = self
+                .buckets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (tokens0, ts) = buckets.get(key).copied().unwrap_or((burst, now));
+            let elapsed = (now - ts).max(0.0);
+            let mut tokens = (tokens0 + elapsed * rate_per_sec).min(burst);
 
-        let allowed = if entry.0 < 1.0 {
-            false
-        } else {
-            entry.0 -= 1.0;
-            true
-        };
+            let allowed = tokens >= 1.0;
+            if allowed {
+                tokens -= 1.0;
+            }
 
-        // Release the lock before returning.
-        drop(buckets);
-        allowed
+            let new_state = (tokens, now);
+            if let Some(entry) = buckets.get_mut(key) {
+                *entry = new_state;
+            } else {
+                buckets.insert(key.to_string(), new_state);
+            }
+
+            allowed
+        }
     }
 
-    fn cleanup(&self, now: Instant) {
+    fn cleanup(&self, now: f64) {
         {
             let mut last = self
                 .last_cleanup
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if now.duration_since(*last) < Duration::from_secs(60) {
+            if now - *last < 60.0 {
                 return;
             }
             *last = now;
         }
 
-        let Some(cutoff) = now.checked_sub(Duration::from_secs(3600)) else {
-            // If we're running for < 1h, nothing can be older than the cutoff yet.
-            return;
-        };
+        let cutoff = now - 3600.0;
         let mut buckets = self
             .buckets
             .lock()
@@ -1614,6 +1849,30 @@ fn split_path_query(uri: &str) -> (String, Option<String>) {
     let path = parts.next().unwrap_or("/").to_string();
     let query = parts.next().map(std::string::ToString::to_string);
     (path, query)
+}
+
+fn maybe_inject_localhost_authorization_for_base_passthrough(
+    config: &mcp_agent_mail_core::Config,
+    req: &mut Http1Request,
+    path: &str,
+    base_no_slash: &str,
+) {
+    if path != base_no_slash {
+        return;
+    }
+    if !config.http_allow_localhost_unauthenticated {
+        return;
+    }
+    if !is_local_peer_addr(req.peer_addr) {
+        return;
+    }
+    if header_value(req, "authorization").is_some() {
+        return;
+    }
+    if let Some(token) = config.http_bearer_token.as_deref() {
+        req.headers
+            .push(("authorization".to_string(), format!("Bearer {token}")));
+    }
 }
 
 fn to_mcp_http_request(req: &Http1Request, path: &str) -> HttpRequest {
@@ -1750,9 +2009,28 @@ fn peer_addr_host(peer_addr: SocketAddr) -> String {
     match peer_addr.ip() {
         IpAddr::V4(v4) => v4.to_string(),
         IpAddr::V6(v6) => v6
-            .to_ipv4()
+            .to_ipv4_mapped()
             .map_or_else(|| v6.to_string(), |v4| v4.to_string()),
     }
+}
+
+fn rate_limit_now() -> f64 {
+    // Legacy python uses `time.monotonic()` (system-wide monotonic seconds).
+    // We approximate "monotonic seconds since epoch" by anchoring SystemTime to an Instant.
+    //
+    // This avoids time going backwards on clock adjustments while remaining consistent
+    // across processes for Redis-backed buckets (absolute base cancels out in deltas).
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static BASE: OnceLock<(SystemTime, Instant)> = OnceLock::new();
+    let (base_wall, base_inst) = BASE.get_or_init(|| (SystemTime::now(), Instant::now()));
+    let now_wall = base_wall
+        .checked_add(base_inst.elapsed())
+        .unwrap_or_else(SystemTime::now);
+
+    now_wall
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64())
 }
 
 fn rate_limit_identity(req: &Http1Request, jwt_sub: Option<&str>) -> String {
@@ -2093,10 +2371,227 @@ const fn http_error_status(
 mod tests {
     use super::*;
     use asupersync::http::h1::types::Version as Http1Version;
+    use chrono::Utc;
     use ftui_runtime::stdio_capture::StdioCapture;
+    use std::path::PathBuf;
     use std::sync::Mutex;
 
     static STDIO_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+    static REDIS_RATE_LIMIT_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    fn repo_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("repo root")
+            .to_path_buf()
+    }
+
+    fn safe_component(value: &str) -> String {
+        let mut out = value.trim().to_string();
+        for ch in ['/', '\\', ':', '*', '?', '"', '<', '>', '|', ' '] {
+            out = out.replace(ch, "_");
+        }
+        if out.is_empty() {
+            "unknown".to_string()
+        } else {
+            out
+        }
+    }
+
+    fn jwt_artifact_dir(test_name: &str) -> PathBuf {
+        let ts = Utc::now().format("%Y%m%dT%H%M%S%.fZ").to_string();
+        let dir = repo_root()
+            .join("tests")
+            .join("artifacts")
+            .join("http")
+            .join("jwt")
+            .join(format!("{ts}-{}", safe_component(test_name)));
+        std::fs::create_dir_all(&dir).expect("create jwt artifacts dir");
+        dir
+    }
+
+    fn write_jwt_artifact(test_name: &str, value: &serde_json::Value) {
+        let dir = jwt_artifact_dir(test_name);
+        let path = dir.join("context.json");
+        let json = serde_json::to_string_pretty(value).expect("artifact json");
+        std::fs::write(&path, json).expect("write jwt artifact");
+    }
+
+    fn rbac_artifact_dir(test_name: &str) -> PathBuf {
+        let ts = Utc::now().format("%Y%m%dT%H%M%S%.fZ").to_string();
+        let dir = repo_root()
+            .join("tests")
+            .join("artifacts")
+            .join("http")
+            .join("rbac")
+            .join(format!("{ts}-{}", safe_component(test_name)));
+        std::fs::create_dir_all(&dir).expect("create rbac artifacts dir");
+        dir
+    }
+
+    fn write_rbac_artifact(test_name: &str, value: &serde_json::Value) {
+        let dir = rbac_artifact_dir(test_name);
+        let path = dir.join("context.json");
+        let json = serde_json::to_string_pretty(value).expect("artifact json");
+        std::fs::write(&path, json).expect("write rbac artifact");
+    }
+
+    fn rate_limit_artifact_dir(test_name: &str) -> PathBuf {
+        let ts = Utc::now().format("%Y%m%dT%H%M%S%.fZ").to_string();
+        let dir = repo_root()
+            .join("tests")
+            .join("artifacts")
+            .join("http")
+            .join("rate_limit")
+            .join(format!("{ts}-{}", safe_component(test_name)));
+        std::fs::create_dir_all(&dir).expect("create rate_limit artifacts dir");
+        dir
+    }
+
+    fn write_rate_limit_artifact(test_name: &str, value: &serde_json::Value) {
+        let dir = rate_limit_artifact_dir(test_name);
+        let path = dir.join("context.json");
+        let json = serde_json::to_string_pretty(value).expect("artifact json");
+        std::fs::write(&path, json).expect("write rate_limit artifact");
+    }
+
+    fn redis_url_or_skip(test_name: &str) -> Option<String> {
+        let url = match std::env::var("REDIS_URL") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => {
+                eprintln!("SKIP: REDIS_URL not set; skipping redis test {test_name}");
+                return None;
+            }
+        };
+
+        let cx = Cx::for_testing();
+        let client = match block_on(RedisClient::connect(&cx, &url)) {
+            Ok(v) => v,
+            Err(err) => {
+                eprintln!("SKIP: RedisClient.connect failed for {test_name}: {err}");
+                return None;
+            }
+        };
+        let ping = match block_on(client.cmd(&cx, &["PING"])) {
+            Ok(v) => v,
+            Err(err) => {
+                eprintln!("SKIP: redis ping failed for {test_name}: {err}");
+                return None;
+            }
+        };
+        if !matches!(
+            ping,
+            asupersync::messaging::redis::RespValue::SimpleString(ref s) if s == "PONG"
+        ) {
+            eprintln!("SKIP: unexpected PING response for {test_name}: {ping:?}");
+            return None;
+        }
+
+        Some(url)
+    }
+
+    fn hs256_token(secret: &[u8], claims: &serde_json::Value) -> String {
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        jsonwebtoken::encode(
+            &header,
+            claims,
+            &jsonwebtoken::EncodingKey::from_secret(secret),
+        )
+        .expect("encode token")
+    }
+
+    fn assert_unauthorized(resp: &Http1Response) {
+        assert_eq!(resp.status, 401);
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.body).expect("unauthorized response json");
+        assert_eq!(body["detail"], "Unauthorized");
+    }
+
+    fn assert_forbidden(resp: &Http1Response) {
+        assert_eq!(resp.status, 403);
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.body).expect("forbidden response json");
+        assert_eq!(body["detail"], "Forbidden");
+    }
+
+    fn with_jwks_server<F>(jwks_body: &[u8], max_requests: usize, f: F)
+    where
+        F: FnOnce(String),
+    {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        std::thread::scope(|s| {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind jwks listener");
+            listener.set_nonblocking(true).expect("set_nonblocking");
+            let addr = listener.local_addr().expect("listener addr");
+            let jwks_body2 = jwks_body.to_vec();
+            let accepted = Arc::new(AtomicUsize::new(0));
+            let accepted2 = Arc::clone(&accepted);
+
+            s.spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if accepted2.load(Ordering::SeqCst) >= max_requests {
+                        return;
+                    }
+                    match listener.accept() {
+                        Ok((mut stream, _peer)) => {
+                            accepted2.fetch_add(1, Ordering::SeqCst);
+
+                            // Best-effort drain the request before responding.
+                            let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                            let mut buf = [0_u8; 512];
+                            let mut seen = Vec::new();
+                            loop {
+                                match stream.read(&mut buf) {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        seen.extend_from_slice(&buf[..n]);
+                                        if seen.windows(4).any(|w| w == b"\r\n\r\n")
+                                            || seen.len() > 8 * 1024
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    Err(err)
+                                        if err.kind() == std::io::ErrorKind::WouldBlock
+                                            || err.kind() == std::io::ErrorKind::TimedOut =>
+                                    {
+                                        break;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+
+                            let status = "200 OK";
+                            let body: &[u8] = jwks_body2.as_slice();
+                            let header = format!(
+                                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(header.as_bytes());
+                            let _ = stream.write_all(body);
+                            let _ = stream.flush();
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() > deadline {
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => return,
+                    }
+                }
+            });
+
+            let jwks_url = format!("http://{addr}/jwks");
+            f(jwks_url);
+        });
+    }
 
     fn build_state(config: mcp_agent_mail_core::Config) -> HttpState {
         let server = build_server(&config);
@@ -2511,6 +3006,71 @@ mod tests {
         );
     }
 
+    // ── Base path Authorization injection (br-1bm.4.4) ────────────────────
+
+    #[test]
+    fn base_passthrough_injects_authorization_for_localhost_only_on_base_no_slash() {
+        let config = mcp_agent_mail_core::Config {
+            http_path: "/api/".to_string(),
+            http_bearer_token: Some("secret".to_string()),
+            http_allow_localhost_unauthenticated: true,
+            ..Default::default()
+        };
+        let base_no_slash = normalize_base_path(&config.http_path);
+        assert_eq!(base_no_slash, "/api");
+
+        let local = SocketAddr::from(([127, 0, 0, 1], 1234));
+
+        // Base without slash: inject Authorization when missing.
+        let mut req = make_request_with_peer_addr(Http1Method::Post, "/api", &[], Some(local));
+        maybe_inject_localhost_authorization_for_base_passthrough(
+            &config,
+            &mut req,
+            "/api",
+            &base_no_slash,
+        );
+        assert_eq!(
+            header_value(&req, "authorization"),
+            Some("Bearer secret"),
+            "localhost base passthrough should synthesize Authorization"
+        );
+
+        // Base with trailing slash: do not inject (legacy injection is only on base_no_slash).
+        let mut req_slash =
+            make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(local));
+        maybe_inject_localhost_authorization_for_base_passthrough(
+            &config,
+            &mut req_slash,
+            "/api/",
+            &base_no_slash,
+        );
+        assert!(
+            header_value(&req_slash, "authorization").is_none(),
+            "base_with_slash should not synthesize Authorization"
+        );
+    }
+
+    #[test]
+    fn base_passthrough_does_not_inject_authorization_when_not_local() {
+        let config = mcp_agent_mail_core::Config {
+            http_path: "/api/".to_string(),
+            http_bearer_token: Some("secret".to_string()),
+            http_allow_localhost_unauthenticated: true,
+            ..Default::default()
+        };
+        let base_no_slash = normalize_base_path(&config.http_path);
+        let non_local = SocketAddr::from(([10, 0, 0, 1], 1234));
+
+        let mut req = make_request_with_peer_addr(Http1Method::Post, "/api", &[], Some(non_local));
+        maybe_inject_localhost_authorization_for_base_passthrough(
+            &config,
+            &mut req,
+            "/api",
+            &base_no_slash,
+        );
+        assert!(header_value(&req, "authorization").is_none());
+    }
+
     // ── Stateless dispatch tests (br-1bm.4.5) ────────────────────────────
 
     #[test]
@@ -2536,6 +3096,80 @@ mod tests {
         assert!(
             resp.error.is_some(),
             "unknown method must return an error response"
+        );
+    }
+
+    #[test]
+    fn http_post_roundtrip_returns_json_rpc_response() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+
+        let mut req = make_request(Http1Method::Post, "/api", &[]);
+        let json_rpc = JsonRpcRequest::new("tools/list", None, 1_i64);
+        req.body = serde_json::to_vec(&json_rpc).expect("serialize json-rpc");
+
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            response_header(&resp, "content-type"),
+            Some("application/json"),
+            "streamable http must return JSON content-type"
+        );
+
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json response");
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 1);
+        assert!(
+            body.get("result")
+                .and_then(|v| v.get("tools"))
+                .and_then(serde_json::Value::as_array)
+                .is_some(),
+            "expected tools list result"
+        );
+    }
+
+    #[test]
+    fn http_post_base_path_without_slash_matches_base_with_slash() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+
+        let json_rpc = JsonRpcRequest::new("tools/list", None, 1_i64);
+        let body = serde_json::to_vec(&json_rpc).expect("serialize json-rpc");
+
+        let mut req_base = make_request(Http1Method::Post, "/api", &[]);
+        req_base.body = body.clone();
+        let resp_base = block_on(state.handle(req_base));
+
+        let mut req_slash = make_request(Http1Method::Post, "/api/", &[]);
+        req_slash.body = body;
+        let resp_slash = block_on(state.handle(req_slash));
+
+        assert_eq!(resp_base.status, resp_slash.status);
+        assert_eq!(
+            resp_base.body, resp_slash.body,
+            "POST /api passthrough must behave identically to POST /api/"
+        );
+    }
+
+    #[test]
+    fn http_post_notification_returns_accepted_with_empty_body() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+
+        let mut req = make_request(Http1Method::Post, "/api", &[]);
+        let json_rpc = JsonRpcRequest::notification("notifications/initialized", None);
+        req.body = serde_json::to_vec(&json_rpc).expect("serialize json-rpc");
+
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 202);
+        assert_eq!(
+            response_header(&resp, "content-type"),
+            Some("application/json"),
+            "accepted responses still set content-type"
+        );
+        assert!(
+            resp.body.is_empty(),
+            "notification should not return a JSON-RPC response body"
         );
     }
 
@@ -2584,6 +3218,520 @@ mod tests {
     }
 
     #[test]
+    fn rate_limits_for_defaults_burst_to_rpm_max_1() {
+        let config = mcp_agent_mail_core::Config {
+            http_rate_limit_tools_per_minute: 10,
+            http_rate_limit_tools_burst: 0,
+            http_rate_limit_resources_per_minute: 5,
+            http_rate_limit_resources_burst: 0,
+            http_rate_limit_per_minute: 0,
+            ..Default::default()
+        };
+        assert_eq!(rate_limits_for(&config, RequestKind::Tools), (10, 10));
+        assert_eq!(rate_limits_for(&config, RequestKind::Resources), (5, 5));
+        assert_eq!(rate_limits_for(&config, RequestKind::Other), (0, 1));
+
+        let config = mcp_agent_mail_core::Config {
+            http_rate_limit_per_minute: 7,
+            ..Default::default()
+        };
+        assert_eq!(rate_limits_for(&config, RequestKind::Other), (7, 7));
+
+        let config = mcp_agent_mail_core::Config {
+            http_rate_limit_tools_per_minute: 10,
+            http_rate_limit_tools_burst: 3,
+            ..Default::default()
+        };
+        assert_eq!(rate_limits_for(&config, RequestKind::Tools), (10, 3));
+    }
+
+    #[test]
+    fn rate_limit_tools_call_without_name_uses_wildcard_endpoint() {
+        let config = mcp_agent_mail_core::Config {
+            http_rate_limit_enabled: true,
+            http_rate_limit_tools_per_minute: 1,
+            http_rate_limit_tools_burst: 1,
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        // tools/call with missing name should be keyed under endpoint="*"
+        let json_rpc = JsonRpcRequest::new("tools/call", Some(serde_json::json!({})), 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+
+        let req1 = make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(peer));
+        assert!(block_on(state.check_rbac_and_rate_limit(&req1, &json_rpc)).is_none());
+
+        let req2 = make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(peer));
+        let resp = block_on(state.check_rbac_and_rate_limit(&req2, &json_rpc))
+            .expect("rate limit should trigger via wildcard endpoint bucket");
+        assert_eq!(resp.status, 429);
+    }
+
+    #[test]
+    fn rate_limit_tools_and_resources_use_separate_buckets() {
+        let config = mcp_agent_mail_core::Config {
+            http_rate_limit_enabled: true,
+            http_rate_limit_tools_per_minute: 1,
+            http_rate_limit_tools_burst: 1,
+            http_rate_limit_resources_per_minute: 1,
+            http_rate_limit_resources_burst: 1,
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let tool_params = serde_json::json!({ "name": "health_check", "arguments": {} });
+        let tool_rpc = JsonRpcRequest::new("tools/call", Some(tool_params), 1);
+        let res_rpc = JsonRpcRequest::new("resources/list", None, 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+
+        let req_tool1 = make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(peer));
+        assert!(block_on(state.check_rbac_and_rate_limit(&req_tool1, &tool_rpc)).is_none());
+
+        let req_res1 = make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(peer));
+        assert!(block_on(state.check_rbac_and_rate_limit(&req_res1, &res_rpc)).is_none());
+
+        let req_tool2 = make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(peer));
+        let tool_resp = block_on(state.check_rbac_and_rate_limit(&req_tool2, &tool_rpc))
+            .expect("tool rate limit should trigger on second tool request");
+        assert_eq!(tool_resp.status, 429);
+
+        let req_res2 = make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(peer));
+        let res_resp = block_on(state.check_rbac_and_rate_limit(&req_res2, &res_rpc))
+            .expect("resource rate limit should trigger on second resource request");
+        assert_eq!(res_resp.status, 429);
+    }
+
+    #[test]
+    fn rate_limit_identity_vectors_cover_ipv4_ipv6_and_mapped_ipv6() {
+        // jwt_sub should win when present (including whitespace-only strings).
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[],
+            Some(SocketAddr::from(([192, 168, 0, 1], 1234))),
+        );
+        assert_eq!(
+            rate_limit_identity(&req, Some("  user-123  ")),
+            "sub:  user-123  "
+        );
+
+        // empty jwt_sub should be treated as missing.
+        assert_eq!(rate_limit_identity(&req, Some("")), "192.168.0.1");
+
+        // ipv6 loopback
+        let v6_loop = SocketAddr::from((
+            std::net::IpAddr::V6("::1".parse().expect("ipv6 parse")),
+            1234,
+        ));
+        let req_v6 = make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(v6_loop));
+        assert_eq!(rate_limit_identity(&req_v6, None), "::1");
+
+        // ipv4-mapped ipv6 should normalize to ipv4 string
+        let mapped = SocketAddr::from((
+            std::net::IpAddr::V6("::ffff:127.0.0.1".parse().expect("ipv6 mapped parse")),
+            1234,
+        ));
+        let req_mapped = make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(mapped));
+        assert_eq!(rate_limit_identity(&req_mapped, None), "127.0.0.1");
+
+        // missing peer addr
+        let req_none = make_request(Http1Method::Post, "/api/", &[]);
+        assert_eq!(rate_limit_identity(&req_none, None), "ip-unknown");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn rate_limit_vector_suite_matches_memory_and_redis_when_available() {
+        #[derive(Clone, Copy)]
+        struct Vector {
+            name: &'static str,
+            rpm: u32,
+            burst: u32,
+            times: &'static [f64],
+            expected: &'static [bool],
+        }
+
+        static V1_TIMES: &[f64] = &[1000.0, 1000.1, 1000.1, 1001.1];
+        static V1_EXPECTED: &[bool] = &[true, true, false, true];
+        static V2_TIMES: &[f64] = &[2000.0, 2000.0, 2000.49, 2000.51];
+        static V2_EXPECTED: &[bool] = &[true, false, false, true];
+
+        const VECTORS: &[Vector] = &[
+            Vector {
+                name: "rpm60_burst2",
+                rpm: 60,
+                burst: 2,
+                times: V1_TIMES,
+                expected: V1_EXPECTED,
+            },
+            Vector {
+                name: "rpm120_burst1",
+                rpm: 120,
+                burst: 1,
+                times: V2_TIMES,
+                expected: V2_EXPECTED,
+            },
+        ];
+
+        // Memory backend should match legacy vectors deterministically (explicit timestamps).
+        for v in VECTORS {
+            let limiter = RateLimiter::new();
+            let key = format!("tools:vector_suite:{}:ip-unknown", v.name);
+            assert_eq!(v.times.len(), v.expected.len());
+            for (idx, (&now, &exp)) in v.times.iter().zip(v.expected.iter()).enumerate() {
+                let allowed = limiter.allow_memory(&key, v.rpm, v.burst, now, false);
+                if allowed != exp {
+                    let state = {
+                        let buckets = limiter
+                            .buckets
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        buckets.get(&key).copied()
+                    };
+                    write_rate_limit_artifact(
+                        "rate_limit_vector_suite_matches_memory_and_redis_when_available_memory",
+                        &serde_json::json!({
+                            "backend": "memory",
+                            "vector": v.name,
+                            "idx": idx,
+                            "rpm": v.rpm,
+                            "burst": v.burst,
+                            "now": now,
+                            "expected_allowed": exp,
+                            "actual_allowed": allowed,
+                            "bucket_state": state.map(|(tokens, ts)| serde_json::json!({"tokens": tokens, "ts": ts})),
+                            "key": key,
+                        }),
+                    );
+                }
+                assert_eq!(allowed, exp, "memory vector={} idx={idx}", v.name);
+            }
+        }
+
+        // Redis backend should match the exact same vectors when a test redis is available.
+        let Some(redis_url) =
+            redis_url_or_skip("rate_limit_vector_suite_matches_memory_and_redis_when_available")
+        else {
+            return;
+        };
+
+        let cx = Cx::for_testing();
+        let redis = block_on(RedisClient::connect(&cx, &redis_url)).expect("connect redis");
+
+        for v in VECTORS {
+            let suffix = REDIS_RATE_LIMIT_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let key = format!("tools:vector_suite_{suffix}:{}:ip-unknown", v.name);
+            let redis_key = format!("rl:{key}");
+            let _ = block_on(redis.del(&cx, &[redis_key.as_str()]));
+
+            for (idx, (&now, &exp)) in v.times.iter().zip(v.expected.iter()).enumerate() {
+                let allowed = block_on(consume_rate_limit_redis(
+                    &cx, &redis, &key, v.rpm, v.burst, now,
+                ))
+                .expect("redis eval");
+                if allowed != exp {
+                    let tokens = block_on(redis.hget(&cx, &redis_key, "tokens"))
+                        .unwrap_or(None)
+                        .and_then(|b| {
+                            std::str::from_utf8(&b)
+                                .ok()
+                                .and_then(|s| s.parse::<f64>().ok())
+                        });
+                    let ts = block_on(redis.hget(&cx, &redis_key, "ts"))
+                        .unwrap_or(None)
+                        .and_then(|b| {
+                            std::str::from_utf8(&b)
+                                .ok()
+                                .and_then(|s| s.parse::<f64>().ok())
+                        });
+                    let ttl = block_on(redis.cmd(&cx, &["TTL", redis_key.as_str()]))
+                        .ok()
+                        .and_then(|v| v.as_integer());
+                    write_rate_limit_artifact(
+                        "rate_limit_vector_suite_matches_memory_and_redis_when_available_redis",
+                        &serde_json::json!({
+                            "backend": "redis",
+                            "redis_url": redis_url,
+                            "vector": v.name,
+                            "idx": idx,
+                            "rpm": v.rpm,
+                            "burst": v.burst,
+                            "now": now,
+                            "expected_allowed": exp,
+                            "actual_allowed": allowed,
+                            "key": key,
+                            "redis_key": redis_key,
+                            "redis_state": {
+                                "tokens": tokens,
+                                "ts": ts,
+                                "ttl": ttl,
+                            }
+                        }),
+                    );
+                }
+                assert_eq!(allowed, exp, "redis vector={} idx={idx}", v.name);
+            }
+
+            // Best-effort cleanup
+            let _ = block_on(redis.del(&cx, &[redis_key.as_str()]));
+        }
+    }
+
+    #[test]
+    fn rate_limit_redis_ttl_matches_legacy_formula_when_available() {
+        let Some(redis_url) =
+            redis_url_or_skip("rate_limit_redis_ttl_matches_legacy_formula_when_available")
+        else {
+            return;
+        };
+
+        let cx = Cx::for_testing();
+        let redis = block_on(RedisClient::connect(&cx, &redis_url)).expect("connect redis");
+
+        let suffix = REDIS_RATE_LIMIT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let key = format!("tools:ttl_test_{suffix}:ip-unknown");
+        let redis_key = format!("rl:{key}");
+        let _ = block_on(redis.del(&cx, &[redis_key.as_str()]));
+
+        let rpm = 1;
+        let burst = 2;
+        let now = 1000.0;
+        let allowed = block_on(consume_rate_limit_redis(&cx, &redis, &key, rpm, burst, now))
+            .expect("redis eval");
+        assert!(allowed);
+
+        let expected_ttl_u64 = (u64::from(burst) * 60).div_ceil(u64::from(rpm));
+        let expected_ttl = i64::try_from(expected_ttl_u64).unwrap_or(i64::MAX);
+        let ttl = block_on(redis.cmd(&cx, &["TTL", redis_key.as_str()]))
+            .expect("TTL")
+            .as_integer()
+            .unwrap_or(-999);
+        // TTL counts down in real time; allow a small amount of slop.
+        assert!(
+            ttl <= expected_ttl && ttl >= expected_ttl.saturating_sub(2),
+            "ttl={ttl} expected~={expected_ttl} redis_key={redis_key}"
+        );
+
+        // Best-effort cleanup
+        let _ = block_on(redis.del(&cx, &[redis_key.as_str()]));
+    }
+
+    #[test]
+    fn rate_limit_redis_invalid_url_falls_back_to_memory() {
+        let config = mcp_agent_mail_core::Config {
+            http_rate_limit_enabled: true,
+            http_rate_limit_backend: mcp_agent_mail_core::RateLimitBackend::Redis,
+            http_rate_limit_redis_url: Some("not-a-url".to_string()),
+            http_rate_limit_tools_per_minute: 1,
+            http_rate_limit_tools_burst: 1,
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let params = serde_json::json!({ "name": "health_check", "arguments": {} });
+        let json_rpc = JsonRpcRequest::new("tools/call", Some(params), 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+
+        let req1 = make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(peer));
+        assert!(block_on(state.check_rbac_and_rate_limit(&req1, &json_rpc)).is_none());
+
+        let req2 = make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(peer));
+        let resp = block_on(state.check_rbac_and_rate_limit(&req2, &json_rpc))
+            .expect("rate limit should trigger via memory fallback");
+        if resp.status != 429 {
+            write_rate_limit_artifact(
+                "rate_limit_redis_invalid_url_falls_back_to_memory",
+                &serde_json::json!({
+                    "redis_url": "not-a-url",
+                    "expected_backend": "memory",
+                    "expected_status": 429,
+                    "actual_status": resp.status,
+                }),
+            );
+        }
+        assert_eq!(resp.status, 429);
+
+        let (is_failed, state_dbg) = {
+            let guard = state
+                .rate_limit_redis
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let is_failed = matches!(&*guard, RateLimitRedisState::Failed);
+            let state_dbg = format!("{guard:?}");
+            drop(guard);
+            (is_failed, state_dbg)
+        };
+        if !is_failed {
+            write_rate_limit_artifact(
+                "rate_limit_redis_invalid_url_falls_back_to_memory_state",
+                &serde_json::json!({
+                    "expected_state": "Failed",
+                    "actual_state": state_dbg,
+                }),
+            );
+        }
+        assert!(is_failed);
+    }
+
+    #[test]
+    fn rate_limit_redis_command_failure_falls_back_to_memory() {
+        // Use a local port that should reliably refuse connections.
+        let config = mcp_agent_mail_core::Config {
+            http_rate_limit_enabled: true,
+            http_rate_limit_backend: mcp_agent_mail_core::RateLimitBackend::Redis,
+            http_rate_limit_redis_url: Some("redis://127.0.0.1:1/0".to_string()),
+            http_rate_limit_tools_per_minute: 1,
+            http_rate_limit_tools_burst: 1,
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let params = serde_json::json!({ "name": "health_check", "arguments": {} });
+        let json_rpc = JsonRpcRequest::new("tools/call", Some(params), 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+
+        let req1 = make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(peer));
+        assert!(block_on(state.check_rbac_and_rate_limit(&req1, &json_rpc)).is_none());
+
+        let req2 = make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(peer));
+        let resp = block_on(state.check_rbac_and_rate_limit(&req2, &json_rpc))
+            .expect("rate limit should trigger via memory fallback");
+        if resp.status != 429 {
+            write_rate_limit_artifact(
+                "rate_limit_redis_command_failure_falls_back_to_memory",
+                &serde_json::json!({
+                    "redis_url": "redis://127.0.0.1:1/0",
+                    "expected_backend": "redis->memory fallback",
+                    "expected_status": 429,
+                    "actual_status": resp.status,
+                }),
+            );
+        }
+        assert_eq!(resp.status, 429);
+
+        let (is_ready, state_dbg) = {
+            let guard = state
+                .rate_limit_redis
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let is_ready = matches!(&*guard, RateLimitRedisState::Ready(_));
+            let state_dbg = format!("{guard:?}");
+            drop(guard);
+            (is_ready, state_dbg)
+        };
+        if !is_ready {
+            write_rate_limit_artifact(
+                "rate_limit_redis_command_failure_falls_back_to_memory_state",
+                &serde_json::json!({
+                    "expected_state": "Ready",
+                    "actual_state": state_dbg,
+                }),
+            );
+        }
+        assert!(is_ready, "command failures must not disable redis state");
+    }
+
+    #[test]
+    fn rate_limit_redis_backend_enforces_limits_when_available() {
+        let Some(redis_url) =
+            redis_url_or_skip("rate_limit_redis_backend_enforces_limits_when_available")
+        else {
+            return;
+        };
+
+        let config = mcp_agent_mail_core::Config {
+            http_rate_limit_enabled: true,
+            http_rate_limit_backend: mcp_agent_mail_core::RateLimitBackend::Redis,
+            http_rate_limit_redis_url: Some(redis_url.clone()),
+            http_rate_limit_tools_per_minute: 1,
+            http_rate_limit_tools_burst: 1,
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let suffix = REDIS_RATE_LIMIT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tool = format!("redis_rate_limit_test_{suffix}");
+        let params = serde_json::json!({ "name": tool, "arguments": {} });
+        let json_rpc = JsonRpcRequest::new("tools/call", Some(params), 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+
+        let req1 = make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(peer));
+        assert!(block_on(state.check_rbac_and_rate_limit(&req1, &json_rpc)).is_none());
+
+        // Assert the Redis key exists so we know the EVAL path ran (not memory fallback).
+        let identity = peer_addr_host(peer);
+        let redis_key = format!("rl:tools:{tool}:{identity}");
+        let cx = Cx::for_testing();
+        let redis = block_on(RedisClient::connect(&cx, &redis_url)).expect("connect redis");
+        let tokens = block_on(redis.hget(&cx, &redis_key, "tokens")).expect("hget tokens");
+        assert!(tokens.is_some(), "expected redis hash key to be created");
+
+        let req2 = make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(peer));
+        let resp = block_on(state.check_rbac_and_rate_limit(&req2, &json_rpc))
+            .expect("rate limit should trigger on second request");
+        assert_eq!(resp.status, 429);
+
+        // Best-effort cleanup
+        let _ = block_on(redis.del(&cx, &[redis_key.as_str()]));
+    }
+
+    #[test]
+    fn rate_limiter_memory_refill_and_consume_math() {
+        let limiter = RateLimiter::new();
+        let key = "tools:unit_test:ip-unknown";
+        let t0 = rate_limit_now();
+
+        // rpm=60 => 1 token/sec. burst=2 => start with 2 tokens.
+        assert!(limiter.allow_memory(key, 60, 2, t0, false));
+        assert!(limiter.allow_memory(key, 60, 2, t0 + 0.1, false));
+        assert!(!limiter.allow_memory(key, 60, 2, t0 + 0.1, false));
+
+        // After ~1s, we should have refilled enough to allow again.
+        assert!(limiter.allow_memory(key, 60, 2, t0 + 1.1, false));
+    }
+
+    #[test]
+    fn rate_limiter_cleanup_eviction_after_one_hour() {
+        let limiter = RateLimiter::new();
+        let now = rate_limit_now();
+        let cutoff = now - 3600.0;
+
+        {
+            let mut buckets = limiter
+                .buckets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            buckets.insert("old".to_string(), (1.0, cutoff - 1.0));
+            buckets.insert("new".to_string(), (1.0, cutoff + 1.0));
+        }
+        {
+            let mut last = limiter
+                .last_cleanup
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *last = now - 61.0; // ensure cleanup runs
+        }
+
+        limiter.cleanup(now);
+
+        let (has_old, has_new) = {
+            let buckets = limiter
+                .buckets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (buckets.contains_key("old"), buckets.contains_key("new"))
+        };
+        assert!(!has_old);
+        assert!(has_new);
+    }
+
+    #[test]
     fn jwt_enabled_requires_bearer_token() {
         let config = mcp_agent_mail_core::Config {
             http_jwt_enabled: true,
@@ -2597,7 +3745,103 @@ mod tests {
         let req = make_request_with_peer_addr(Http1Method::Post, "/api/", &[], Some(peer));
         let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc))
             .expect("jwt should require Authorization header");
-        assert_eq!(resp.status, 401);
+        assert_unauthorized(&resp);
+    }
+
+    #[test]
+    fn jwt_enabled_rejects_non_bearer_authorization_header() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let json_rpc = JsonRpcRequest::new("tools/list", None, 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", "Basic abc123")],
+            Some(peer),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc))
+            .expect("non-bearer Authorization should be rejected");
+        write_jwt_artifact(
+            "jwt_enabled_rejects_non_bearer_authorization_header",
+            &serde_json::json!({
+                "config": { "http_jwt_enabled": true },
+                "authorization": "Basic abc123",
+                "expected_status": 401,
+                "actual_status": resp.status,
+            }),
+        );
+        assert_unauthorized(&resp);
+    }
+
+    #[test]
+    fn jwt_enabled_rejects_empty_bearer_token() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let json_rpc = JsonRpcRequest::new("tools/list", None, 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", "Bearer ")],
+            Some(peer),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc))
+            .expect("empty bearer token should be rejected");
+        write_jwt_artifact(
+            "jwt_enabled_rejects_empty_bearer_token",
+            &serde_json::json!({
+                "config": { "http_jwt_enabled": true },
+                "authorization": "Bearer <empty>",
+                "expected_status": 401,
+                "actual_status": resp.status,
+            }),
+        );
+        assert_unauthorized(&resp);
+    }
+
+    #[test]
+    fn jwt_rejects_malformed_header_segment() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        // "abc" base64url-decodes, but is not valid JSON; this must fail header parsing.
+        let auth = "Bearer abc.def.ghi";
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth)],
+            Some(peer),
+        );
+        let json_rpc = JsonRpcRequest::new("tools/list", None, 1);
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc))
+            .expect("malformed header must be rejected");
+        write_jwt_artifact(
+            "jwt_rejects_malformed_header_segment",
+            &serde_json::json!({
+                "config": { "http_jwt_enabled": true },
+                "authorization": { "scheme": "Bearer", "token": "<malformed>" },
+                "expected_status": 401,
+                "actual_status": resp.status,
+            }),
+        );
+        assert_unauthorized(&resp);
     }
 
     #[test]
@@ -2610,13 +3854,7 @@ mod tests {
         };
         let state = build_state(config);
         let claims = serde_json::json!({ "sub": "user-123", "role": "writer" });
-        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
-        let token = jsonwebtoken::encode(
-            &header,
-            &claims,
-            &jsonwebtoken::EncodingKey::from_secret(b"secret"),
-        )
-        .expect("encode token");
+        let token = hs256_token(b"secret", &claims);
         let auth = format!("Bearer {token}");
 
         let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
@@ -2631,6 +3869,443 @@ mod tests {
     }
 
     #[test]
+    fn jwt_hs256_secret_rejects_invalid_signature() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let claims = serde_json::json!({ "sub": "user-123", "role": "writer" });
+        let token = hs256_token(b"not-the-secret", &claims);
+        let auth = format!("Bearer {token}");
+
+        let json_rpc = JsonRpcRequest::new("tools/list", None, 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth.as_str())],
+            Some(peer),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc))
+            .expect("invalid signature should be rejected");
+        write_jwt_artifact(
+            "jwt_hs256_secret_rejects_invalid_signature",
+            &serde_json::json!({
+                "config": { "http_jwt_enabled": true, "http_jwt_secret": "***" },
+                "claims": claims,
+                "authorization": { "scheme": "Bearer", "token_len": token.len() },
+                "expected_status": 401,
+                "actual_status": resp.status,
+            }),
+        );
+        assert_unauthorized(&resp);
+    }
+
+    #[test]
+    fn jwt_rejects_token_with_disallowed_algorithm() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_jwt_algorithms: vec!["RS256".to_string()],
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let claims = serde_json::json!({ "sub": "user-123", "role": "writer" });
+        let token = hs256_token(b"secret", &claims);
+        let auth = format!("Bearer {token}");
+
+        let json_rpc = JsonRpcRequest::new("tools/list", None, 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth.as_str())],
+            Some(peer),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc))
+            .expect("disallowed alg should be rejected");
+        write_jwt_artifact(
+            "jwt_rejects_token_with_disallowed_algorithm",
+            &serde_json::json!({
+                "config": { "http_jwt_enabled": true, "http_jwt_algorithms": ["RS256"] },
+                "claims": claims,
+                "authorization": { "scheme": "Bearer", "token_len": token.len() },
+                "expected_status": 401,
+                "actual_status": resp.status,
+            }),
+        );
+        assert_unauthorized(&resp);
+    }
+
+    #[test]
+    fn jwt_hs256_rejects_expired_token() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let claims = serde_json::json!({ "sub": "user-123", "role": "writer", "exp": 1_i64 });
+        let token = hs256_token(b"secret", &claims);
+        let auth = format!("Bearer {token}");
+
+        let json_rpc = JsonRpcRequest::new("tools/list", None, 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth.as_str())],
+            Some(peer),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc))
+            .expect("expired token should be rejected");
+        write_jwt_artifact(
+            "jwt_hs256_rejects_expired_token",
+            &serde_json::json!({
+                "config": { "http_jwt_enabled": true },
+                "claims": claims,
+                "authorization": { "scheme": "Bearer", "token_len": token.len() },
+                "expected_status": 401,
+                "actual_status": resp.status,
+            }),
+        );
+        assert_unauthorized(&resp);
+    }
+
+    #[test]
+    fn jwt_hs256_rejects_token_not_yet_valid() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let claims =
+            serde_json::json!({ "sub": "user-123", "role": "writer", "nbf": 4_102_444_800_i64 });
+        let token = hs256_token(b"secret", &claims);
+        let auth = format!("Bearer {token}");
+
+        let json_rpc = JsonRpcRequest::new("tools/list", None, 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth.as_str())],
+            Some(peer),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc))
+            .expect("future nbf token should be rejected");
+        write_jwt_artifact(
+            "jwt_hs256_rejects_token_not_yet_valid",
+            &serde_json::json!({
+                "config": { "http_jwt_enabled": true },
+                "claims": claims,
+                "authorization": { "scheme": "Bearer", "token_len": token.len() },
+                "expected_status": 401,
+                "actual_status": resp.status,
+            }),
+        );
+        assert_unauthorized(&resp);
+    }
+
+    #[test]
+    fn jwt_hs256_rejects_issuer_mismatch_when_configured() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_jwt_issuer: Some("issuer-expected".to_string()),
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let claims =
+            serde_json::json!({ "sub": "user-123", "role": "writer", "iss": "issuer-wrong" });
+        let token = hs256_token(b"secret", &claims);
+        let auth = format!("Bearer {token}");
+
+        let json_rpc = JsonRpcRequest::new("tools/list", None, 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth.as_str())],
+            Some(peer),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc))
+            .expect("iss mismatch should be rejected");
+        write_jwt_artifact(
+            "jwt_hs256_rejects_issuer_mismatch_when_configured",
+            &serde_json::json!({
+                "config": { "http_jwt_enabled": true, "http_jwt_issuer": "issuer-expected" },
+                "claims": claims,
+                "authorization": { "scheme": "Bearer", "token_len": token.len() },
+                "expected_status": 401,
+                "actual_status": resp.status,
+            }),
+        );
+        assert_unauthorized(&resp);
+    }
+
+    #[test]
+    fn jwt_hs256_rejects_audience_mismatch_when_configured() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_jwt_audience: Some("aud-expected".to_string()),
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let claims = serde_json::json!({ "sub": "user-123", "role": "writer", "aud": "aud-wrong" });
+        let token = hs256_token(b"secret", &claims);
+        let auth = format!("Bearer {token}");
+
+        let json_rpc = JsonRpcRequest::new("tools/list", None, 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth.as_str())],
+            Some(peer),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc))
+            .expect("aud mismatch should be rejected");
+        write_jwt_artifact(
+            "jwt_hs256_rejects_audience_mismatch_when_configured",
+            &serde_json::json!({
+                "config": { "http_jwt_enabled": true, "http_jwt_audience": "aud-expected" },
+                "claims": claims,
+                "authorization": { "scheme": "Bearer", "token_len": token.len() },
+                "expected_status": 401,
+                "actual_status": resp.status,
+            }),
+        );
+        assert_unauthorized(&resp);
+    }
+
+    #[test]
+    fn jwt_hs256_allows_issuer_match_when_configured() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_jwt_issuer: Some("issuer-expected".to_string()),
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "role": "writer",
+            "iss": "issuer-expected"
+        });
+        let token = hs256_token(b"secret", &claims);
+        let auth = format!("Bearer {token}");
+
+        let json_rpc = JsonRpcRequest::new("tools/list", None, 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth.as_str())],
+            Some(peer),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc));
+        write_jwt_artifact(
+            "jwt_hs256_allows_issuer_match_when_configured",
+            &serde_json::json!({
+                "config": { "http_jwt_enabled": true, "http_jwt_issuer": "issuer-expected" },
+                "claims": claims,
+                "authorization": { "scheme": "Bearer", "token_len": token.len() },
+                "result": if resp.is_none() { "allow" } else { "deny" },
+                "deny_status": resp.as_ref().map(|r| r.status),
+            }),
+        );
+        assert!(resp.is_none(), "expected issuer match to allow");
+    }
+
+    #[test]
+    fn jwt_hs256_allows_audience_match_when_configured() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_jwt_audience: Some("aud-expected".to_string()),
+            http_rbac_enabled: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let claims = serde_json::json!({
+            "sub": "user-123",
+            "role": "writer",
+            "aud": "aud-expected"
+        });
+        let token = hs256_token(b"secret", &claims);
+        let auth = format!("Bearer {token}");
+
+        let json_rpc = JsonRpcRequest::new("tools/list", None, 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth.as_str())],
+            Some(peer),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc));
+        write_jwt_artifact(
+            "jwt_hs256_allows_audience_match_when_configured",
+            &serde_json::json!({
+                "config": { "http_jwt_enabled": true, "http_jwt_audience": "aud-expected" },
+                "claims": claims,
+                "authorization": { "scheme": "Bearer", "token_len": token.len() },
+                "result": if resp.is_none() { "allow" } else { "deny" },
+                "deny_status": resp.as_ref().map(|r| r.status),
+            }),
+        );
+        assert!(resp.is_none(), "expected audience match to allow");
+    }
+
+    #[test]
+    fn jwt_roles_from_claim_string_is_singleton() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+        let claims = serde_json::json!({ "role": "writer" });
+        let roles = state.jwt_roles_from_claims(&claims);
+        write_rbac_artifact(
+            "jwt_roles_from_claim_string_is_singleton",
+            &serde_json::json!({
+                "role_claim": state.config.http_jwt_role_claim,
+                "default_role": state.config.http_rbac_default_role,
+                "claims": claims,
+                "roles": roles,
+            }),
+        );
+        assert_eq!(roles, vec!["writer".to_string()]);
+    }
+
+    #[test]
+    fn jwt_roles_from_claim_list_is_sorted_and_deduped() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+        let claims = serde_json::json!({ "role": ["writer", "", "reader", "writer", "reader"] });
+        let roles = state.jwt_roles_from_claims(&claims);
+        write_rbac_artifact(
+            "jwt_roles_from_claim_list_is_sorted_and_deduped",
+            &serde_json::json!({
+                "role_claim": state.config.http_jwt_role_claim,
+                "default_role": state.config.http_rbac_default_role,
+                "claims": claims,
+                "roles": roles,
+            }),
+        );
+        assert_eq!(roles, vec!["reader".to_string(), "writer".to_string()]);
+    }
+
+    #[test]
+    fn jwt_roles_from_claim_missing_uses_default_role() {
+        let config = mcp_agent_mail_core::Config {
+            http_rbac_default_role: "default-role".to_string(),
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let claims = serde_json::json!({});
+        let roles = state.jwt_roles_from_claims(&claims);
+        write_rbac_artifact(
+            "jwt_roles_from_claim_missing_uses_default_role",
+            &serde_json::json!({
+                "role_claim": state.config.http_jwt_role_claim,
+                "default_role": state.config.http_rbac_default_role,
+                "claims": claims,
+                "roles": roles,
+            }),
+        );
+        assert_eq!(roles, vec!["default-role".to_string()]);
+    }
+
+    #[test]
+    fn jwt_roles_from_claim_empty_string_uses_default_role() {
+        let config = mcp_agent_mail_core::Config {
+            http_rbac_default_role: "default-role".to_string(),
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let claims = serde_json::json!({ "role": "" });
+        let roles = state.jwt_roles_from_claims(&claims);
+        write_rbac_artifact(
+            "jwt_roles_from_claim_empty_string_uses_default_role",
+            &serde_json::json!({
+                "role_claim": state.config.http_jwt_role_claim,
+                "default_role": state.config.http_rbac_default_role,
+                "claims": claims,
+                "roles": roles,
+            }),
+        );
+        assert_eq!(roles, vec!["default-role".to_string()]);
+    }
+
+    #[test]
+    fn jwt_roles_from_custom_claim_name_is_used() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_role_claim: "roles".to_string(),
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let claims = serde_json::json!({ "roles": ["writer"] });
+        let roles = state.jwt_roles_from_claims(&claims);
+        write_rbac_artifact(
+            "jwt_roles_from_custom_claim_name_is_used",
+            &serde_json::json!({
+                "role_claim": state.config.http_jwt_role_claim,
+                "default_role": state.config.http_rbac_default_role,
+                "claims": claims,
+                "roles": roles,
+            }),
+        );
+        assert_eq!(roles, vec!["writer".to_string()]);
+    }
+
+    #[test]
+    fn rbac_reader_can_call_readonly_tool() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_rbac_enabled: true,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let claims = serde_json::json!({ "sub": "user-123", "role": "reader" });
+        let token = hs256_token(b"secret", &claims);
+        let auth = format!("Bearer {token}");
+
+        let params = serde_json::json!({ "name": "health_check", "arguments": {} });
+        let json_rpc = JsonRpcRequest::new("tools/call", Some(params), 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth.as_str())],
+            Some(peer),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc));
+        write_rbac_artifact(
+            "rbac_reader_can_call_readonly_tool",
+            &serde_json::json!({
+                "claims": claims,
+                "tool": "health_check",
+                "peer_addr": peer.to_string(),
+                "is_local_ok": state.allow_local_unauthenticated(&req),
+                "result": if resp.is_none() { "allow" } else { "deny" },
+                "deny_status": resp.as_ref().map(|r| r.status),
+            }),
+        );
+        assert!(resp.is_none(), "reader should be allowed for readonly tool");
+    }
+
+    #[test]
     fn jwt_roles_enforced_for_tools() {
         let config = mcp_agent_mail_core::Config {
             http_jwt_enabled: true,
@@ -2640,13 +4315,7 @@ mod tests {
         };
         let state = build_state(config);
         let claims = serde_json::json!({ "sub": "user-123", "role": "reader" });
-        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
-        let token = jsonwebtoken::encode(
-            &header,
-            &claims,
-            &jsonwebtoken::EncodingKey::from_secret(b"secret"),
-        )
-        .expect("encode token");
+        let token = hs256_token(b"secret", &claims);
         let auth = format!("Bearer {token}");
 
         let params = serde_json::json!({ "name": "send_message", "arguments": {} });
@@ -2664,6 +4333,166 @@ mod tests {
     }
 
     #[test]
+    fn rbac_unknown_tool_name_requires_writer() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_rbac_enabled: true,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let claims = serde_json::json!({ "sub": "user-123", "role": "reader" });
+        let token = hs256_token(b"secret", &claims);
+        let auth = format!("Bearer {token}");
+
+        let params = serde_json::json!({ "arguments": {} });
+        let json_rpc = JsonRpcRequest::new("tools/call", Some(params), 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth.as_str())],
+            Some(peer),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc))
+            .expect("unknown tool name should be forbidden for readers");
+        write_rbac_artifact(
+            "rbac_unknown_tool_name_requires_writer",
+            &serde_json::json!({
+                "claims": claims,
+                "tool": null,
+                "peer_addr": peer.to_string(),
+                "is_local_ok": state.allow_local_unauthenticated(&req),
+                "expected_status": 403,
+                "actual_status": resp.status,
+            }),
+        );
+        assert_forbidden(&resp);
+    }
+
+    #[test]
+    fn rbac_resources_allowed_for_unknown_role() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_rbac_enabled: true,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let claims = serde_json::json!({ "sub": "user-123", "role": "nobody" });
+        let token = hs256_token(b"secret", &claims);
+        let auth = format!("Bearer {token}");
+
+        let json_rpc = JsonRpcRequest::new("resources/read", None, 1);
+        let peer = SocketAddr::from(([10, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth.as_str())],
+            Some(peer),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc));
+        write_rbac_artifact(
+            "rbac_resources_allowed_for_unknown_role",
+            &serde_json::json!({
+                "claims": claims,
+                "resource_method": "resources/read",
+                "peer_addr": peer.to_string(),
+                "is_local_ok": state.allow_local_unauthenticated(&req),
+                "result": if resp.is_none() { "allow" } else { "deny" },
+                "deny_status": resp.as_ref().map(|r| r.status),
+            }),
+        );
+        assert!(
+            resp.is_none(),
+            "resources should be allowed regardless of role membership"
+        );
+    }
+
+    #[test]
+    fn rbac_localhost_bypass_allows_reader_for_writer_tool() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_rbac_enabled: true,
+            http_allow_localhost_unauthenticated: true,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let claims = serde_json::json!({ "sub": "user-123", "role": "reader" });
+        let token = hs256_token(b"secret", &claims);
+        let auth = format!("Bearer {token}");
+
+        let params = serde_json::json!({ "name": "send_message", "arguments": {} });
+        let json_rpc = JsonRpcRequest::new("tools/call", Some(params), 1);
+        let peer = SocketAddr::from(([127, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[("Authorization", auth.as_str())],
+            Some(peer),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc));
+        write_rbac_artifact(
+            "rbac_localhost_bypass_allows_reader_for_writer_tool",
+            &serde_json::json!({
+                "claims": claims,
+                "tool": "send_message",
+                "peer_addr": peer.to_string(),
+                "is_local_ok": state.allow_local_unauthenticated(&req),
+                "result": if resp.is_none() { "allow" } else { "deny" },
+                "deny_status": resp.as_ref().map(|r| r.status),
+            }),
+        );
+        assert!(
+            resp.is_none(),
+            "localhost bypass should skip RBAC restrictions"
+        );
+    }
+
+    #[test]
+    fn rbac_localhost_bypass_disabled_by_forwarded_headers() {
+        let config = mcp_agent_mail_core::Config {
+            http_jwt_enabled: true,
+            http_jwt_secret: Some("secret".to_string()),
+            http_rbac_enabled: true,
+            http_allow_localhost_unauthenticated: true,
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let claims = serde_json::json!({ "sub": "user-123", "role": "reader" });
+        let token = hs256_token(b"secret", &claims);
+        let auth = format!("Bearer {token}");
+
+        let params = serde_json::json!({ "name": "send_message", "arguments": {} });
+        let json_rpc = JsonRpcRequest::new("tools/call", Some(params), 1);
+        let peer = SocketAddr::from(([127, 0, 0, 1], 1234));
+        let req = make_request_with_peer_addr(
+            Http1Method::Post,
+            "/api/",
+            &[
+                ("Authorization", auth.as_str()),
+                ("X-Forwarded-For", "1.2.3.4"),
+            ],
+            Some(peer),
+        );
+        let resp = block_on(state.check_rbac_and_rate_limit(&req, &json_rpc))
+            .expect("forwarded headers should disable bypass and enforce RBAC");
+        write_rbac_artifact(
+            "rbac_localhost_bypass_disabled_by_forwarded_headers",
+            &serde_json::json!({
+                "claims": claims,
+                "tool": "send_message",
+                "peer_addr": peer.to_string(),
+                "is_local_ok": state.allow_local_unauthenticated(&req),
+                "expected_status": 403,
+                "actual_status": resp.status,
+            }),
+        );
+        assert_forbidden(&resp);
+    }
+
+    #[test]
     fn rate_limiting_uses_jwt_sub_identity() {
         let config = mcp_agent_mail_core::Config {
             http_jwt_enabled: true,
@@ -2677,13 +4506,7 @@ mod tests {
         let state = build_state(config);
 
         let claims = serde_json::json!({ "sub": "user-123", "role": "writer" });
-        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
-        let token = jsonwebtoken::encode(
-            &header,
-            &claims,
-            &jsonwebtoken::EncodingKey::from_secret(b"secret"),
-        )
-        .expect("encode token");
+        let token = hs256_token(b"secret", &claims);
         let auth = format!("Bearer {token}");
 
         let params = serde_json::json!({ "name": "health_check", "arguments": {} });
@@ -2709,13 +4532,8 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
     fn jwt_hs256_jwks_allows_valid_token() {
         use base64::Engine as _;
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::time::{Duration, Instant};
 
         let runtime = RuntimeBuilder::current_thread()
             .build()
@@ -2733,92 +4551,21 @@ mod tests {
         });
         let jwks_bytes = serde_json::to_vec(&jwks).expect("jwks json");
 
-        // Run a tiny blocking HTTP server on a dedicated OS thread. Using a separate
-        // thread avoids in-process deadlocks when both client and server are driven by
-        // a single-threaded async runtime.
-        std::thread::scope(|s| {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind jwks listener");
-            listener.set_nonblocking(true).expect("set_nonblocking");
-            let addr = listener.local_addr().expect("listener addr");
-            let jwks_body = jwks_bytes.clone();
-            let accepted = Arc::new(AtomicBool::new(false));
-            let accepted2 = Arc::clone(&accepted);
-
-            s.spawn(move || {
-                let deadline = Instant::now() + Duration::from_secs(5);
-                loop {
-                    match listener.accept() {
-                        Ok((mut stream, _peer)) => {
-                            accepted2.store(true, Ordering::SeqCst);
-
-                            // Best-effort read of the request before responding. If we close
-                            // without draining, some TCP stacks may RST, causing the client to
-                            // treat the response as an IO error.
-                            let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-                            let mut buf = [0_u8; 512];
-                            let mut seen = Vec::new();
-                            loop {
-                                match stream.read(&mut buf) {
-                                    Ok(0) => break,
-                                    Ok(n) => {
-                                        seen.extend_from_slice(&buf[..n]);
-                                        if seen.windows(4).any(|w| w == b"\r\n\r\n")
-                                            || seen.len() > 8 * 1024
-                                        {
-                                            break;
-                                        }
-                                    }
-                                    Err(err)
-                                        if err.kind() == std::io::ErrorKind::WouldBlock
-                                            || err.kind() == std::io::ErrorKind::TimedOut =>
-                                    {
-                                        break;
-                                    }
-                                    Err(_) => break,
-                                }
-                            }
-
-                            let status = "200 OK";
-                            let body: &[u8] = jwks_body.as_slice();
-
-                            let header = format!(
-                                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                                body.len()
-                            );
-                            let _ = stream.write_all(header.as_bytes());
-                            let _ = stream.write_all(body);
-                            let _ = stream.flush();
-                            return;
-                        }
-                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                            if Instant::now() > deadline {
-                                return;
-                            }
-                            std::thread::sleep(Duration::from_millis(5));
-                        }
-                        Err(_) => return,
-                    }
-                }
-            });
-
-            let jwks_url = format!("http://{addr}/jwks");
+        with_jwks_server(&jwks_bytes, 2, |jwks_url| {
+            let jwks_url2 = jwks_url.clone();
             let config = mcp_agent_mail_core::Config {
                 http_jwt_enabled: true,
                 http_jwt_algorithms: vec!["HS256".to_string()],
                 http_jwt_secret: None,
-                http_jwt_jwks_url: Some(jwks_url.clone()),
+                http_jwt_jwks_url: Some(jwks_url),
                 http_rbac_enabled: false,
                 ..Default::default()
             };
             let state = build_state(config);
 
             runtime.block_on(async move {
-                let jwks = state.fetch_jwks(&jwks_url, true).await;
-                assert!(
-                    jwks.is_ok(),
-                    "fetch_jwks failed: {jwks:?}; accepted={}",
-                    accepted.load(Ordering::SeqCst)
-                );
+                let jwks = state.fetch_jwks(&jwks_url2, true).await;
+                assert!(jwks.is_ok(), "fetch_jwks failed: {jwks:?}");
 
                 let claims = serde_json::json!({ "sub": "user-123", "role": "writer" });
                 let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
@@ -2843,6 +4590,165 @@ mod tests {
                         .await
                         .is_none()
                 );
+            });
+        });
+    }
+
+    #[test]
+    fn jwt_hs256_jwks_kid_missing_uses_first_key() {
+        use base64::Engine as _;
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        let secret = b"secret";
+        let k = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret);
+        let jwks = serde_json::json!({
+            "keys": [{
+                "kty": "oct",
+                "alg": "HS256",
+                "kid": "kid-1",
+                "k": k,
+            }]
+        });
+        let jwks_bytes = serde_json::to_vec(&jwks).expect("jwks json");
+
+        with_jwks_server(&jwks_bytes, 2, |jwks_url| {
+            let config = mcp_agent_mail_core::Config {
+                http_jwt_enabled: true,
+                http_jwt_algorithms: vec!["HS256".to_string()],
+                http_jwt_secret: None,
+                http_jwt_jwks_url: Some(jwks_url),
+                http_rbac_enabled: false,
+                ..Default::default()
+            };
+            let state = build_state(config);
+
+            runtime.block_on(async move {
+                let claims = serde_json::json!({ "sub": "user-123", "role": "writer" });
+                let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256); // kid missing
+                let token = jsonwebtoken::encode(
+                    &header,
+                    &claims,
+                    &jsonwebtoken::EncodingKey::from_secret(secret),
+                )
+                .expect("encode token");
+                let auth = format!("Bearer {token}");
+                let req = make_request_with_peer_addr(
+                    Http1Method::Post,
+                    "/api/",
+                    &[("Authorization", auth.as_str())],
+                    Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+                );
+                let json_rpc = JsonRpcRequest::new("tools/list", None, 1);
+                assert!(
+                    state
+                        .check_rbac_and_rate_limit(&req, &json_rpc)
+                        .await
+                        .is_none(),
+                    "kid missing should use first key in JWKS"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn jwt_hs256_jwks_kid_mismatch_is_rejected() {
+        use base64::Engine as _;
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        let secret = b"secret";
+        let k = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret);
+        let jwks = serde_json::json!({
+            "keys": [{
+                "kty": "oct",
+                "alg": "HS256",
+                "kid": "kid-1",
+                "k": k,
+            }]
+        });
+        let jwks_bytes = serde_json::to_vec(&jwks).expect("jwks json");
+
+        with_jwks_server(&jwks_bytes, 4, |jwks_url| {
+            let config = mcp_agent_mail_core::Config {
+                http_jwt_enabled: true,
+                http_jwt_algorithms: vec!["HS256".to_string()],
+                http_jwt_secret: None,
+                http_jwt_jwks_url: Some(jwks_url.clone()),
+                http_rbac_enabled: false,
+                ..Default::default()
+            };
+            let state = build_state(config);
+
+            runtime.block_on(async move {
+                // Warm cache so the first lookup uses cached JWKS; the kid mismatch path
+                // should still attempt a forced refresh before failing.
+                let _ = state.fetch_jwks(&jwks_url, true).await;
+
+                let claims = serde_json::json!({ "sub": "user-123", "role": "writer" });
+                let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+                header.kid = Some("kid-missing".to_string());
+                let token = jsonwebtoken::encode(
+                    &header,
+                    &claims,
+                    &jsonwebtoken::EncodingKey::from_secret(secret),
+                )
+                .expect("encode token");
+                let auth = format!("Bearer {token}");
+                let req = make_request_with_peer_addr(
+                    Http1Method::Post,
+                    "/api/",
+                    &[("Authorization", auth.as_str())],
+                    Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+                );
+                let json_rpc = JsonRpcRequest::new("tools/list", None, 1);
+                let resp = state
+                    .check_rbac_and_rate_limit(&req, &json_rpc)
+                    .await
+                    .expect("kid mismatch should be rejected");
+                assert_unauthorized(&resp);
+            });
+        });
+    }
+
+    #[test]
+    fn jwt_hs256_jwks_invalid_json_is_rejected() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        let bad_jwks = b"{this is not json}".to_vec();
+        with_jwks_server(&bad_jwks, 2, |jwks_url| {
+            let config = mcp_agent_mail_core::Config {
+                http_jwt_enabled: true,
+                http_jwt_algorithms: vec!["HS256".to_string()],
+                http_jwt_secret: None,
+                http_jwt_jwks_url: Some(jwks_url),
+                http_rbac_enabled: false,
+                ..Default::default()
+            };
+            let state = build_state(config);
+
+            runtime.block_on(async move {
+                let claims = serde_json::json!({ "sub": "user-123", "role": "writer" });
+                let token = hs256_token(b"secret", &claims);
+                let auth = format!("Bearer {token}");
+                let req = make_request_with_peer_addr(
+                    Http1Method::Post,
+                    "/api/",
+                    &[("Authorization", auth.as_str())],
+                    Some(SocketAddr::from(([10, 0, 0, 1], 1234))),
+                );
+                let json_rpc = JsonRpcRequest::new("tools/list", None, 1);
+                let resp = state
+                    .check_rbac_and_rate_limit(&req, &json_rpc)
+                    .await
+                    .expect("invalid JWKS must be rejected");
+                assert_unauthorized(&resp);
             });
         });
     }

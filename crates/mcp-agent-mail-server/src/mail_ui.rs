@@ -364,11 +364,13 @@ fn render_project(cx: &Cx, pool: &DbPool, slug: &str) -> Result<Option<String>, 
 #[derive(Serialize)]
 struct InboxCtx {
     project: ProjectView,
-    agent: AgentView,
-    messages: Vec<InboxMessage>,
+    agent: String,
+    items: Vec<InboxMessage>,
     page: usize,
     limit: usize,
     total: usize,
+    prev_page: Option<usize>,
+    next_page: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -402,7 +404,7 @@ fn render_inbox(
         queries::fetch_inbox(cx, pool, pid, aid, false, None, limit),
     )?;
     let total = inbox.len();
-    let messages: Vec<InboxMessage> = inbox
+    let items: Vec<InboxMessage> = inbox
         .iter()
         .map(|row| {
             let m = &row.message;
@@ -424,11 +426,13 @@ fn render_inbox(
         "mail_inbox.html",
         InboxCtx {
             project: project_view(&p),
-            agent: agent_view(&a),
-            messages,
+            agent: a.name,
+            items,
             page,
             limit,
             total,
+            prev_page: None,
+            next_page: None,
         },
     )
 }
