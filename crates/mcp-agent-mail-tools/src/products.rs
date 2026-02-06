@@ -542,3 +542,150 @@ pub async fn summarize_thread_product(
     serde_json::to_string(&response)
         .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // collapse_whitespace
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn collapse_whitespace_single_spaces() {
+        assert_eq!(collapse_whitespace("hello world"), "hello world");
+    }
+
+    #[test]
+    fn collapse_whitespace_multiple_spaces() {
+        assert_eq!(collapse_whitespace("hello   world"), "hello world");
+    }
+
+    #[test]
+    fn collapse_whitespace_tabs_and_newlines() {
+        assert_eq!(collapse_whitespace("hello\t\n  world"), "hello world");
+    }
+
+    #[test]
+    fn collapse_whitespace_leading_trailing() {
+        assert_eq!(collapse_whitespace("  hello  "), "hello");
+    }
+
+    #[test]
+    fn collapse_whitespace_empty() {
+        assert_eq!(collapse_whitespace(""), "");
+    }
+
+    #[test]
+    fn collapse_whitespace_only_spaces() {
+        assert_eq!(collapse_whitespace("   "), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // is_hex_uid
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn hex_uid_valid_8_chars() {
+        assert!(is_hex_uid("abcdef12"));
+    }
+
+    #[test]
+    fn hex_uid_valid_20_chars() {
+        assert!(is_hex_uid("abcdef1234567890abcd"));
+    }
+
+    #[test]
+    fn hex_uid_valid_64_chars() {
+        assert!(is_hex_uid(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn hex_uid_too_short() {
+        assert!(!is_hex_uid("abcdef1"));
+    }
+
+    #[test]
+    fn hex_uid_too_long() {
+        assert!(!is_hex_uid(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn hex_uid_empty() {
+        assert!(!is_hex_uid(""));
+    }
+
+    #[test]
+    fn hex_uid_non_hex_chars() {
+        assert!(!is_hex_uid("abcdefgh12345678"));
+    }
+
+    #[test]
+    fn hex_uid_with_whitespace_trimmed() {
+        assert!(is_hex_uid("  abcdef12  "));
+    }
+
+    #[test]
+    fn hex_uid_uppercase() {
+        assert!(is_hex_uid("ABCDEF12"));
+    }
+
+    #[test]
+    fn hex_uid_mixed_case() {
+        assert!(is_hex_uid("AbCdEf12"));
+    }
+
+    // -----------------------------------------------------------------------
+    // generate_product_uid
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn product_uid_is_20_chars() {
+        let uid = generate_product_uid(1_000_000);
+        assert_eq!(uid.len(), 20);
+    }
+
+    #[test]
+    fn product_uid_is_hex() {
+        let uid = generate_product_uid(1_000_000);
+        assert!(uid.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn product_uid_is_lowercase() {
+        let uid = generate_product_uid(1_000_000);
+        assert_eq!(uid, uid.to_ascii_lowercase());
+    }
+
+    #[test]
+    fn product_uid_unique() {
+        let a = generate_product_uid(1_000_000);
+        let b = generate_product_uid(1_000_000);
+        assert_ne!(a, b, "sequential UIDs should differ (counter increments)");
+    }
+
+    #[test]
+    fn product_uid_different_timestamps() {
+        let a = generate_product_uid(1_000_000);
+        let b = generate_product_uid(2_000_000);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn product_uid_zero_timestamp() {
+        let uid = generate_product_uid(0);
+        assert_eq!(uid.len(), 20);
+        assert!(uid.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // -----------------------------------------------------------------------
+    // worktrees_required
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn worktrees_error_is_feature_disabled() {
+        let err = worktrees_required();
+        let msg = err.to_string();
+        assert!(msg.contains("disabled") || msg.contains("FEATURE_DISABLED"));
+    }
+}
