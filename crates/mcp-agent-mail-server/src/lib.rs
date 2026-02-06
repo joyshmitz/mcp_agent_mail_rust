@@ -2,11 +2,13 @@
 
 mod ack_ttl;
 mod cleanup;
+pub mod console;
 mod mail_ui;
 mod markdown;
 mod retention;
 mod static_files;
 mod templates;
+pub mod theme;
 mod tool_metrics;
 
 use asupersync::http::h1::HttpClient;
@@ -25,8 +27,15 @@ use fastmcp_server::{BoxFuture, Session};
 use fastmcp_transport::http::{
     HttpHandlerConfig, HttpMethod as McpHttpMethod, HttpRequest, HttpRequestHandler, HttpResponse,
 };
+use ftui::layout::{Constraint, Flex, Rect};
+use ftui::widgets::Widget;
+use ftui::widgets::block::Block;
+use ftui::widgets::borders::BorderType;
+use ftui::widgets::paragraph::Paragraph;
+use ftui::widgets::table::{Row, Table};
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{DecodingKey, Validation};
+use mcp_agent_mail_core::config::{ConsoleSplitMode, ConsoleUiAnchor};
 use mcp_agent_mail_db::{
     DbPoolConfig, QueryTracker, active_tracker, create_pool, set_active_tracker,
 };
@@ -51,8 +60,9 @@ use mcp_agent_mail_tools::{
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 struct InstrumentedTool<T> {
@@ -407,6 +417,8 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> Server {
 }
 
 pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
+    // Initialize console theme (reads CONSOLE_THEME env var).
+    let _ = theme::init_console_theme();
     // Enable global query tracker if instrumentation is on.
     if config.instrumentation_enabled {
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
@@ -417,6 +429,8 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
 }
 
 pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+    // Initialize console theme (reads CONSOLE_THEME env var).
+    let _ = theme::init_console_theme();
     // Enable global query tracker if instrumentation is on.
     if config.instrumentation_enabled {
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
@@ -426,6 +440,8 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     ack_ttl::start(config);
     tool_metrics::start(config);
     retention::start(config);
+    let dashboard = StartupDashboard::maybe_start(config);
+    set_dashboard_handle(dashboard.clone());
 
     let server = build_server(config);
     let server_info = server.info().clone();
@@ -462,13 +478,976 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     ack_ttl::shutdown();
     cleanup::shutdown();
     mcp_agent_mail_storage::wbq_shutdown();
+    if let Some(dashboard) = dashboard.as_ref() {
+        dashboard.shutdown();
+    }
+    set_dashboard_handle(None);
     result
 }
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+static LIVE_DASHBOARD: std::sync::LazyLock<Mutex<Option<Arc<StartupDashboard>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
 
 const JWKS_CACHE_TTL: Duration = Duration::from_secs(60);
 const JWKS_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Default)]
+struct DashboardDbStats {
+    projects: u64,
+    agents: u64,
+    messages: u64,
+    file_reservations: u64,
+    contact_links: u64,
+    ack_pending: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DashboardLastRequest {
+    at_iso: String,
+    method: String,
+    path: String,
+    status: u16,
+    duration_ms: u64,
+    client_ip: String,
+}
+
+#[derive(Debug, Clone)]
+struct DashboardSnapshot {
+    endpoint: String,
+    web_ui: String,
+    app_environment: String,
+    auth_enabled: bool,
+    database_url: String,
+    storage_root: String,
+    uptime: String,
+    requests_total: u64,
+    requests_2xx: u64,
+    requests_4xx: u64,
+    requests_5xx: u64,
+    avg_latency_ms: u64,
+    db: DashboardDbStats,
+    last_request: Option<DashboardLastRequest>,
+    sparkline_data: Vec<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct ConsoleLayoutState {
+    persist_path: std::path::PathBuf,
+    auto_save: bool,
+    interactive_enabled: bool,
+    ui_height_percent: u16,
+    ui_anchor: ConsoleUiAnchor,
+    ui_auto_size: bool,
+    inline_auto_min_rows: u16,
+    inline_auto_max_rows: u16,
+    split_mode: ConsoleSplitMode,
+    split_ratio_percent: u16,
+}
+
+impl ConsoleLayoutState {
+    fn from_config(config: &mcp_agent_mail_core::Config) -> Self {
+        Self {
+            persist_path: config.console_persist_path.clone(),
+            auto_save: config.console_auto_save,
+            interactive_enabled: config.console_interactive_enabled,
+            ui_height_percent: config.console_ui_height_percent,
+            ui_anchor: config.console_ui_anchor,
+            ui_auto_size: config.console_ui_auto_size,
+            inline_auto_min_rows: config.console_inline_auto_min_rows,
+            inline_auto_max_rows: config.console_inline_auto_max_rows,
+            split_mode: config.console_split_mode,
+            split_ratio_percent: config.console_split_ratio_percent,
+        }
+    }
+
+    fn compute_writer_settings(&self, term_height: u16) -> (ftui::ScreenMode, ftui::UiAnchor) {
+        let ui_anchor = match self.ui_anchor {
+            ConsoleUiAnchor::Bottom => ftui::UiAnchor::Bottom,
+            ConsoleUiAnchor::Top => ftui::UiAnchor::Top,
+        };
+
+        let effective_term_height = term_height.saturating_sub(2).max(1);
+        let screen_mode = if self.ui_auto_size {
+            let min_height = self.inline_auto_min_rows.min(effective_term_height).max(1);
+            let max_height = self
+                .inline_auto_max_rows
+                .min(effective_term_height)
+                .max(min_height);
+            ftui::ScreenMode::InlineAuto {
+                min_height,
+                max_height,
+            }
+        } else {
+            let ui_height_u32 = (u32::from(term_height) * u32::from(self.ui_height_percent)) / 100;
+            let ui_height = u16::try_from(ui_height_u32).unwrap_or(u16::MAX);
+            let ui_height = ui_height.max(4).min(effective_term_height);
+            ftui::ScreenMode::Inline { ui_height }
+        };
+
+        (screen_mode, ui_anchor)
+    }
+
+    fn console_updates(&self) -> HashMap<&'static str, String> {
+        let anchor = match self.ui_anchor {
+            ConsoleUiAnchor::Bottom => "bottom",
+            ConsoleUiAnchor::Top => "top",
+        };
+        let split_mode = match self.split_mode {
+            ConsoleSplitMode::Inline => "inline",
+            ConsoleSplitMode::Left => "left",
+        };
+
+        let mut updates = HashMap::new();
+        updates.insert(
+            "CONSOLE_UI_HEIGHT_PERCENT",
+            self.ui_height_percent.to_string(),
+        );
+        updates.insert("CONSOLE_UI_ANCHOR", anchor.to_string());
+        updates.insert(
+            "CONSOLE_UI_AUTO_SIZE",
+            if self.ui_auto_size { "true" } else { "false" }.to_string(),
+        );
+        updates.insert(
+            "CONSOLE_INLINE_AUTO_MIN_ROWS",
+            self.inline_auto_min_rows.to_string(),
+        );
+        updates.insert(
+            "CONSOLE_INLINE_AUTO_MAX_ROWS",
+            self.inline_auto_max_rows.to_string(),
+        );
+        updates.insert("CONSOLE_SPLIT_MODE", split_mode.to_string());
+        updates.insert(
+            "CONSOLE_SPLIT_RATIO_PERCENT",
+            self.split_ratio_percent.to_string(),
+        );
+        updates.insert(
+            "CONSOLE_AUTO_SAVE",
+            if self.auto_save { "true" } else { "false" }.to_string(),
+        );
+        updates.insert(
+            "CONSOLE_INTERACTIVE",
+            if self.interactive_enabled {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string(),
+        );
+        updates
+    }
+
+    fn summary_line(&self) -> String {
+        let anchor = match self.ui_anchor {
+            ConsoleUiAnchor::Bottom => "bottom",
+            ConsoleUiAnchor::Top => "top",
+        };
+
+        let inline = if self.ui_auto_size {
+            format!(
+                "inline_auto {anchor} {}..{} rows",
+                self.inline_auto_min_rows, self.inline_auto_max_rows
+            )
+        } else {
+            format!("inline {anchor} {}%", self.ui_height_percent)
+        };
+
+        match self.split_mode {
+            ConsoleSplitMode::Inline => inline,
+            ConsoleSplitMode::Left => {
+                format!(
+                    "{inline} (split: left {}% requested)",
+                    self.split_ratio_percent
+                )
+            }
+        }
+    }
+
+    fn apply_key(&mut self, code: ftui::KeyCode) -> (bool, Option<String>) {
+        use ftui::KeyCode;
+
+        match code {
+            KeyCode::Char('?') => (false, Some(format!("Console: {}", self.summary_line()))),
+            KeyCode::Char('+') | KeyCode::Up => {
+                self.ui_height_percent = self.ui_height_percent.saturating_add(5).clamp(10, 80);
+                (true, None)
+            }
+            KeyCode::Char('-') | KeyCode::Down => {
+                self.ui_height_percent = self.ui_height_percent.saturating_sub(5).clamp(10, 80);
+                (true, None)
+            }
+            KeyCode::Char('t') => {
+                self.ui_anchor = ConsoleUiAnchor::Top;
+                (true, None)
+            }
+            KeyCode::Char('b') => {
+                self.ui_anchor = ConsoleUiAnchor::Bottom;
+                (true, None)
+            }
+            KeyCode::Char('a') => {
+                self.ui_auto_size = !self.ui_auto_size;
+                (true, None)
+            }
+            KeyCode::Char('i') => {
+                self.split_mode = ConsoleSplitMode::Inline;
+                (true, None)
+            }
+            KeyCode::Char('l') => {
+                self.split_mode = ConsoleSplitMode::Left;
+                (
+                    true,
+                    Some("Requested left split mode (br-1m6a.20). Inline console will remain active until AltScreen log viewer lands.".to_string()),
+                )
+            }
+            KeyCode::Char('[') => {
+                self.split_ratio_percent = self.split_ratio_percent.saturating_sub(5).clamp(10, 80);
+                (true, None)
+            }
+            KeyCode::Char(']') => {
+                self.split_ratio_percent = self.split_ratio_percent.saturating_add(5).clamp(10, 80);
+                (true, None)
+            }
+            _ => (false, None),
+        }
+    }
+}
+
+struct StartupDashboard {
+    writer: Mutex<ftui::TerminalWriter<std::io::Stdout>>,
+    stop: AtomicBool,
+    worker: Mutex<Option<JoinHandle<()>>>,
+    input_worker: Mutex<Option<JoinHandle<()>>>,
+    started_at: Instant,
+    endpoint: String,
+    web_ui: String,
+    app_environment: String,
+    auth_enabled: bool,
+    database_url: String,
+    storage_root: String,
+    console_layout: Mutex<ConsoleLayoutState>,
+    requests_total: AtomicU64,
+    requests_2xx: AtomicU64,
+    requests_4xx: AtomicU64,
+    requests_5xx: AtomicU64,
+    latency_total_ms: AtomicU64,
+    db_stats: Mutex<DashboardDbStats>,
+    last_request: Mutex<Option<DashboardLastRequest>>,
+    sparkline: console::SparklineBuffer,
+}
+
+impl StartupDashboard {
+    fn maybe_start(config: &mcp_agent_mail_core::Config) -> Option<Arc<Self>> {
+        if !config.log_rich_enabled || !std::io::stdout().is_terminal() {
+            return None;
+        }
+
+        let term_width = parse_env_u16("COLUMNS", 120).max(80);
+        let term_height = parse_env_u16("LINES", 36).max(20);
+        let console_layout = ConsoleLayoutState::from_config(config);
+        let (screen_mode, ui_anchor) = console_layout.compute_writer_settings(term_height);
+        let mut writer = ftui::TerminalWriter::new(
+            std::io::stdout(),
+            screen_mode,
+            ui_anchor,
+            ftui::TerminalCapabilities::detect(),
+        );
+        writer.set_size(term_width, term_height);
+
+        let endpoint = format!(
+            "http://{}:{}{}",
+            config.http_host, config.http_port, config.http_path
+        );
+        let web_ui = format!("http://{}:{}/mail", config.http_host, config.http_port);
+
+        let dashboard = Arc::new(Self {
+            writer: Mutex::new(writer),
+            stop: AtomicBool::new(false),
+            worker: Mutex::new(None),
+            input_worker: Mutex::new(None),
+            started_at: Instant::now(),
+            endpoint,
+            web_ui,
+            app_environment: config.app_environment.to_string(),
+            auth_enabled: config.http_bearer_token.is_some(),
+            database_url: config.database_url.clone(),
+            storage_root: config.storage_root.display().to_string(),
+            console_layout: Mutex::new(console_layout),
+            requests_total: AtomicU64::new(0),
+            requests_2xx: AtomicU64::new(0),
+            requests_4xx: AtomicU64::new(0),
+            requests_5xx: AtomicU64::new(0),
+            latency_total_ms: AtomicU64::new(0),
+            db_stats: Mutex::new(DashboardDbStats::default()),
+            last_request: Mutex::new(None),
+            sparkline: console::SparklineBuffer::new(),
+        });
+
+        dashboard.refresh_db_stats();
+        dashboard.render_now();
+        dashboard.emit_startup_showcase(config);
+        dashboard.spawn_refresh_worker();
+        dashboard.spawn_console_input_worker();
+        Some(dashboard)
+    }
+
+    fn emit_startup_showcase(&self, config: &mcp_agent_mail_core::Config) {
+        let stats = lock_mutex(&self.db_stats);
+        let params = console::BannerParams {
+            app_environment: &self.app_environment,
+            endpoint: &self.endpoint,
+            database_url: &self.database_url,
+            storage_root: &self.storage_root,
+            auth_enabled: self.auth_enabled,
+            tools_log_enabled: config.tools_log_enabled,
+            tool_calls_log_enabled: config.log_tool_calls_enabled,
+            console_theme: theme::current_theme_display_name(),
+            web_ui_url: &self.web_ui,
+            projects: stats.projects,
+            agents: stats.agents,
+            messages: stats.messages,
+            file_reservations: stats.file_reservations,
+            contact_links: stats.contact_links,
+        };
+        drop(stats);
+        for line in console::render_startup_banner(&params) {
+            self.log_line(&line);
+        }
+        let summary = lock_mutex(&self.console_layout).summary_line();
+        self.log_line(&format!("Console: {summary}"));
+    }
+
+    fn spawn_refresh_worker(self: &Arc<Self>) {
+        let this = Arc::clone(self);
+        let handle = std::thread::Builder::new()
+            .name("mcp-agent-mail-dashboard".to_string())
+            .spawn(move || {
+                while !this.stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(1200));
+                    if this.stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    this.sparkline.sample();
+                    this.refresh_db_stats();
+                    this.render_now();
+                }
+            });
+
+        if let Ok(join) = handle {
+            *lock_mutex(&self.worker) = Some(join);
+        }
+    }
+
+    fn spawn_console_input_worker(self: &Arc<Self>) {
+        if !lock_mutex(&self.console_layout).interactive_enabled || !std::io::stdin().is_terminal()
+        {
+            return;
+        }
+
+        let this = Arc::clone(self);
+        let handle = std::thread::Builder::new()
+            .name("mcp-agent-mail-dashboard-input".to_string())
+            .spawn(move || {
+                let Ok(session) = ftui::TerminalSession::minimal() else {
+                    this.log_line("Console interactive mode: failed to enter raw mode");
+                    return;
+                };
+
+                this.log_line(
+                    "Console layout keys: +/- or Up/Down (height), t/b (anchor), a (auto-size), i/l (split request), [/ ] (split ratio), ? (help)",
+                );
+
+                while !this.stop.load(Ordering::Relaxed) {
+                    if !session
+                        .poll_event(std::time::Duration::from_millis(100))
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+
+                    while let Ok(Some(event)) = session.read_event() {
+                        if this.handle_console_event(&session, &event) {
+                            break;
+                        }
+                        if !session
+                            .poll_event(std::time::Duration::from_millis(0))
+                            .unwrap_or(false)
+                        {
+                            break;
+                        }
+                    }
+                }
+                drop(session);
+            });
+
+        if let Ok(join) = handle {
+            *lock_mutex(&self.input_worker) = Some(join);
+        }
+    }
+
+    fn handle_console_event(&self, session: &ftui::TerminalSession, event: &ftui::Event) -> bool {
+        use ftui::{Event, KeyCode, KeyEventKind, Modifiers};
+
+        let Event::Key(key) = event else {
+            return false;
+        };
+        if key.kind != KeyEventKind::Press {
+            return false;
+        }
+
+        // Ensure Ctrl+C still terminates the process even if raw-mode disables ISIG.
+        if key.modifiers.contains(Modifiers::CTRL) && matches!(key.code, KeyCode::Char('c')) {
+            ftui::core::terminal_session::best_effort_cleanup_for_exit();
+            std::process::exit(130);
+        }
+
+        let (changed, message) = {
+            let mut layout = lock_mutex(&self.console_layout);
+            layout.apply_key(key.code)
+        };
+
+        if let Some(msg) = message {
+            self.log_line(&msg);
+        }
+
+        if !changed {
+            return false;
+        }
+
+        let (term_width, term_height) = session.size().unwrap_or((80, 24));
+        self.apply_console_layout(term_width, term_height);
+
+        // Persistence (auto-remember).
+        let layout = lock_mutex(&self.console_layout).clone();
+        if layout.auto_save {
+            let updates = layout.console_updates();
+            if let Err(e) =
+                mcp_agent_mail_core::config::update_envfile(&layout.persist_path, &updates)
+            {
+                self.log_line(&format!(
+                    "Console: failed to persist settings to {}: {e}",
+                    layout.persist_path.display()
+                ));
+            } else {
+                self.log_line(&format!(
+                    "Console: saved settings to {}",
+                    layout.persist_path.display()
+                ));
+            }
+        }
+
+        false
+    }
+
+    fn apply_console_layout(&self, term_width: u16, term_height: u16) {
+        let (screen_mode, ui_anchor) =
+            lock_mutex(&self.console_layout).compute_writer_settings(term_height);
+        let mut writer = ftui::TerminalWriter::new(
+            std::io::stdout(),
+            screen_mode,
+            ui_anchor,
+            ftui::TerminalCapabilities::detect(),
+        );
+        writer.set_size(term_width.max(2), term_height.max(2));
+        *lock_mutex(&self.writer) = writer;
+        self.render_now();
+    }
+
+    fn shutdown(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let join = lock_mutex(&self.worker).take();
+        if let Some(join) = join {
+            let _ = join.join();
+        }
+        let join = lock_mutex(&self.input_worker).take();
+        if let Some(join) = join {
+            let _ = join.join();
+        }
+    }
+
+    fn log_line(&self, text: &str) {
+        let mut line = String::from(text);
+        if !line.ends_with('\n') {
+            line.push('\n');
+        }
+        let mut writer = lock_mutex(&self.writer);
+        let _ = writer.write_log(&line);
+    }
+
+    fn record_request(
+        &self,
+        method: &str,
+        path: &str,
+        status: u16,
+        duration_ms: u64,
+        client_ip: &str,
+    ) {
+        self.requests_total.fetch_add(1, Ordering::Relaxed);
+        self.sparkline.tick();
+        self.latency_total_ms
+            .fetch_add(duration_ms, Ordering::Relaxed);
+        match status {
+            200..=299 => {
+                self.requests_2xx.fetch_add(1, Ordering::Relaxed);
+            }
+            400..=499 => {
+                self.requests_4xx.fetch_add(1, Ordering::Relaxed);
+            }
+            500..=599 => {
+                self.requests_5xx.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        *lock_mutex(&self.last_request) = Some(DashboardLastRequest {
+            at_iso: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            method: method.to_string(),
+            path: path.to_string(),
+            status,
+            duration_ms,
+            client_ip: client_ip.to_string(),
+        });
+        self.render_now();
+    }
+
+    fn refresh_db_stats(&self) {
+        *lock_mutex(&self.db_stats) = fetch_dashboard_db_stats(&self.database_url);
+    }
+
+    fn snapshot(&self) -> DashboardSnapshot {
+        let requests_total = self.requests_total.load(Ordering::Relaxed);
+        let latency_total_ms = self.latency_total_ms.load(Ordering::Relaxed);
+        DashboardSnapshot {
+            endpoint: self.endpoint.clone(),
+            web_ui: self.web_ui.clone(),
+            app_environment: self.app_environment.clone(),
+            auth_enabled: self.auth_enabled,
+            database_url: self.database_url.clone(),
+            storage_root: self.storage_root.clone(),
+            uptime: human_uptime(self.started_at.elapsed()),
+            requests_total,
+            requests_2xx: self.requests_2xx.load(Ordering::Relaxed),
+            requests_4xx: self.requests_4xx.load(Ordering::Relaxed),
+            requests_5xx: self.requests_5xx.load(Ordering::Relaxed),
+            avg_latency_ms: latency_total_ms.checked_div(requests_total).unwrap_or(0),
+            db: lock_mutex(&self.db_stats).clone(),
+            last_request: lock_mutex(&self.last_request).clone(),
+            sparkline_data: self.sparkline.snapshot(),
+        }
+    }
+
+    fn render_now(&self) {
+        let snapshot = self.snapshot();
+        let mut writer = lock_mutex(&self.writer);
+        let width = writer.width().max(80);
+        let ui_height = writer.ui_height().max(8);
+        let rendered = {
+            let buffer = writer.take_render_buffer(width, ui_height);
+            let (pool, links) = writer.pool_and_links_mut();
+            let mut frame = ftui::Frame::from_buffer(buffer, pool);
+            frame.links = Some(links);
+            let area = Rect::new(0, 0, width, ui_height);
+            render_dashboard_frame(&mut frame, area, &snapshot);
+            frame.buffer
+        };
+        let _ = writer.present_ui_owned(rendered, None, false);
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_dashboard_frame(frame: &mut ftui::Frame<'_>, area: Rect, snapshot: &DashboardSnapshot) {
+    if area.width < 40 || area.height < 5 {
+        Paragraph::new("MCP Agent Mail Dashboard")
+            .block(
+                Block::bordered()
+                    .border_type(BorderType::Ascii)
+                    .title("Dashboard"),
+            )
+            .render(area, frame);
+        return;
+    }
+
+    let header_style = ftui::Style::default()
+        .fg(ftui::PackedRgba::rgb(218, 244, 255))
+        .bg(ftui::PackedRgba::rgb(12, 36, 84))
+        .bold();
+    let card_style = ftui::Style::default().fg(ftui::PackedRgba::rgb(222, 231, 255));
+    let title_style = ftui::Style::default().fg(ftui::PackedRgba::rgb(144, 205, 255));
+    let warn_style = ftui::Style::default().fg(ftui::PackedRgba::rgb(255, 184, 108));
+    let good_style = ftui::Style::default()
+        .fg(ftui::PackedRgba::rgb(116, 255, 177))
+        .bold();
+
+    let rows = Flex::vertical()
+        .constraints([
+            Constraint::Fixed(3),
+            Constraint::Min(4),
+            Constraint::Fixed(2),
+        ])
+        .split(area);
+
+    let header_text = format!(
+        "📬 MCP Agent Mail Live HUD  •  uptime {}  •  req {}  •  avg {}ms  •  env {}",
+        snapshot.uptime,
+        pretty_num(snapshot.requests_total),
+        snapshot.avg_latency_ms,
+        snapshot.app_environment
+    );
+    Paragraph::new(header_text)
+        .block(
+            Block::bordered()
+                .border_type(BorderType::Double)
+                .title(" Live Console "),
+        )
+        .style(header_style)
+        .render(rows[0], frame);
+
+    let cols = Flex::horizontal()
+        .constraints([
+            Constraint::Percentage(39.0),
+            Constraint::Percentage(33.0),
+            Constraint::Percentage(28.0),
+        ])
+        .split(rows[1]);
+
+    let left = format!(
+        "Endpoint: {}\nWeb UI: {}\nAuth: {}\nStorage: {}\nDatabase: {}",
+        compact_path(&snapshot.endpoint, 52),
+        compact_path(&snapshot.web_ui, 52),
+        if snapshot.auth_enabled {
+            "ENABLED"
+        } else {
+            "DISABLED"
+        },
+        compact_path(&snapshot.storage_root, 52),
+        compact_path(&snapshot.database_url, 52)
+    );
+    Paragraph::new(left)
+        .block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .title(" Server "),
+        )
+        .style(card_style)
+        .wrap(ftui::text::WrapMode::Word)
+        .render(cols[0], frame);
+
+    let db_rows = vec![
+        Row::new(vec![
+            "projects".to_string(),
+            pretty_num(snapshot.db.projects),
+        ]),
+        Row::new(vec!["agents".to_string(), pretty_num(snapshot.db.agents)]),
+        Row::new(vec![
+            "messages".to_string(),
+            pretty_num(snapshot.db.messages),
+        ]),
+        Row::new(vec![
+            "reservations".to_string(),
+            pretty_num(snapshot.db.file_reservations),
+        ]),
+        Row::new(vec![
+            "contact_links".to_string(),
+            pretty_num(snapshot.db.contact_links),
+        ]),
+        Row::new(vec![
+            "pending_acks".to_string(),
+            pretty_num(snapshot.db.ack_pending),
+        ]),
+    ];
+    Table::new(
+        db_rows,
+        [
+            Constraint::FitContentBounded { min: 8, max: 18 },
+            Constraint::Fill,
+        ],
+    )
+    .header(Row::new(vec!["Resource", "Count"]).style(title_style.bold()))
+    .column_spacing(2)
+    .block(
+        Block::bordered()
+            .border_type(BorderType::Rounded)
+            .title(" Database "),
+    )
+    .style(card_style)
+    .render(cols[1], frame);
+
+    // Render sparkline for request throughput
+    let sparkline_str = {
+        use ftui::widgets::sparkline::Sparkline;
+        Sparkline::new(&snapshot.sparkline_data)
+            .gradient(
+                ftui::PackedRgba::rgb(60, 120, 200),
+                ftui::PackedRgba::rgb(120, 255, 180),
+            )
+            .render_to_string()
+    };
+
+    let request_summary = format!(
+        "2xx: {}  4xx: {}  5xx: {}\n{}\n{}\nreq/s: {}",
+        pretty_num(snapshot.requests_2xx),
+        pretty_num(snapshot.requests_4xx),
+        pretty_num(snapshot.requests_5xx),
+        if snapshot.requests_5xx > 0 {
+            "status: server errors observed"
+        } else {
+            "status: healthy"
+        },
+        if snapshot.auth_enabled {
+            "auth path protected"
+        } else {
+            "auth path open"
+        },
+        sparkline_str,
+    );
+    let right_block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(" Traffic ");
+    Paragraph::new(request_summary)
+        .block(right_block)
+        .style(if snapshot.requests_5xx > 0 {
+            warn_style
+        } else {
+            good_style
+        })
+        .render(cols[2], frame);
+
+    let footer_text = snapshot.last_request.as_ref().map_or_else(
+        || "Last: no requests observed yet".to_string(),
+        |last| {
+            format!(
+                "Last: {} {} {} {}ms from {} @ {}",
+                last.method,
+                compact_path(&last.path, 48),
+                last.status,
+                last.duration_ms,
+                last.client_ip,
+                last.at_iso
+            )
+        },
+    );
+    Paragraph::new(footer_text)
+        .block(
+            Block::bordered()
+                .border_type(BorderType::Ascii)
+                .title(" Last Request "),
+        )
+        .style(title_style)
+        .render(rows[2], frame);
+}
+
+fn lock_mutex<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn parse_env_u16(key: &str, default: u16) -> u16 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+fn pretty_num(value: u64) -> String {
+    let s = value.to_string();
+    let mut out = String::with_capacity(s.len() + (s.len() / 3));
+    for (idx, ch) in s.chars().enumerate() {
+        if idx > 0 && (s.len() - idx) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn human_uptime(d: Duration) -> String {
+    let secs = d.as_secs();
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{h}h {m}m {s}s")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+fn compact_path(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    if max_chars <= 3 {
+        return "...".to_string();
+    }
+    let keep = (max_chars - 3) / 2;
+    let head = input.chars().take(keep).collect::<String>();
+    let tail = input
+        .chars()
+        .rev()
+        .take(max_chars - 3 - keep)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{head}...{tail}")
+}
+
+/// Strip ANSI escape sequences and return the visible character count.
+#[allow(dead_code)]
+fn strip_ansi_len(s: &str) -> usize {
+    let mut len = 0usize;
+    let mut in_esc = false;
+    for ch in s.chars() {
+        if in_esc {
+            if ch.is_ascii_alphabetic() {
+                in_esc = false;
+            }
+        } else if ch == '\x1b' {
+            in_esc = true;
+        } else {
+            len += unicode_char_width(ch);
+        }
+    }
+    len
+}
+
+/// Approximate display width of a single char (emoji ≈ 2, CJK ≈ 2, ASCII = 1).
+fn unicode_char_width(ch: char) -> usize {
+    let c = ch as u32;
+    // Emoji ranges (simplified: Misc Symbols, Dingbats, Supplemental Symbols, Emoticons, Transport)
+    if (0x1F300..=0x1FAFF).contains(&c)
+        || (0x2600..=0x27BF).contains(&c)
+        || (0xFE00..=0xFE0F).contains(&c)
+    {
+        return 2;
+    }
+    // CJK Unified, Fullwidth forms, etc.
+    if (0x3000..=0x9FFF).contains(&c)
+        || (0xF900..=0xFAFF).contains(&c)
+        || (0xFF01..=0xFF60).contains(&c)
+    {
+        return 2;
+    }
+    1
+}
+
+/// Visible width of a string containing possible emoji/unicode but no ANSI.
+#[allow(dead_code)]
+fn unicode_display_width(s: &str) -> usize {
+    s.chars().map(unicode_char_width).sum()
+}
+
+/// Number of decimal digits in a u64 (for alignment).
+#[allow(dead_code)]
+const fn digit_count(mut n: u64) -> usize {
+    if n == 0 {
+        return 1;
+    }
+    let mut count = 0;
+    while n > 0 {
+        count += 1;
+        n /= 10;
+    }
+    count
+}
+
+/// Colorize a single JSON line: keys in `key_color`, numbers in `num_color`.
+#[allow(dead_code)]
+fn colorize_json_line(line: &str, key_color: &str, num_color: &str, ansi_off: &str) -> String {
+    let trimmed = line.trim_start();
+    let indent = &line[..line.len() - trimmed.len()];
+    let mut out = String::from(indent);
+
+    let mut tail = trimmed;
+    // Try to match "key": value pattern
+    if let Some(colon_pos) = tail.find(':') {
+        let before_colon = &tail[..colon_pos];
+        if before_colon.contains('"') {
+            // It's a key
+            out.push_str(key_color);
+            out.push_str(before_colon);
+            out.push_str(ansi_off);
+            out.push(':');
+            tail = &tail[colon_pos + 1..];
+
+            // Check if value is numeric
+            let val = tail.trim().trim_end_matches(',');
+            if val.parse::<u64>().is_ok() || val.parse::<i64>().is_ok() {
+                let before_val = &tail[..tail.len() - tail.trim_start().len()];
+                let trimmed_tail = tail.trim_start();
+                out.push_str(before_val);
+                let has_comma = trimmed_tail.ends_with(',');
+                let num_part = trimmed_tail.trim_end_matches(',');
+                out.push_str(num_color);
+                out.push_str(num_part);
+                out.push_str(ansi_off);
+                if has_comma {
+                    out.push(',');
+                }
+            } else {
+                out.push_str(tail);
+            }
+            return out;
+        }
+    }
+
+    // Not a key-value line — just return as-is (braces, etc.)
+    out.push_str(tail);
+    out
+}
+
+fn fetch_dashboard_db_stats(database_url: &str) -> DashboardDbStats {
+    let cfg = DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
+    let Ok(path) = cfg.sqlite_path() else {
+        return DashboardDbStats::default();
+    };
+    let Ok(conn) = mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection::open_file(&path) else {
+        return DashboardDbStats::default();
+    };
+    DashboardDbStats {
+        projects: dashboard_count(&conn, "SELECT COUNT(*) AS c FROM projects"),
+        agents: dashboard_count(&conn, "SELECT COUNT(*) AS c FROM agents"),
+        messages: dashboard_count(&conn, "SELECT COUNT(*) AS c FROM messages"),
+        file_reservations: dashboard_count(
+            &conn,
+            "SELECT COUNT(*) AS c FROM file_reservations WHERE released_ts IS NULL",
+        ),
+        contact_links: dashboard_count(&conn, "SELECT COUNT(*) AS c FROM agent_links"),
+        ack_pending: dashboard_count(
+            &conn,
+            "SELECT COUNT(*) AS c FROM message_recipients mr \
+             JOIN messages m ON m.id = mr.message_id \
+             WHERE m.ack_required = 1 AND mr.ack_ts IS NULL",
+        ),
+    }
+}
+
+fn dashboard_count(conn: &mcp_agent_mail_db::sqlmodel_sqlite::SqliteConnection, sql: &str) -> u64 {
+    conn.query_sync(sql, &[])
+        .ok()
+        .and_then(|rows| rows.into_iter().next())
+        .and_then(|row| row.get_named::<i64>("c").ok())
+        .and_then(|v| u64::try_from(v).ok())
+        .unwrap_or(0)
+}
+
+fn dashboard_handle() -> Option<Arc<StartupDashboard>> {
+    lock_mutex(&LIVE_DASHBOARD).as_ref().map(Arc::clone)
+}
+
+fn set_dashboard_handle(dashboard: Option<Arc<StartupDashboard>>) {
+    *lock_mutex(&LIVE_DASHBOARD) = dashboard;
+}
+
+fn dashboard_write_log(text: &str) -> bool {
+    dashboard_handle().is_some_and(|dashboard| {
+        dashboard.log_line(text);
+        true
+    })
+}
 
 #[derive(Debug, Clone)]
 struct JwtContext {
@@ -553,7 +1532,8 @@ impl HttpState {
 
     #[allow(clippy::unused_async)] // Required for Http1Listener interface
     async fn handle(&self, req: Http1Request) -> Http1Response {
-        if !self.config.http_request_log_enabled {
+        let dashboard = dashboard_handle();
+        if !self.config.http_request_log_enabled && dashboard.is_none() {
             return self.handle_inner(req).await;
         }
 
@@ -567,7 +1547,12 @@ impl HttpState {
         let resp = self.handle_inner(req).await;
         let dur_ms = u64::try_from(start.elapsed().as_millis().min(u128::from(u64::MAX)))
             .unwrap_or(u64::MAX);
-        self.emit_http_request_log(method.as_str(), &path, resp.status, dur_ms, &client_ip);
+        if let Some(dashboard) = dashboard.as_ref() {
+            dashboard.record_request(method.as_str(), &path, resp.status, dur_ms, &client_ip);
+        }
+        if self.config.http_request_log_enabled || dashboard.is_some() {
+            self.emit_http_request_log(method.as_str(), &path, resp.status, dur_ms, &client_ip);
+        }
         resp
     }
 
@@ -685,8 +1670,9 @@ impl HttpState {
             ftui_runtime::ftui_eprintln!("{line}");
 
             // Rich-ish panel output (stdout), fallback to legacy plain-text line on any error.
-            let use_ansi = std::io::stdout().is_terminal();
-            if let Some(panel) = render_http_request_panel(
+            // Gate: only render ANSI panel when rich output is enabled AND stdout is a TTY.
+            let use_ansi = self.config.log_rich_enabled && std::io::stdout().is_terminal();
+            if let Some(panel) = console::render_http_request_panel(
                 100,
                 method,
                 path,
@@ -695,12 +1681,15 @@ impl HttpState {
                 client_ip,
                 use_ansi,
             ) {
-                ftui_runtime::ftui_println!("{panel}");
+                if !dashboard_write_log(&panel) {
+                    ftui_runtime::ftui_println!("{panel}");
+                }
             } else {
-                ftui_runtime::ftui_println!(
-                    "{}",
-                    http_request_log_fallback_line(method, path, status, duration_ms, client_ip)
-                );
+                let fallback =
+                    http_request_log_fallback_line(method, path, status, duration_ms, client_ip);
+                if !dashboard_write_log(&fallback) {
+                    ftui_runtime::ftui_println!("{fallback}");
+                }
             }
         }));
     }
@@ -1251,6 +2240,32 @@ impl HttpState {
                     ],
                 );
 
+                let tool_call_console_enabled = self.config.log_rich_enabled
+                    && self.config.tools_log_enabled
+                    && self.config.log_tool_calls_enabled
+                    && std::io::stdout().is_terminal();
+
+                // Emit tool-call-start panel if console tool logging is enabled.
+                let call_start = if tool_call_console_enabled {
+                    let args = params
+                        .arguments
+                        .clone()
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    let panel_lines = console::render_tool_call_start(
+                        &tool_name,
+                        &args,
+                        project_hint.as_deref(),
+                        agent_hint.as_deref(),
+                    );
+                    let panel = panel_lines.join("\n");
+                    if !dashboard_write_log(&panel) {
+                        ftui_runtime::ftui_println!("{panel}");
+                    }
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+
                 let tracker_state =
                     if self.config.instrumentation_enabled && active_tracker().is_none() {
                         let tracker = Arc::new(QueryTracker::new());
@@ -1271,24 +2286,71 @@ impl HttpState {
                     None,
                 );
 
-                if let Some((tracker, _guard)) = tracker_state {
-                    if self.config.tools_log_enabled {
-                        log_tool_query_stats(
-                            &tool_name,
-                            project_hint.as_deref(),
-                            agent_hint.as_deref(),
-                            &tracker,
-                        );
-                    }
-                }
+                let (queries, query_time_ms, per_table_sorted) =
+                    if let Some((ref tracker, ref _guard)) = tracker_state {
+                        if self.config.tools_log_enabled {
+                            log_tool_query_stats(
+                                &tool_name,
+                                project_hint.as_deref(),
+                                agent_hint.as_deref(),
+                                tracker,
+                            );
+                        }
+                        let snap = tracker.snapshot();
+                        let mut pairs: Vec<(String, u64)> = snap.per_table.into_iter().collect();
+                        pairs.sort_by(|(a_name, a_count), (b_name, b_count)| {
+                            b_count.cmp(a_count).then_with(|| a_name.cmp(b_name))
+                        });
+                        (snap.total, snap.total_time_ms, pairs)
+                    } else {
+                        (0_u64, 0.0_f64, Vec::new())
+                    };
 
                 let out = match result {
                     Ok(v) => v,
                     Err(e) => {
+                        // Emit tool-call-end panel on error
+                        if let Some(start) = call_start {
+                            let dur_ms =
+                                u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                            let err_msg = format!("Error: {e}");
+                            let panel_lines = console::render_tool_call_end(
+                                &tool_name,
+                                dur_ms,
+                                Some(&err_msg),
+                                queries,
+                                query_time_ms,
+                                &per_table_sorted,
+                                self.config.log_tool_calls_result_max_chars,
+                            );
+                            let panel = panel_lines.join("\n");
+                            if !dashboard_write_log(&panel) {
+                                ftui_runtime::ftui_println!("{panel}");
+                            }
+                        }
                         return Err(e);
                     }
                 };
                 let mut value = serde_json::to_value(out).map_err(McpError::from)?;
+
+                // Emit tool-call-end panel
+                if let Some(start) = call_start {
+                    let dur_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    let result_preview = serde_json::to_string(&value).ok();
+                    let panel_lines = console::render_tool_call_end(
+                        &tool_name,
+                        dur_ms,
+                        result_preview.as_deref(),
+                        queries,
+                        query_time_ms,
+                        &per_table_sorted,
+                        self.config.log_tool_calls_result_max_chars,
+                    );
+                    let panel = panel_lines.join("\n");
+                    if !dashboard_write_log(&panel) {
+                        ftui_runtime::ftui_println!("{panel}");
+                    }
+                }
                 if let Some(ref fmt) = format_value {
                     apply_toon_to_content(&mut value, "content", fmt, &self.config);
                 }
@@ -2139,105 +3201,7 @@ fn http_request_log_fallback_line(
     format!("http method={method} path={path} status={status} ms={duration_ms} client={client_ip}")
 }
 
-fn render_http_request_panel(
-    width: usize,
-    method: &str,
-    path: &str,
-    status: u16,
-    duration_ms: u64,
-    client_ip: &str,
-    use_ansi: bool,
-) -> Option<String> {
-    // `rich.console.Console(width=100)` - keep deterministic, but avoid panicking on tiny widths.
-    if width < 20 {
-        return None;
-    }
-    let inner_width = width.saturating_sub(2);
-
-    let status_str = status.to_string();
-    let dur_str = format!("{duration_ms}ms");
-
-    // Title formatting mirrors legacy spacing: "METHOD␠␠PATH␠␠STATUS␠␠DUR".
-    let reserved = method.len() + status_str.len() + dur_str.len() + 8; // 6 spaces between + 2 edge spaces
-    let max_path = inner_width.saturating_sub(reserved).max(1);
-    let path = if path.len() <= max_path {
-        path.to_string()
-    } else if max_path <= 3 {
-        path[..max_path].to_string()
-    } else {
-        format!("{}...", &path[..(max_path - 3)])
-    };
-
-    let title_plain = format!("{method}  {path}  {status_str}  {dur_str}");
-
-    let title_styled = if use_ansi {
-        const RESET: &str = "\x1b[0m";
-        const BOLD_BLUE: &str = "\x1b[1;34m";
-        const BOLD_WHITE: &str = "\x1b[1;37m";
-        const BOLD_GREEN: &str = "\x1b[1;32m";
-        const BOLD_RED: &str = "\x1b[1;31m";
-        const BOLD_YELLOW: &str = "\x1b[1;33m";
-
-        let status_color = if (200..400).contains(&status) {
-            BOLD_GREEN
-        } else {
-            BOLD_RED
-        };
-
-        format!(
-            "{BOLD_BLUE}{method}{RESET}  {BOLD_WHITE}{path}{RESET}  {status_color}{status_str}{RESET}  {BOLD_YELLOW}{dur_str}{RESET}",
-        )
-    } else {
-        title_plain.clone()
-    };
-
-    let mut top = format!(" {title_styled} ");
-    let top_plain_len = title_plain.len().saturating_add(2);
-    if top_plain_len > inner_width {
-        return None;
-    }
-    top.push_str(&"-".repeat(inner_width.saturating_sub(top_plain_len)));
-
-    // Body: "client: <ip>"
-    let mut body_plain = format!(" client: {client_ip}");
-    if body_plain.len() > inner_width {
-        // Truncate client_ip to fit.
-        let reserved = " client: ".len();
-        let max_ip = inner_width.saturating_sub(reserved).max(1);
-        let ip = if client_ip.len() <= max_ip {
-            client_ip.to_string()
-        } else if max_ip <= 3 {
-            client_ip[..max_ip].to_string()
-        } else {
-            format!("{}...", &client_ip[..(max_ip - 3)])
-        };
-        body_plain = format!(" client: {ip}");
-    }
-
-    let body_plain_len = body_plain.len();
-
-    let body_styled = if use_ansi {
-        const RESET: &str = "\x1b[0m";
-        const CYAN: &str = "\x1b[36m";
-        const WHITE: &str = "\x1b[37m";
-
-        let prefix = " client: ";
-        let ip = body_plain.strip_prefix(prefix).unwrap_or(client_ip);
-        format!(" {CYAN}client: {RESET}{WHITE}{ip}{RESET}")
-    } else {
-        body_plain
-    };
-
-    let mut body = body_styled;
-    if body_plain_len > inner_width {
-        return None;
-    }
-    body.push_str(&" ".repeat(inner_width.saturating_sub(body_plain_len)));
-
-    let bottom = "-".repeat(inner_width);
-
-    Some(format!("+{top}+\n|{body}|\n+{bottom}+"))
-}
+// render_http_request_panel moved to console.rs (br-1m6a.13)
 
 // ---------------------------------------------------------------------------
 // Expected Error Filter (Legacy Parity Helper)
@@ -2630,6 +3594,112 @@ mod tests {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn console_layout_compute_writer_settings_inline_percent_clamps_to_terminal() {
+        let layout = ConsoleLayoutState {
+            persist_path: PathBuf::from("/dev/null"),
+            auto_save: true,
+            interactive_enabled: true,
+            ui_height_percent: 80,
+            ui_anchor: ConsoleUiAnchor::Bottom,
+            ui_auto_size: false,
+            inline_auto_min_rows: 8,
+            inline_auto_max_rows: 18,
+            split_mode: ConsoleSplitMode::Inline,
+            split_ratio_percent: 30,
+        };
+
+        let (mode, anchor) = layout.compute_writer_settings(20);
+        assert!(matches!(anchor, ftui::UiAnchor::Bottom));
+        assert!(matches!(mode, ftui::ScreenMode::Inline { ui_height: 16 }));
+
+        // Extremely small terminals still clamp to the effective term height.
+        let (mode, _) = layout.compute_writer_settings(5);
+        assert!(matches!(mode, ftui::ScreenMode::Inline { ui_height: 3 }));
+    }
+
+    #[test]
+    fn console_layout_compute_writer_settings_inline_auto_clamps_to_effective_height() {
+        let layout = ConsoleLayoutState {
+            persist_path: PathBuf::from("/dev/null"),
+            auto_save: true,
+            interactive_enabled: true,
+            ui_height_percent: 33,
+            ui_anchor: ConsoleUiAnchor::Top,
+            ui_auto_size: true,
+            inline_auto_min_rows: 8,
+            inline_auto_max_rows: 18,
+            split_mode: ConsoleSplitMode::Inline,
+            split_ratio_percent: 30,
+        };
+
+        let (mode, anchor) = layout.compute_writer_settings(10);
+        assert!(matches!(anchor, ftui::UiAnchor::Top));
+        assert!(matches!(
+            mode,
+            ftui::ScreenMode::InlineAuto {
+                min_height: 8,
+                max_height: 8
+            }
+        ));
+    }
+
+    #[test]
+    fn console_layout_apply_key_updates_state_and_clamps() {
+        let mut layout = ConsoleLayoutState {
+            persist_path: PathBuf::from("/dev/null"),
+            auto_save: true,
+            interactive_enabled: true,
+            ui_height_percent: 33,
+            ui_anchor: ConsoleUiAnchor::Bottom,
+            ui_auto_size: false,
+            inline_auto_min_rows: 8,
+            inline_auto_max_rows: 18,
+            split_mode: ConsoleSplitMode::Inline,
+            split_ratio_percent: 30,
+        };
+
+        assert_eq!(layout.apply_key(ftui::KeyCode::Char('+')), (true, None));
+        assert_eq!(layout.ui_height_percent, 38);
+
+        assert_eq!(layout.apply_key(ftui::KeyCode::Up), (true, None));
+        assert_eq!(layout.ui_height_percent, 43);
+
+        assert_eq!(layout.apply_key(ftui::KeyCode::Char('-')), (true, None));
+        assert_eq!(layout.ui_height_percent, 38);
+
+        assert_eq!(layout.apply_key(ftui::KeyCode::Down), (true, None));
+        assert_eq!(layout.ui_height_percent, 33);
+
+        assert_eq!(layout.apply_key(ftui::KeyCode::Char('t')), (true, None));
+        assert_eq!(layout.ui_anchor, ConsoleUiAnchor::Top);
+        assert_eq!(layout.apply_key(ftui::KeyCode::Char('b')), (true, None));
+        assert_eq!(layout.ui_anchor, ConsoleUiAnchor::Bottom);
+
+        assert_eq!(layout.apply_key(ftui::KeyCode::Char('a')), (true, None));
+        assert!(layout.ui_auto_size);
+
+        let (changed, message) = layout.apply_key(ftui::KeyCode::Char('l'));
+        assert!(changed);
+        assert!(
+            message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Requested left split mode")
+        );
+        assert_eq!(layout.split_mode, ConsoleSplitMode::Left);
+
+        assert_eq!(layout.apply_key(ftui::KeyCode::Char('[')), (true, None));
+        assert_eq!(layout.split_ratio_percent, 25);
+        assert_eq!(layout.apply_key(ftui::KeyCode::Char(']')), (true, None));
+        assert_eq!(layout.split_ratio_percent, 30);
+
+        // Help key should not report a changed layout.
+        let (changed, message) = layout.apply_key(ftui::KeyCode::Char('?'));
+        assert!(!changed);
+        assert!(message.as_deref().unwrap_or_default().contains("Console:"));
     }
 
     #[test]
@@ -4940,7 +6010,7 @@ mod tests {
 
         // Panel output
         assert!(
-            out.contains("+ GET  /health/liveness  200 "),
+            out.contains("| GET  /health/liveness  200 "),
             "missing panel title: {out:?}"
         );
         assert!(
@@ -4989,7 +6059,7 @@ mod tests {
 
         // Panel output
         assert!(
-            out.contains("+ GET  /health/liveness  200 "),
+            out.contains("| GET  /health/liveness  200 "),
             "missing panel title: {out:?}"
         );
         assert!(
@@ -5000,7 +6070,7 @@ mod tests {
 
     #[test]
     fn http_request_panel_tiny_width_returns_none_and_fallback_is_exact() {
-        assert!(render_http_request_panel(0, "GET", "/", 200, 1, "x", false).is_none());
+        assert!(console::render_http_request_panel(0, "GET", "/", 200, 1, "x", false).is_none());
         assert_eq!(
             http_request_log_fallback_line("GET", "/x", 404, 12, "127.0.0.1"),
             "http method=GET path=/x status=404 ms=12 client=127.0.0.1"
@@ -5087,7 +6157,8 @@ mod tests {
     #[test]
     fn http_request_panel_no_ansi_output() {
         // Non-TTY: should render panel without ANSI escape codes.
-        let panel = render_http_request_panel(100, "POST", "/mcp", 201, 42, "10.0.0.1", false);
+        let panel =
+            console::render_http_request_panel(100, "POST", "/mcp", 201, 42, "10.0.0.1", false);
         assert!(panel.is_some());
         let text = panel.unwrap();
         // Should not contain ANSI escape sequences.
@@ -5106,7 +6177,8 @@ mod tests {
     #[test]
     fn http_request_panel_ansi_output() {
         // TTY: should render panel with ANSI escape codes.
-        let panel = render_http_request_panel(100, "GET", "/health", 200, 5, "127.0.0.1", true);
+        let panel =
+            console::render_http_request_panel(100, "GET", "/health", 200, 5, "127.0.0.1", true);
         assert!(panel.is_some());
         let text = panel.unwrap();
         assert!(
@@ -5117,14 +6189,13 @@ mod tests {
 
     #[test]
     fn http_request_panel_error_status_color() {
-        // 4xx/5xx should use red color in ANSI mode.
-        let panel = render_http_request_panel(100, "GET", "/x", 500, 1, "x", true);
+        // 5xx should use theme error color (24-bit ANSI) in ANSI mode.
+        let panel = console::render_http_request_panel(100, "GET", "/x", 500, 1, "x", true);
         assert!(panel.is_some());
         let text = panel.unwrap();
-        // Bold red: \x1b[1;31m
         assert!(
-            text.contains("\x1b[1;31m"),
-            "error status should use bold red: {text:?}"
+            text.contains("38;2;"),
+            "error status should use 24-bit theme color: {text:?}"
         );
     }
 
@@ -5863,8 +6934,9 @@ mod tests {
 
     #[test]
     fn panel_non_tty_has_no_ansi_escapes() {
-        let panel = render_http_request_panel(100, "GET", "/api", 200, 42, "127.0.0.1", false)
-            .expect("panel should render");
+        let panel =
+            console::render_http_request_panel(100, "GET", "/api", 200, 42, "127.0.0.1", false)
+                .expect("panel should render");
         assert!(
             !panel.contains("\x1b["),
             "non-TTY panel must not contain ANSI escapes: {panel:?}"
@@ -5883,67 +6955,66 @@ mod tests {
 
     #[test]
     fn panel_tty_has_ansi_color_codes() {
-        let panel = render_http_request_panel(100, "GET", "/api", 200, 10, "127.0.0.1", true)
-            .expect("panel should render");
+        let panel =
+            console::render_http_request_panel(100, "GET", "/api", 200, 10, "127.0.0.1", true)
+                .expect("panel should render");
         assert!(
             panel.contains("\x1b["),
             "TTY panel must contain ANSI escapes: {panel:?}"
         );
-        // Bold blue for method
-        assert!(panel.contains("\x1b[1;34m"), "method should be bold blue");
-        // Bold green for 2xx status
+        // Should use 24-bit theme colors for method, status, and duration
         assert!(
-            panel.contains("\x1b[1;32m"),
-            "2xx status should be bold green"
+            panel.contains("38;2;"),
+            "panel should use 24-bit theme colors: {panel:?}"
         );
-        // Bold yellow for duration
+        // Should use rounded unicode border
         assert!(
-            panel.contains("\x1b[1;33m"),
-            "duration should be bold yellow"
+            panel.contains('\u{256d}'),
+            "TTY panel should use rounded top-left corner"
         );
     }
 
     #[test]
-    fn panel_tty_error_status_uses_red() {
-        let panel = render_http_request_panel(100, "GET", "/bad", 500, 1, "x", true)
+    fn panel_tty_error_status_uses_theme_color() {
+        let panel = console::render_http_request_panel(100, "GET", "/bad", 500, 1, "x", true)
             .expect("panel should render");
         assert!(
-            panel.contains("\x1b[1;31m"),
-            "5xx status should be bold red"
+            panel.contains("38;2;"),
+            "5xx status should use 24-bit theme color: {panel:?}"
         );
     }
 
     #[test]
-    fn panel_tty_4xx_status_uses_red() {
-        let panel = render_http_request_panel(100, "POST", "/missing", 404, 1, "x", true)
+    fn panel_tty_4xx_status_uses_theme_color() {
+        let panel = console::render_http_request_panel(100, "POST", "/missing", 404, 1, "x", true)
             .expect("panel should render");
         assert!(
-            panel.contains("\x1b[1;31m"),
-            "4xx status should be bold red"
+            panel.contains("38;2;"),
+            "4xx status should use 24-bit theme color: {panel:?}"
         );
     }
 
     #[test]
-    fn panel_3xx_status_uses_green() {
-        let panel = render_http_request_panel(100, "GET", "/redirect", 301, 1, "x", true)
+    fn panel_3xx_status_uses_theme_color() {
+        let panel = console::render_http_request_panel(100, "GET", "/redirect", 301, 1, "x", true)
             .expect("panel should render");
         assert!(
-            panel.contains("\x1b[1;32m"),
-            "3xx status should be bold green (same as 2xx)"
+            panel.contains("38;2;"),
+            "3xx status should use 24-bit theme color: {panel:?}"
         );
     }
 
     #[test]
     fn panel_returns_none_for_width_below_20() {
-        assert!(render_http_request_panel(19, "GET", "/", 200, 1, "x", false).is_none());
-        assert!(render_http_request_panel(0, "GET", "/", 200, 1, "x", false).is_none());
-        assert!(render_http_request_panel(1, "GET", "/", 200, 1, "x", true).is_none());
+        assert!(console::render_http_request_panel(19, "GET", "/", 200, 1, "x", false).is_none());
+        assert!(console::render_http_request_panel(0, "GET", "/", 200, 1, "x", false).is_none());
+        assert!(console::render_http_request_panel(1, "GET", "/", 200, 1, "x", true).is_none());
     }
 
     #[test]
     fn panel_long_path_truncated_with_ellipsis() {
         let long_path = "/".to_string() + &"a".repeat(200);
-        let panel = render_http_request_panel(100, "GET", &long_path, 200, 1, "x", false)
+        let panel = console::render_http_request_panel(100, "GET", &long_path, 200, 1, "x", false)
             .expect("panel should render even with long path");
         assert!(
             panel.contains("..."),

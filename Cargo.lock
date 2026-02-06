@@ -2083,7 +2083,10 @@ dependencies = [
 name = "ftui-extras"
 version = "0.1.1"
 dependencies = [
+ "ftui-render 0.1.1",
  "ftui-runtime 0.1.1",
+ "ftui-style 0.1.1",
+ "ftui-text 0.1.1",
 ]
 
 [[package]]
@@ -4360,6 +4363,8 @@ dependencies = [
  "fastmcp-rust",
  "fastmcp-server",
  "fastmcp-transport",
+ "ftui 0.1.1",
+ "ftui-extras 0.1.1",
  "ftui-runtime 0.1.1",
  "glob",
  "include_dir",

@@ -16,6 +16,8 @@ minijinja.workspace = true
 comrak.workspace = true
 ammonia.workspace = true
 include_dir.workspace = true
+ftui.workspace = true
+ftui-extras.workspace = true
 ftui-runtime = { workspace = true, features = ["stdio-capture"] }
 fastmcp.workspace = true
 fastmcp-core.workspace = true

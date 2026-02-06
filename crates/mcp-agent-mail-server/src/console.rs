@@ -1,0 +1,1690 @@
+//! Rich console output for MCP Agent Mail server.
+//!
+//! All rendering functions produce ANSI-colored strings suitable for
+//! `TerminalWriter::write_log()` or `dashboard_write_log()`.
+
+use ftui::widgets::sparkline::Sparkline;
+use serde_json::Value;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::theme;
+
+// Re-export theme constants used frequently throughout this module.
+const RESET: &str = theme::RESET;
+const DIM: &str = theme::DIM;
+
+/// Number of data points kept in the sparkline ring buffer.
+pub const SPARKLINE_CAPACITY: usize = 60;
+
+// ──────────────────────────────────────────────────────────────────────
+// Sensitive value masking (br-1m6a.18)
+// ──────────────────────────────────────────────────────────────────────
+
+const MASK_REDACTED: &str = "<redacted>";
+
+/// Sensitive key patterns (case-insensitive substring match).
+const SENSITIVE_PATTERNS: &[&str] = &[
+    "token",
+    "secret",
+    "password",
+    "credential",
+    "bearer",
+    "jwt",
+    "api_key",
+    "private_key",
+];
+
+/// Returns `true` if a JSON object key should have its value masked.
+#[must_use]
+pub fn is_sensitive_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    // Explicit allowlist: these are identity/safety-critical values and must remain visible.
+    if lower == "project_key" || lower == "storage_root" {
+        return false;
+    }
+    // Specific header-like keys that commonly carry secrets.
+    if lower == "authorization" || lower == "auth_header" {
+        return true;
+    }
+    SENSITIVE_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
+/// Always returns the redaction placeholder (ASCII-only).
+#[must_use]
+pub fn mask_sensitive_value(_original: &str) -> String {
+    MASK_REDACTED.to_string()
+}
+
+/// Sanitize a value for known keys where secrets can appear in *values* even if the key is not
+/// obviously sensitive (e.g., `postgres://user:pass@host/db`).
+#[must_use]
+pub fn sanitize_known_value(key: &str, value: &str) -> Option<String> {
+    let lower = key.to_ascii_lowercase();
+    let is_database_url = lower == "database_url" || lower.ends_with("database_url");
+    let is_redis_url =
+        lower == "redis_url" || lower.ends_with("redis_url") || lower.contains("redis_url");
+    if !is_database_url && !is_redis_url {
+        return None;
+    }
+    sanitize_url_userinfo(value)
+}
+
+/// Walk a `serde_json::Value` tree and replace values whose keys match
+/// sensitive patterns with redaction placeholders. Also sanitizes select known keys.
+#[must_use]
+pub fn mask_json(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                if is_sensitive_key(k) {
+                    out.insert(k.clone(), Value::String(mask_sensitive_value("")));
+                } else if let Value::String(s) = v
+                    && let Some(sanitized) = sanitize_known_value(k, s)
+                {
+                    out.insert(k.clone(), Value::String(sanitized));
+                } else {
+                    out.insert(k.clone(), mask_json(v));
+                }
+            }
+            Value::Object(out)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(mask_json).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Back-compat name used by existing panel renderers/tests.
+#[must_use]
+pub fn mask_json_params(value: &Value) -> Value {
+    mask_json(value)
+}
+
+#[must_use]
+fn sanitize_url_userinfo(value: &str) -> Option<String> {
+    // Conservative, allocation-light sanitizer:
+    // - only modifies strings that look like: `scheme://user:pass@host/...`
+    // - masks ONLY the password segment
+    let scheme_end = value.find("://")?;
+    let after_scheme = scheme_end + 3;
+    let at_pos = value[after_scheme..].find('@')? + after_scheme;
+    let userinfo = &value[after_scheme..at_pos];
+    let colon_pos = userinfo.find(':')?;
+    let user = &userinfo[..colon_pos];
+    let pass = &userinfo[(colon_pos + 1)..];
+    if pass.is_empty() {
+        return None;
+    }
+
+    let mut out = String::with_capacity(value.len() + MASK_REDACTED.len());
+    out.push_str(&value[..after_scheme]);
+    out.push_str(user);
+    out.push(':');
+    out.push_str(MASK_REDACTED);
+    out.push_str(&value[at_pos..]);
+    Some(out)
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Duration color gradient (br-1m6a.2)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Icon and ANSI color for a duration value.
+pub struct DurationStyle {
+    pub icon: &'static str,
+    pub color: String,
+    pub label: String,
+}
+
+/// Pick icon + color based on duration thresholds.
+#[must_use]
+pub fn duration_style(ms: u64) -> DurationStyle {
+    let (icon, color) = if ms < 100 {
+        ("\u{26a1}", theme::success_bold()) // ⚡ green
+    } else if ms < 1000 {
+        ("\u{23f1}\u{fe0f}", theme::warning_bold()) // ⏱️ yellow
+    } else {
+        ("\u{1f40c}", theme::error_bold()) // 🐌 red
+    };
+    DurationStyle {
+        icon,
+        color,
+        label: format!("{ms}ms"),
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Startup banner (br-1m6a.1)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Parameters for the startup banner.
+pub struct BannerParams<'a> {
+    pub app_environment: &'a str,
+    pub endpoint: &'a str,
+    pub database_url: &'a str,
+    pub storage_root: &'a str,
+    pub auth_enabled: bool,
+    pub tools_log_enabled: bool,
+    pub tool_calls_log_enabled: bool,
+    pub console_theme: &'a str,
+    pub web_ui_url: &'a str,
+    pub projects: u64,
+    pub agents: u64,
+    pub messages: u64,
+    pub file_reservations: u64,
+    pub contact_links: u64,
+}
+
+/// Render the full startup banner as a vector of ANSI-colored lines.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn render_startup_banner(params: &BannerParams<'_>) -> Vec<String> {
+    let mut lines = Vec::with_capacity(60);
+
+    // Resolve theme colors once for this render pass.
+    let primary = theme::primary_bold();
+    let secondary = theme::secondary();
+    let accent_c = theme::accent();
+    let success = theme::success_bold();
+    let warning = theme::warning_bold();
+    let text = theme::text_bold();
+
+    // ── ASCII art logo (HEAVY border, cyan) ──
+    lines.push(String::new());
+    for l in [
+        "\u{250f}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2513}",
+        "\u{2503}                                                                      \u{2503}",
+        "\u{2503}     \u{2588}\u{2588}\u{2588}\u{2557}   \u{2588}\u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557}     \u{2588}\u{2588}\u{2588}\u{2557}   \u{2588}\u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2557}         \u{2503}",
+        "\u{2503}     \u{2588}\u{2588}\u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2550}\u{2550}\u{255d}\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2588}\u{2588}\u{2557}    \u{2588}\u{2588}\u{2588}\u{2588}\u{2557} \u{2588}\u{2588}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}         \u{2503}",
+        "\u{2503}     \u{2588}\u{2588}\u{2554}\u{2588}\u{2588}\u{2588}\u{2588}\u{2554}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}     \u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2554}\u{255d}    \u{2588}\u{2588}\u{2554}\u{2588}\u{2588}\u{2588}\u{2588}\u{2554}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}         \u{2503}",
+        "\u{2503}     \u{2588}\u{2588}\u{2551}\u{255a}\u{2588}\u{2588}\u{2554}\u{255d}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}     \u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2550}\u{255d}     \u{2588}\u{2588}\u{2551}\u{255a}\u{2588}\u{2588}\u{2554}\u{255d}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2554}\u{2550}\u{2550}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}         \u{2503}",
+        "\u{2503}     \u{2588}\u{2588}\u{2551} \u{255a}\u{2550}\u{255d} \u{2588}\u{2588}\u{2551}\u{255a}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557}\u{2588}\u{2588}\u{2551}         \u{2588}\u{2588}\u{2551} \u{255a}\u{2550}\u{255d} \u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}  \u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2551}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{2557}    \u{2503}",
+        "\u{2503}     \u{255a}\u{2550}\u{255d}     \u{255a}\u{2550}\u{255d} \u{255a}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255d}\u{255a}\u{2550}\u{255d}         \u{255a}\u{2550}\u{255d}     \u{255a}\u{2550}\u{255d}\u{255a}\u{2550}\u{255d}  \u{255a}\u{2550}\u{255d}\u{255a}\u{2550}\u{255d}\u{255a}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255d}    \u{2503}",
+        "\u{2503}                                                                      \u{2503}",
+        "\u{2503}               \u{1f4ec}  Agent Coordination via Message Passing  \u{1f4e8}         \u{2503}",
+        "\u{2503}                                                                      \u{2503}",
+        "\u{2517}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{251b}",
+    ] {
+        lines.push(format!("{primary}{l}{RESET}"));
+    }
+    lines.push(String::new());
+
+    // ── Server Configuration table (ROUNDED, blue) ──
+    let auth_val = if params.auth_enabled {
+        format!("{success}ENABLED{RESET}")
+    } else {
+        format!("{DIM}disabled{RESET}")
+    };
+    let tool_log_val = if params.tools_log_enabled {
+        format!("{success}ENABLED{RESET}")
+    } else {
+        format!("{DIM}disabled{RESET}")
+    };
+    let tool_calls_val = if params.tool_calls_log_enabled {
+        format!("{success}ENABLED{RESET}")
+    } else {
+        format!("{DIM}disabled{RESET}")
+    };
+    let database_url = sanitize_known_value("database_url", params.database_url)
+        .unwrap_or_else(|| params.database_url.to_string());
+    let cfg_rows: &[(&str, String)] = &[
+        (
+            "\u{1f30d} Environment",
+            format!("{success}{}{RESET}", params.app_environment),
+        ),
+        (
+            "\u{1f517} Endpoint",
+            format!("{accent_c}{}{RESET}", params.endpoint),
+        ),
+        (
+            "\u{1f4be} Database",
+            format!("{DIM}{}{RESET}", compact_path(&database_url, 48)),
+        ),
+        (
+            "\u{1f4c1} Storage",
+            format!("{DIM}{}{RESET}", compact_path(params.storage_root, 48)),
+        ),
+        ("\u{1f512} Auth", auth_val),
+        ("\u{1f4dd} Tool Logging", tool_log_val),
+        ("\u{1f527} Tool Call Panels", tool_calls_val),
+        (
+            "\u{1f3a8} Theme",
+            format!("{accent_c}{}{RESET}", params.console_theme),
+        ),
+    ];
+
+    let lw = 18;
+    let rw = 52;
+    let inner = lw + 3 + rw;
+
+    lines.push(format!(
+        "{secondary}  {warning}\u{1f680} Server Configuration{RESET}"
+    ));
+    lines.push(format!(
+        "{secondary}  \u{256d}{:\u{2500}<w$}\u{256e}{RESET}",
+        "",
+        w = inner + 2
+    ));
+    lines.push(format!(
+        "{secondary}  \u{2502} {text}{:<lw$}{RESET}{secondary} \u{2502} {text}{:<rw2$}{RESET}{secondary} \u{2502}{RESET}",
+        "Setting", "Value", lw = lw, rw2 = rw
+    ));
+    lines.push(format!(
+        "{secondary}  \u{251c}{:\u{2500}<w$}\u{2524}{RESET}",
+        "",
+        w = inner + 2
+    ));
+    for (label, value) in cfg_rows {
+        let label_vis = unicode_display_width(label);
+        let label_pad = lw.saturating_sub(label_vis);
+        let val_vis = strip_ansi_len(value);
+        let val_pad = rw.saturating_sub(val_vis);
+        lines.push(format!(
+            "{secondary}  \u{2502} {}{}{secondary} \u{2502} {}{}{secondary} \u{2502}{RESET}",
+            label,
+            " ".repeat(label_pad),
+            value,
+            " ".repeat(val_pad),
+        ));
+    }
+    lines.push(format!(
+        "{secondary}  \u{2570}{:\u{2500}<w$}\u{256f}{RESET}",
+        "",
+        w = inner + 2
+    ));
+    lines.push(String::new());
+
+    // ── Database Statistics table (ROUNDED, magenta) ──
+    let stat_rows: &[(&str, u64)] = &[
+        ("\u{1f4e6} Projects", params.projects),
+        ("\u{1f916} Agents", params.agents),
+        ("\u{1f4ec} Messages", params.messages),
+        ("\u{1f510} File Reservations", params.file_reservations),
+        ("\u{1f517} Contact Links", params.contact_links),
+    ];
+
+    let slw = 22;
+    let srw = 10;
+    let sinner = slw + 3 + srw;
+
+    lines.push(format!(
+        "{accent_c}  {warning}\u{1f4ca} Database Statistics{RESET}"
+    ));
+    lines.push(format!(
+        "{accent_c}  \u{256d}{:\u{2500}<w$}\u{256e}{RESET}",
+        "",
+        w = sinner + 2
+    ));
+    lines.push(format!(
+        "{accent_c}  \u{2502} {text}{:<lw$}{RESET}{accent_c} \u{2502} {text}{:>rw2$}{RESET}{accent_c} \u{2502}{RESET}",
+        "Resource", "Count", lw = slw, rw2 = srw
+    ));
+    lines.push(format!(
+        "{accent_c}  \u{251c}{:\u{2500}<w$}\u{2524}{RESET}",
+        "",
+        w = sinner + 2
+    ));
+    for (label, count) in stat_rows {
+        let label_vis = unicode_display_width(label);
+        let label_pad = slw.saturating_sub(label_vis);
+        let count_str = format!("{success}{count}{RESET}");
+        let count_digits = digit_count(*count);
+        let count_pad = srw.saturating_sub(count_digits);
+        lines.push(format!(
+            "{accent_c}  \u{2502} {}{}{accent_c} \u{2502} {}{}{accent_c} \u{2502}{RESET}",
+            label,
+            " ".repeat(label_pad),
+            " ".repeat(count_pad),
+            count_str,
+        ));
+    }
+    lines.push(format!(
+        "{accent_c}  \u{2570}{:\u{2500}<w$}\u{256f}{RESET}",
+        "",
+        w = sinner + 2
+    ));
+    lines.push(String::new());
+
+    // ── Web UI (HEAVY box, blue) ──
+    let ui_w = 68;
+    lines.push(format!(
+        "{secondary}  \u{250f}{:\u{2501}<w$}\u{2513}{RESET}",
+        "",
+        w = ui_w
+    ));
+    {
+        let title = format!("{text}\u{1f310} Web UI{RESET}");
+        let title_vis = 8; // "🌐 Web UI" width guess
+        let pad_l = (ui_w - title_vis) / 2;
+        let pad_r = ui_w - title_vis - pad_l;
+        lines.push(format!(
+            "{secondary}  \u{2503}{}{}{}{secondary}\u{2503}{RESET}",
+            " ".repeat(pad_l),
+            title,
+            " ".repeat(pad_r)
+        ));
+    }
+    lines.push(format!(
+        "{secondary}  \u{2503}{:\u{2501}<w$}\u{2503}{RESET}",
+        "",
+        w = ui_w
+    ));
+    {
+        let msg = format!("{text}Open the Web UI to view all agent messages:{RESET}");
+        let msg_vis = 44;
+        let pad_l = (ui_w - msg_vis) / 2;
+        let pad_r = ui_w - msg_vis - pad_l;
+        lines.push(format!(
+            "{secondary}  \u{2503}{}{}{}{secondary}\u{2503}{RESET}",
+            " ".repeat(pad_l),
+            msg,
+            " ".repeat(pad_r)
+        ));
+    }
+    {
+        let url = params.web_ui_url;
+        let url_line = format!("{primary}{url}{RESET}");
+        let url_vis = url.len();
+        if url_vis < ui_w {
+            let pad_l = (ui_w - url_vis) / 2;
+            let pad_r = ui_w - url_vis - pad_l;
+            lines.push(format!(
+                "{secondary}  \u{2503}{}{}{}{secondary}\u{2503}{RESET}",
+                " ".repeat(pad_l),
+                url_line,
+                " ".repeat(pad_r)
+            ));
+        } else {
+            lines.push(format!(
+                "{secondary}  \u{2503} {url_line} {secondary}\u{2503}{RESET}"
+            ));
+        }
+    }
+    lines.push(format!(
+        "{secondary}  \u{2503}{:<w$}\u{2503}{RESET}",
+        "",
+        w = ui_w
+    ));
+    {
+        let tip = format!(
+            "{DIM}Tip: Per-agent inbox: {accent_c}http://HOST:PORT/mail/{{project}}/inbox/{{agent}}{RESET}"
+        );
+        let tip_vis = 71;
+        let pad = if tip_vis < ui_w { ui_w - tip_vis } else { 1 };
+        lines.push(format!(
+            "{secondary}  \u{2503} {tip}{}{secondary}\u{2503}{RESET}",
+            " ".repeat(pad.saturating_sub(1))
+        ));
+    }
+    lines.push(format!(
+        "{secondary}  \u{2517}{:\u{2501}<w$}\u{251b}{RESET}",
+        "",
+        w = ui_w
+    ));
+    lines.push(String::new());
+
+    // ── JSON Stats showcase (DOUBLE box, green) ──
+    let json_str = format!(
+        "{{\n  \"stats\": {{\n    \"projects\": {},\n    \"agents\": {},\n    \"messages\": {},\n    \"file_reservations\": {},\n    \"contact_links\": {}\n  }}\n}}",
+        params.projects,
+        params.agents,
+        params.messages,
+        params.file_reservations,
+        params.contact_links
+    );
+    let json_w = 52;
+    lines.push(format!(
+        "{success}  \u{2554}{:\u{2550}<w$}\u{2557}{RESET}",
+        "",
+        w = json_w
+    ));
+    {
+        let title = "Stats Showcase";
+        let pad_l = (json_w - title.len()) / 2;
+        let pad_r = json_w - title.len() - pad_l;
+        lines.push(format!(
+            "{success}  \u{2551}{}{text}{title}{RESET}{success}{}\u{2551}{RESET}",
+            " ".repeat(pad_l),
+            " ".repeat(pad_r)
+        ));
+    }
+    lines.push(format!(
+        "{success}  \u{2560}{:\u{2550}<w$}\u{2563}{RESET}",
+        "",
+        w = json_w
+    ));
+    for jline in json_str.lines() {
+        let colored = colorize_json_line(jline);
+        let vis_len = strip_ansi_len(&colored);
+        let pad = json_w.saturating_sub(vis_len + 2);
+        lines.push(format!(
+            "{success}  \u{2551} {colored}{}{success} \u{2551}{RESET}",
+            " ".repeat(pad)
+        ));
+    }
+    lines.push(format!(
+        "{success}  \u{255a}{:\u{2550}<w$}\u{255d}{RESET}",
+        "",
+        w = json_w
+    ));
+    lines.push(String::new());
+
+    // ── Rich Logging ENABLED box (conditional, HEAVY green) ──
+    if params.tools_log_enabled {
+        let msg_w = 74;
+        lines.push(format!(
+            "{success}  \u{250f}{:\u{2501}<w$}\u{2513}{RESET}",
+            "",
+            w = msg_w
+        ));
+        let parts = format!(
+            "{success}\u{2705} {text}Rich Logging ENABLED{RESET} \u{2014} All MCP tool calls will be displayed with {primary}beautiful panels{RESET}, {accent_c}syntax highlighting{RESET}, and {warning}performance metrics{RESET}! \u{1f3a8}\u{2728}"
+        );
+        let vis = 97;
+        let pad = msg_w.saturating_sub(vis + 1);
+        lines.push(format!(
+            "{success}  \u{2503} {parts}{}{success}\u{2503}{RESET}",
+            " ".repeat(pad)
+        ));
+        lines.push(format!(
+            "{success}  \u{2517}{:\u{2501}<w$}\u{251b}{RESET}",
+            "",
+            w = msg_w
+        ));
+        lines.push(String::new());
+    }
+
+    // ── Closing rule ──
+    lines.push(format!("{secondary}  {:\u{2550}<76}{RESET}", ""));
+    lines.push(String::new());
+
+    lines
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Tool call panels (br-1m6a.2)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Render a tool-call-start panel (DOUBLE border).
+#[must_use]
+pub fn render_tool_call_start(
+    tool_name: &str,
+    params: &Value,
+    project: Option<&str>,
+    agent: Option<&str>,
+) -> Vec<String> {
+    let mut lines = Vec::with_capacity(20);
+    let timestamp = chrono::Utc::now().format("%H:%M:%S%.3f").to_string();
+
+    let secondary_b = theme::secondary_bold();
+    let primary = theme::primary_bold();
+    let text = theme::text_bold();
+    let warning = theme::warning_bold();
+
+    let w = 78;
+    let border = "\u{2550}".repeat(w);
+
+    // Top border
+    lines.push(format!("{secondary_b}\u{2554}{border}\u{2557}{RESET}"));
+
+    // Title
+    let title = format!(" {primary}\u{1f527} TOOL CALL{RESET} {text}{tool_name}{RESET} ");
+    let title_vis = 12 + tool_name.len(); // "🔧 TOOL CALL " + tool_name
+    let pad = w.saturating_sub(title_vis);
+    lines.push(format!(
+        "{secondary_b}\u{2551}{title}{}{secondary_b}\u{2551}{RESET}",
+        " ".repeat(pad)
+    ));
+
+    // Separator
+    lines.push(format!("{secondary_b}\u{2560}{border}\u{2563}{RESET}"));
+
+    // Info rows
+    let info_rows: Vec<(&str, String)> = vec![
+        ("Tool", tool_name.to_string()),
+        ("Time", timestamp),
+        ("Project", project.unwrap_or("-").to_string()),
+        ("Agent", agent.unwrap_or("-").to_string()),
+    ];
+
+    for (label, value) in &info_rows {
+        let row = format!(" {DIM}{label}:{RESET} {text}{value}{RESET}");
+        let vis_len = label.len() + 2 + value.len();
+        let pad = w.saturating_sub(vis_len);
+        lines.push(format!(
+            "{secondary_b}\u{2551}{row}{}{secondary_b}\u{2551}{RESET}",
+            " ".repeat(pad)
+        ));
+    }
+
+    // Parameters section
+    lines.push(format!("{secondary_b}\u{2560}{border}\u{2563}{RESET}"));
+    {
+        let hdr = format!(" {warning}Parameters:{RESET}");
+        let hdr_vis = 12; // " Parameters:"
+        let pad = w.saturating_sub(hdr_vis);
+        lines.push(format!(
+            "{secondary_b}\u{2551}{hdr}{}{secondary_b}\u{2551}{RESET}",
+            " ".repeat(pad)
+        ));
+    }
+
+    // Masked + pretty-printed JSON
+    let masked = mask_json_params(params);
+    let json_str = serde_json::to_string_pretty(&masked).unwrap_or_else(|_| masked.to_string());
+    for jline in json_str.lines() {
+        let colored = colorize_json_line(jline);
+        let vis_len = strip_ansi_len(&colored);
+        let padded = format!("  {colored}");
+        let pad = w.saturating_sub(vis_len + 2);
+        lines.push(format!(
+            "{secondary_b}\u{2551}{padded}{}{secondary_b}\u{2551}{RESET}",
+            " ".repeat(pad)
+        ));
+    }
+
+    // Bottom border
+    lines.push(format!("{secondary_b}\u{255a}{border}\u{255d}{RESET}"));
+    lines
+}
+
+/// Render a tool-call-end summary panel.
+///
+/// When `per_table` is non-empty, a "Query Stats" section shows the top 5
+/// tables by query count (descending, then alphabetical tie-break).
+#[must_use]
+pub fn render_tool_call_end(
+    tool_name: &str,
+    duration_ms: u64,
+    result_json: Option<&str>,
+    queries: u64,
+    query_time_ms: f64,
+    per_table: &[(String, u64)],
+    max_chars: usize,
+) -> Vec<String> {
+    let mut lines = Vec::with_capacity(16);
+    let w = 78;
+    let sep = "\u{2500}".repeat(w);
+
+    let ds = duration_style(duration_ms);
+    let color = &ds.color;
+    let icon = ds.icon;
+    let label = &ds.label;
+    let primary = theme::primary_bold();
+    let text = theme::text_bold();
+
+    // Top
+    lines.push(format!("{color}\u{256d}{sep}\u{256e}{RESET}"));
+
+    // Title
+    let title =
+        format!(" {color}{icon} {text}{tool_name}{RESET} {color}completed in {label}{RESET} ",);
+    let title_vis = 2 + tool_name.len() + 15 + label.len(); // icon + spaces + "completed in " + label
+    let pad = w.saturating_sub(title_vis);
+    lines.push(format!(
+        "{color}\u{2502}{title}{}{color}\u{2502}{RESET}",
+        " ".repeat(pad)
+    ));
+
+    // Separator
+    lines.push(format!("{color}\u{251c}{sep}\u{2524}{RESET}"));
+
+    // Stats
+    let query_time_label = format!("{query_time_ms:.2}ms");
+    let stats_line = format!(
+        " {DIM}Queries:{RESET} {primary}{queries}{RESET}  {DIM}Query time:{RESET} {primary}{query_time_label}{RESET}"
+    );
+    let stats_vis = strip_ansi_len(&stats_line);
+    let pad = w.saturating_sub(stats_vis);
+    lines.push(format!(
+        "{color}\u{2502}{stats_line}{}{color}\u{2502}{RESET}",
+        " ".repeat(pad)
+    ));
+
+    // Per-table query breakdown (top 5)
+    if !per_table.is_empty() {
+        let warning = theme::warning_bold();
+        lines.push(format!("{color}\u{251c}{sep}\u{2524}{RESET}"));
+        // Header
+        let hdr = format!(" {DIM}Table{RESET}{} {DIM}Count{RESET}", " ".repeat(w - 14));
+        lines.push(format!("{color}\u{2502}{hdr}{color}\u{2502}{RESET}"));
+        for (tbl, cnt) in per_table.iter().take(5) {
+            let cnt_str = cnt.to_string();
+            let name_max = w.saturating_sub(cnt_str.len() + 4); // 2 leading + 1 space + 1 trailing
+            let name = if tbl.len() > name_max {
+                &tbl[..name_max]
+            } else {
+                tbl.as_str()
+            };
+            let gap = w.saturating_sub(name.len() + cnt_str.len() + 3);
+            let row = format!("  {name}{}{warning}{cnt_str}{RESET}", " ".repeat(gap));
+            let row_vis = name.len() + cnt_str.len() + gap + 2;
+            let pad = w.saturating_sub(row_vis);
+            lines.push(format!(
+                "{color}\u{2502}{row}{}{color}\u{2502}{RESET}",
+                " ".repeat(pad)
+            ));
+        }
+        if per_table.len() > 5 {
+            let more = format!("  {DIM}... and {} more{RESET}", per_table.len() - 5);
+            let more_vis = 12 + (per_table.len() - 5).to_string().len();
+            let pad = w.saturating_sub(more_vis);
+            lines.push(format!(
+                "{color}\u{2502}{more}{}{color}\u{2502}{RESET}",
+                " ".repeat(pad)
+            ));
+        }
+        // Total row
+        let total_label = format!(
+            "  {DIM}Total:{RESET} {warning}{queries}{RESET} queries in {warning}{query_time_ms:.1}ms{RESET}"
+        );
+        let total_vis =
+            10 + queries.to_string().len() + 13 + format!("{query_time_ms:.1}").len() + 2;
+        let pad = w.saturating_sub(total_vis);
+        lines.push(format!(
+            "{color}\u{2502}{total_label}{}{color}\u{2502}{RESET}",
+            " ".repeat(pad)
+        ));
+    }
+
+    // Result preview (truncated)
+    if let Some(result) = result_json {
+        let masked_result = mask_result_preview(result);
+        let truncated = truncate_with_suffix(&masked_result, max_chars, "...(truncated)");
+        lines.push(format!("{color}\u{251c}{sep}\u{2524}{RESET}"));
+        {
+            let hdr = format!(" {DIM}Result:{RESET}");
+            let hdr_vis = 8;
+            let pad = w.saturating_sub(hdr_vis);
+            lines.push(format!(
+                "{color}\u{2502}{hdr}{}{color}\u{2502}{RESET}",
+                " ".repeat(pad)
+            ));
+        }
+        for rline in truncated.lines().take(8) {
+            let vis_len = rline.len();
+            let padded = format!("  {rline}");
+            let pad = w.saturating_sub(vis_len + 2);
+            lines.push(format!(
+                "{color}\u{2502}{padded}{}{color}\u{2502}{RESET}",
+                " ".repeat(pad)
+            ));
+        }
+    }
+
+    // Bottom
+    lines.push(format!("{color}\u{2570}{sep}\u{256f}{RESET}"));
+    lines
+}
+
+fn mask_result_preview(result: &str) -> String {
+    // Best-effort safety: if the result is JSON, apply the same masking rules
+    // used for tool-call params. If parsing fails, fall back to raw text.
+    let Ok(value) = serde_json::from_str::<Value>(result) else {
+        return result.to_string();
+    };
+
+    let masked = mask_json_params(&value);
+    serde_json::to_string_pretty(&masked).unwrap_or_else(|_| masked.to_string())
+}
+
+fn truncate_with_suffix(input: &str, max_chars: usize, suffix: &str) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let mut chars = input.chars();
+    let prefix: String = chars.by_ref().take(max_chars).collect();
+    let truncated = chars.next().is_some();
+
+    if !truncated {
+        return prefix;
+    }
+
+    let suffix_len = suffix.chars().count();
+    if max_chars <= suffix_len {
+        return prefix;
+    }
+
+    let keep = max_chars - suffix_len;
+    let mut out: String = prefix.chars().take(keep).collect();
+    out.push_str(suffix);
+    out
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Sparkline ring buffer (br-1m6a.3)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Ring buffer of request-rate data points for the sparkline.
+pub struct SparklineBuffer {
+    data: Mutex<Vec<f64>>,
+    counter: AtomicU64,
+}
+
+impl Default for SparklineBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SparklineBuffer {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            data: Mutex::new(vec![0.0; SPARKLINE_CAPACITY]),
+            counter: AtomicU64::new(0),
+        }
+    }
+
+    /// Increment the request counter (called per-request).
+    pub fn tick(&self) {
+        self.counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Sample the current rate: reads + resets the counter, pushes into the ring.
+    /// Call this at a fixed interval (e.g. every 1.2s from the dashboard worker).
+    pub fn sample(&self) {
+        let count = self.counter.swap(0, Ordering::Relaxed);
+        let mut data = self
+            .data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if data.len() >= SPARKLINE_CAPACITY {
+            data.remove(0);
+        }
+        let count_u32 = u32::try_from(count).unwrap_or(u32::MAX);
+        data.push(f64::from(count_u32));
+    }
+
+    /// Get a snapshot of the ring buffer data.
+    pub fn snapshot(&self) -> Vec<f64> {
+        self.data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Render a sparkline string using frankentui.
+    pub fn render_sparkline(&self) -> String {
+        let data = self.snapshot();
+        Sparkline::new(&data)
+            .gradient(theme::sparkline_lo(), theme::sparkline_hi())
+            .render_to_string()
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Toast notifications (br-1m6a.4)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Log level for toast display.
+#[derive(Debug, Clone, Copy)]
+pub enum ToastLevel {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+impl ToastLevel {
+    fn color(self) -> String {
+        match self {
+            Self::Info => theme::secondary_bold(),
+            Self::Success => theme::success_bold(),
+            Self::Warning => theme::warning_bold(),
+            Self::Error => theme::error_bold(),
+        }
+    }
+
+    const fn border_char(self) -> char {
+        match self {
+            Self::Info => '\u{2502}',                                  // │
+            Self::Success | Self::Warning | Self::Error => '\u{2503}', // ┃
+        }
+    }
+}
+
+/// Render a toast notification line.
+#[must_use]
+pub fn render_toast(icon: &str, message: &str, level: ToastLevel) -> String {
+    let color = level.color();
+    let border = level.border_char();
+    let text = theme::text_bold();
+    format!("{color}{border} {icon}  {text}{message}{RESET}")
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Structured log panels (br-1m6a.5)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Render a structured log panel with level-specific border color.
+#[must_use]
+pub fn render_log_panel(level: ToastLevel, title: &str, body: &str) -> Vec<String> {
+    let mut lines = Vec::with_capacity(8);
+    let color = level.color();
+    let w = 74;
+
+    let (top_l, top_r, mid_l, mid_r, bot_l, bot_r, h) = match level {
+        ToastLevel::Info | ToastLevel::Success => (
+            '\u{256d}', '\u{256e}', '\u{2502}', '\u{2502}', '\u{2570}', '\u{256f}', '\u{2500}',
+        ),
+        ToastLevel::Warning | ToastLevel::Error => (
+            '\u{250f}', '\u{2513}', '\u{2503}', '\u{2503}', '\u{2517}', '\u{251b}', '\u{2501}',
+        ),
+    };
+
+    let border = std::iter::repeat_n(h, w).collect::<String>();
+    lines.push(format!("{color}{top_l}{border}{top_r}{RESET}"));
+
+    // Title
+    let text = theme::text_bold();
+    let title_line = format!(" {text}{title}{RESET}");
+    let title_vis = title.len() + 1;
+    let pad = w.saturating_sub(title_vis);
+    lines.push(format!(
+        "{color}{mid_l}{title_line}{}{color}{mid_r}{RESET}",
+        " ".repeat(pad)
+    ));
+
+    // Body lines
+    for bline in body.lines() {
+        let padded = format!(" {bline}");
+        let vis = bline.len() + 1;
+        let pad = w.saturating_sub(vis);
+        lines.push(format!(
+            "{color}{mid_l}{padded}{}{color}{mid_r}{RESET}",
+            " ".repeat(pad)
+        ));
+    }
+
+    lines.push(format!("{color}{bot_l}{border}{bot_r}{RESET}"));
+    lines
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Helpers (shared with lib.rs where needed)
+// ──────────────────────────────────────────────────────────────────────
+
+// ──────────────────────────────────────────────────────────────────────
+// HTTP request panel styles (br-1m6a.13)
+// ──────────────────────────────────────────────────────────────────────
+
+/// ANSI color for an HTTP status code.
+#[must_use]
+pub fn status_style(code: u16) -> String {
+    match code {
+        200..=299 => theme::success_bold(),
+        300..=399 => theme::accent(),
+        400..=499 => theme::warning_bold(),
+        _ => theme::error_bold(),
+    }
+}
+
+/// ANSI color for an HTTP method verb.
+#[must_use]
+pub fn method_style(method: &str) -> String {
+    match method {
+        "GET" => theme::accent(),
+        "POST" => theme::primary_bold(),
+        "PUT" | "PATCH" => theme::secondary_bold(),
+        "DELETE" => theme::error_bold(),
+        _ => theme::muted(),
+    }
+}
+
+/// Render a themed HTTP request panel (rounded border, muted).
+///
+/// Returns `None` when `width < 20` (too narrow for a useful panel).
+/// When `use_ansi` is false, produces a plain-text box with no escape codes.
+#[must_use]
+pub fn render_http_request_panel(
+    width: usize,
+    method: &str,
+    path: &str,
+    status: u16,
+    duration_ms: u64,
+    client_ip: &str,
+    use_ansi: bool,
+) -> Option<String> {
+    if width < 20 {
+        return None;
+    }
+    let inner_width = width.saturating_sub(2);
+
+    let status_str = status.to_string();
+    let dur_str = format!("{duration_ms}ms");
+
+    // Title: "METHOD  PATH  STATUS  DUR"
+    let reserved: usize = method.len() + status_str.len() + dur_str.len() + 8;
+    let max_path: usize = inner_width.saturating_sub(reserved).max(1);
+    let display_path = if path.len() <= max_path {
+        path.to_string()
+    } else if max_path <= 3 {
+        path[..max_path].to_string()
+    } else {
+        format!("{}...", &path[..(max_path - 3)])
+    };
+
+    let title_plain = format!("{method}  {display_path}  {status_str}  {dur_str}");
+
+    let title_styled = if use_ansi {
+        let m_color = method_style(method);
+        let s_color = status_style(status);
+        let text = theme::text_bold();
+        let ds = duration_style(duration_ms);
+        let d_color = &ds.color;
+        format!(
+            "{m_color}{method}{RESET}  {text}{display_path}{RESET}  {s_color}{status_str}{RESET}  {d_color}{dur_str}{RESET}",
+        )
+    } else {
+        title_plain.clone()
+    };
+
+    let top_plain_len: usize = title_plain.len().saturating_add(2);
+    if top_plain_len > inner_width {
+        return None;
+    }
+
+    // Body: "client: <ip>"
+    let mut body_plain = format!(" client: {client_ip}");
+    if body_plain.len() > inner_width {
+        let reserved_ip: usize = " client: ".len();
+        let max_ip: usize = inner_width.saturating_sub(reserved_ip).max(1);
+        let ip = if client_ip.len() <= max_ip {
+            client_ip.to_string()
+        } else if max_ip <= 3 {
+            client_ip[..max_ip].to_string()
+        } else {
+            format!("{}...", &client_ip[..(max_ip - 3)])
+        };
+        body_plain = format!(" client: {ip}");
+    }
+
+    let body_plain_len: usize = body_plain.len();
+
+    let body_styled = if use_ansi {
+        let muted_c = theme::muted();
+        let text = theme::text_bold();
+        let prefix = " client: ";
+        let ip = body_plain.strip_prefix(prefix).unwrap_or(client_ip);
+        format!(" {muted_c}client: {RESET}{text}{ip}{RESET}")
+    } else {
+        body_plain
+    };
+
+    if body_plain_len > inner_width {
+        return None;
+    }
+    let body_pad = " ".repeat(inner_width.saturating_sub(body_plain_len));
+
+    if use_ansi {
+        let border_c = theme::muted();
+        let h = "\u{2500}".repeat(inner_width);
+        let title_pad = " ".repeat(inner_width.saturating_sub(top_plain_len));
+        Some(format!(
+            "{border_c}\u{256d}{h}\u{256e}{RESET}\n\
+             {border_c}\u{2502}{RESET} {title_styled} {title_pad}{border_c}\u{2502}{RESET}\n\
+             {border_c}\u{2502}{RESET}{body_styled}{body_pad}{border_c}\u{2502}{RESET}\n\
+             {border_c}\u{2570}{h}\u{256f}{RESET}"
+        ))
+    } else {
+        let dash = "-".repeat(inner_width);
+        let title_pad = " ".repeat(inner_width.saturating_sub(top_plain_len));
+        Some(format!(
+            "+{dash}+\n| {title_plain} {title_pad}|\n|{body_styled}{body_pad}|\n+{dash}+"
+        ))
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Helpers
+// ──────────────────────────────────────────────────────────────────────
+
+/// Compact a filesystem path to fit within `max_chars`.
+fn compact_path(input: &str, max_chars: usize) -> String {
+    if input.len() <= max_chars {
+        return input.to_string();
+    }
+    if max_chars <= 5 {
+        return input[..max_chars].to_string();
+    }
+    let keep = max_chars - 3;
+    format!("...{}", &input[input.len() - keep..])
+}
+
+/// Strip ANSI escape sequences and return the visible character count.
+fn strip_ansi_len(s: &str) -> usize {
+    let mut count = 0usize;
+    let mut in_escape = false;
+    for c in s.chars() {
+        if in_escape {
+            if c.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+        } else if c == '\x1b' {
+            in_escape = true;
+        } else {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Approximate Unicode display width. Emoji and wide chars count as 2.
+fn unicode_display_width(s: &str) -> usize {
+    s.chars().map(|c| if c > '\u{ff}' { 2 } else { 1 }).sum()
+}
+
+/// Number of decimal digits in a u64.
+const fn digit_count(mut n: u64) -> usize {
+    if n == 0 {
+        return 1;
+    }
+    let mut count = 0;
+    while n > 0 {
+        count += 1;
+        n /= 10;
+    }
+    count
+}
+
+/// Colorize a JSON line with key/number highlights.
+fn colorize_json_line(line: &str) -> String {
+    let key_color = theme::json_key();
+    let str_color = theme::json_string();
+    let num_color = theme::json_number();
+
+    let mut out = String::with_capacity(line.len() + 40);
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            // Read until closing quote
+            let mut s = String::new();
+            for inner in chars.by_ref() {
+                if inner == '"' {
+                    break;
+                }
+                s.push(inner);
+            }
+            // Check if followed by ':'  -> key, else -> string value
+            let is_key = chars.peek() == Some(&':');
+            out.push_str(if is_key { &key_color } else { &str_color });
+            out.push('"');
+            out.push_str(&s);
+            out.push('"');
+            out.push_str(RESET);
+        } else if c.is_ascii_digit() || c == '-' {
+            let mut num = String::new();
+            num.push(c);
+            while let Some(&next) = chars.peek() {
+                if next.is_ascii_digit() || next == '.' {
+                    num.push(chars.next().unwrap());
+                } else {
+                    break;
+                }
+            }
+            out.push_str(&num_color);
+            out.push_str(&num);
+            out.push_str(RESET);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Tests
+// ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Masking tests ──
+
+    #[test]
+    fn test_is_sensitive_key_positive() {
+        for key in &[
+            "api_token",
+            "SECRET_KEY",
+            "password",
+            "auth_header",
+            "credential_file",
+            "bearer_token",
+            "HTTP_BEARER_TOKEN",
+            "MyPassword",
+            "secret",
+            "api_key",
+            "Authorization",
+            "jwt_secret",
+            "private_key",
+        ] {
+            assert!(is_sensitive_key(key), "expected sensitive: {key}");
+        }
+    }
+
+    #[test]
+    fn test_is_sensitive_key_negative() {
+        for key in &[
+            "project_key",
+            "storage_root",
+            "agent_name",
+            "auth_enabled",
+            "body_md",
+            "subject",
+            "to",
+            "importance",
+            "format",
+            "limit",
+            "endpoint",
+            "app_environment",
+        ] {
+            assert!(!is_sensitive_key(key), "expected non-sensitive: {key}");
+        }
+    }
+
+    #[test]
+    fn test_mask_sensitive_value() {
+        assert_eq!(mask_sensitive_value("abc123"), MASK_REDACTED);
+    }
+
+    #[test]
+    fn test_mask_json_params() {
+        let input = serde_json::json!({
+            "project_key": "/data/backend",
+            "storage_root": "/tmp/storage",
+            "bearer_token": "secret-value",
+            "nested": {
+                "password": "hunter2",
+                "name": "test",
+                "api_key": 123
+            },
+            "list": [
+                {"jwt_secret": true},
+                {"not_sensitive": "ok"},
+                {"auth_header": "Bearer xyz"}
+            ],
+            "database_url": "postgres://user:pass@localhost/db"
+        });
+        let masked = mask_json_params(&input);
+        assert_eq!(masked["bearer_token"], MASK_REDACTED);
+        assert_eq!(masked["nested"]["password"], MASK_REDACTED);
+        assert_eq!(masked["nested"]["name"], "test");
+        assert_eq!(masked["nested"]["api_key"], MASK_REDACTED);
+        assert_eq!(masked["list"][0]["jwt_secret"], MASK_REDACTED);
+        assert_eq!(masked["list"][1]["not_sensitive"], "ok");
+        assert_eq!(masked["list"][2]["auth_header"], MASK_REDACTED);
+        assert_eq!(
+            masked["database_url"],
+            "postgres://user:<redacted>@localhost/db"
+        );
+        assert_eq!(masked["project_key"], "/data/backend");
+        assert_eq!(masked["storage_root"], "/tmp/storage");
+    }
+
+    #[test]
+    fn test_mask_preserves_non_sensitive() {
+        let input = serde_json::json!({
+            "agent_name": "BlueLake",
+            "subject": "Hello",
+            "body_md": "content"
+        });
+        let masked = mask_json_params(&input);
+        assert_eq!(masked["agent_name"], "BlueLake");
+        assert_eq!(masked["subject"], "Hello");
+        assert_eq!(masked["body_md"], "content");
+    }
+
+    #[test]
+    fn test_sanitize_known_value_postgres_userinfo() {
+        let url = "postgres://user:pass@localhost/db";
+        let sanitized = sanitize_known_value("database_url", url).unwrap();
+        assert_eq!(sanitized, "postgres://user:<redacted>@localhost/db");
+    }
+
+    #[test]
+    fn test_sanitize_known_value_sqlite_no_change() {
+        assert!(sanitize_known_value("database_url", "/tmp/test.db").is_none());
+    }
+
+    #[test]
+    fn test_mask_json_non_string_sensitive_values_are_redacted() {
+        let input = serde_json::json!({
+            "api_key": 123,
+            "jwt_secret": true,
+            "token": null,
+            "ok": false
+        });
+        let masked = mask_json_params(&input);
+        assert_eq!(masked["api_key"], MASK_REDACTED);
+        assert_eq!(masked["jwt_secret"], MASK_REDACTED);
+        assert_eq!(masked["token"], MASK_REDACTED);
+        assert_eq!(masked["ok"], false);
+    }
+
+    #[test]
+    fn test_mask_json_empty_objects_and_arrays() {
+        let input = serde_json::json!({
+            "empty_obj": {},
+            "empty_arr": []
+        });
+        let masked = mask_json_params(&input);
+        assert_eq!(masked["empty_obj"], serde_json::json!({}));
+        assert_eq!(masked["empty_arr"], serde_json::json!([]));
+    }
+
+    // ── Duration gradient tests ──
+
+    #[test]
+    fn test_duration_style_fast() {
+        let ds = duration_style(10);
+        assert!(
+            ds.color.contains("38;2;"),
+            "expected 24-bit color for fast: {}",
+            ds.color
+        );
+        assert_eq!(ds.label, "10ms");
+    }
+
+    #[test]
+    fn test_duration_style_medium() {
+        let ds = duration_style(200);
+        assert!(
+            ds.color.contains("38;2;"),
+            "expected 24-bit color for medium: {}",
+            ds.color
+        );
+    }
+
+    #[test]
+    fn test_duration_style_slow() {
+        let ds = duration_style(2000);
+        assert!(
+            ds.color.contains("38;2;"),
+            "expected 24-bit color for slow: {}",
+            ds.color
+        );
+        assert_eq!(ds.label, "2000ms");
+    }
+
+    // ── Banner tests ──
+
+    #[test]
+    fn test_banner_contains_logo() {
+        let params = BannerParams {
+            app_environment: "development",
+            endpoint: "http://localhost:8765/mcp",
+            database_url: "/tmp/test.db",
+            storage_root: "/tmp/storage",
+            auth_enabled: false,
+            tools_log_enabled: true,
+            tool_calls_log_enabled: true,
+            console_theme: "Cyberpunk Aurora",
+            web_ui_url: "http://localhost:8765/mail",
+            projects: 3,
+            agents: 5,
+            messages: 42,
+            file_reservations: 2,
+            contact_links: 1,
+        };
+        let lines = render_startup_banner(&params);
+        let joined = lines.join("\n");
+        // Check for key structural elements
+        assert!(joined.contains("MCP"), "banner should contain MCP logo");
+        assert!(
+            joined.contains("Server Configuration"),
+            "banner should contain server config section"
+        );
+        assert!(
+            joined.contains("Database Statistics"),
+            "banner should contain db stats section"
+        );
+        assert!(
+            joined.contains("Web UI"),
+            "banner should contain web UI section"
+        );
+        assert!(
+            joined.contains("Stats Showcase"),
+            "banner should contain stats showcase"
+        );
+        assert!(
+            joined.contains("Rich Logging ENABLED"),
+            "banner should contain rich logging notice"
+        );
+        assert!(
+            joined.contains("Cyberpunk Aurora"),
+            "banner should display active theme name"
+        );
+        assert!(
+            joined.contains("Theme"),
+            "banner should contain theme config row"
+        );
+    }
+
+    #[test]
+    fn test_banner_no_rich_logging_when_disabled() {
+        let params = BannerParams {
+            app_environment: "production",
+            endpoint: "http://localhost:8765/mcp",
+            database_url: "/tmp/test.db",
+            storage_root: "/tmp/storage",
+            auth_enabled: true,
+            tools_log_enabled: false,
+            tool_calls_log_enabled: false,
+            console_theme: "Darcula",
+            web_ui_url: "http://localhost:8765/mail",
+            projects: 0,
+            agents: 0,
+            messages: 0,
+            file_reservations: 0,
+            contact_links: 0,
+        };
+        let lines = render_startup_banner(&params);
+        let joined = lines.join("\n");
+        assert!(!joined.contains("Rich Logging ENABLED"));
+    }
+
+    // ── Tool call panel tests ──
+
+    #[test]
+    fn test_tool_call_start_contains_fields() {
+        let params = serde_json::json!({"project_key": "/data/backend", "agent_name": "BlueLake"});
+        let lines =
+            render_tool_call_start("send_message", &params, Some("backend"), Some("BlueLake"));
+        let joined = lines.join("\n");
+        assert!(joined.contains("TOOL CALL"), "should have TOOL CALL header");
+        assert!(joined.contains("send_message"), "should contain tool name");
+        assert!(joined.contains("BlueLake"), "should contain agent name");
+        assert!(
+            joined.contains("Parameters:"),
+            "should have parameters section"
+        );
+    }
+
+    #[test]
+    fn test_tool_call_start_masks_sensitive() {
+        let params = serde_json::json!({"bearer_token": "secret123", "agent_name": "BlueLake"});
+        let lines = render_tool_call_start("health_check", &params, None, None);
+        let joined = lines.join("\n");
+        assert!(
+            !joined.contains("secret123"),
+            "should not contain raw secret"
+        );
+        assert!(
+            joined.contains(MASK_REDACTED),
+            "should contain redaction placeholder"
+        );
+        assert!(
+            joined.contains("BlueLake"),
+            "non-sensitive value should appear"
+        );
+    }
+
+    #[test]
+    fn test_tool_call_end_fields() {
+        let lines =
+            render_tool_call_end("send_message", 42, Some("{\"id\": 1}"), 5, 12.0, &[], 2000);
+        let joined = lines.join("\n");
+        assert!(joined.contains("send_message"));
+        assert!(joined.contains("42ms"));
+        assert!(joined.contains("completed in"));
+        assert!(joined.contains("Queries:"));
+        assert!(joined.contains("Result:"));
+    }
+
+    #[test]
+    fn test_tool_call_end_truncates_long_result() {
+        let long_result = "x".repeat(600);
+        let lines = render_tool_call_end("test_tool", 100, Some(&long_result), 1, 5.0, &[], 500);
+        let joined = lines.join("\n");
+        assert!(joined.contains("..."), "long result should be truncated");
+        assert!(
+            !joined.contains(&"x".repeat(600)),
+            "full result should not appear"
+        );
+    }
+
+    #[test]
+    fn test_tool_call_end_masks_sensitive_result_json() {
+        let result = r#"{"bearer_token":"secret123","ok":true}"#;
+        let lines = render_tool_call_end("test_tool", 10, Some(result), 0, 0.0, &[], 2000);
+        let joined = lines.join("\n");
+        assert!(!joined.contains("secret123"));
+        assert!(joined.contains(MASK_REDACTED));
+        assert!(joined.contains("Result:"));
+    }
+
+    #[test]
+    fn test_tool_call_end_per_table_stats() {
+        let per_table = vec![
+            ("messages".to_string(), 15u64),
+            ("projects".to_string(), 8),
+            ("agents".to_string(), 5),
+            ("file_reservations".to_string(), 3),
+            ("contacts".to_string(), 2),
+            ("acks".to_string(), 1),
+        ];
+        let lines = render_tool_call_end("send_message", 42, None, 34, 12.5, &per_table, 2000);
+        let joined = lines.join("\n");
+        // Top 5 tables shown
+        assert!(joined.contains("messages"), "top table shown");
+        assert!(joined.contains("projects"), "2nd table shown");
+        assert!(joined.contains("agents"), "3rd table shown");
+        assert!(joined.contains("file_reservations"), "4th table shown");
+        assert!(joined.contains("contacts"), "5th table shown");
+        // 6th table hidden behind "... and 1 more"
+        assert!(!joined.contains("acks"), "6th table hidden");
+        assert!(joined.contains("1 more"), "overflow indicator");
+        // Total row
+        assert!(joined.contains("34"), "total count shown");
+        assert!(joined.contains("12.5ms"), "total time shown");
+    }
+
+    #[test]
+    fn test_tool_call_end_empty_per_table() {
+        let lines = render_tool_call_end("test_tool", 10, None, 0, 0.0, &[], 2000);
+        let joined = lines.join("\n");
+        // No table/count headers when per_table is empty
+        assert!(!joined.contains("Table"), "no table header when empty");
+        assert!(!joined.contains("Count"), "no count header when empty");
+    }
+
+    // ── Sparkline tests ──
+
+    #[test]
+    fn test_sparkline_buffer_sample() {
+        let buf = SparklineBuffer::new();
+        buf.tick();
+        buf.tick();
+        buf.tick();
+        buf.sample();
+        let data = buf.snapshot();
+        let last = data.last().copied().unwrap();
+        assert!(
+            (last - 3.0).abs() < 0.0001,
+            "expected last sample to be ~3, got {last}"
+        );
+    }
+
+    #[test]
+    fn test_sparkline_render_nonempty() {
+        let buf = SparklineBuffer::new();
+        for _ in 0..5 {
+            buf.tick();
+            buf.sample();
+        }
+        let rendered = buf.render_sparkline();
+        assert!(!rendered.is_empty());
+    }
+
+    // ── Toast tests ──
+
+    #[test]
+    fn test_toast_formatting() {
+        let toast = render_toast("\u{1f4e8}", "New message from BlueLake", ToastLevel::Info);
+        assert!(toast.contains("New message from BlueLake"));
+        assert!(toast.contains("\u{1f4e8}"));
+    }
+
+    #[test]
+    fn test_toast_error_level() {
+        let toast = render_toast("\u{274c}", "Conflict detected", ToastLevel::Error);
+        assert!(
+            toast.contains("38;2;"),
+            "error toast should use 24-bit theme color: {toast}"
+        );
+    }
+
+    // ── Log panel tests ──
+
+    #[test]
+    fn test_log_panel_info() {
+        let lines = render_log_panel(
+            ToastLevel::Info,
+            "System Info",
+            "Server started successfully",
+        );
+        let joined = lines.join("\n");
+        assert!(joined.contains("System Info"));
+        assert!(joined.contains("Server started successfully"));
+        // Info uses rounded borders
+        assert!(joined.contains('\u{256d}'));
+    }
+
+    #[test]
+    fn test_log_panel_error() {
+        let lines = render_log_panel(ToastLevel::Error, "Fatal Error", "Connection refused");
+        let joined = lines.join("\n");
+        assert!(joined.contains("Fatal Error"));
+        assert!(joined.contains("Connection refused"));
+        // Error uses heavy borders
+        assert!(joined.contains('\u{250f}'));
+    }
+
+    // ── Helper tests ──
+
+    #[test]
+    fn test_strip_ansi_len() {
+        assert_eq!(strip_ansi_len("hello"), 5);
+        assert_eq!(strip_ansi_len("\x1b[1;32mhello\x1b[0m"), 5);
+        assert_eq!(strip_ansi_len(""), 0);
+    }
+
+    #[test]
+    fn test_compact_path() {
+        assert_eq!(compact_path("short", 10), "short");
+        assert_eq!(
+            compact_path("/very/long/path/to/something", 15),
+            "...to/something"
+        );
+    }
+
+    #[test]
+    fn test_digit_count() {
+        assert_eq!(digit_count(0), 1);
+        assert_eq!(digit_count(1), 1);
+        assert_eq!(digit_count(42), 2);
+        assert_eq!(digit_count(1000), 4);
+    }
+
+    #[test]
+    fn test_colorize_json_line() {
+        let line = r#"  "name": "test","#;
+        let colored = colorize_json_line(line);
+        // Should contain ANSI codes
+        assert!(colored.contains('\x1b'));
+        // The key "name" and value "test" should still be present
+        let stripped = strip_ansi_content(&colored);
+        assert!(stripped.contains("name"));
+        assert!(stripped.contains("test"));
+    }
+
+    /// Strip ANSI codes from a string (for test assertions).
+    fn strip_ansi_content(s: &str) -> String {
+        let mut out = String::new();
+        let mut in_escape = false;
+        for c in s.chars() {
+            if in_escape {
+                if c.is_ascii_alphabetic() {
+                    in_escape = false;
+                }
+            } else if c == '\x1b' {
+                in_escape = true;
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    // ── Status/method style tests (br-1m6a.13) ──
+
+    #[test]
+    fn test_status_style_2xx() {
+        let s = status_style(200);
+        assert!(s.contains("38;2;"), "2xx should use 24-bit color: {s}");
+    }
+
+    #[test]
+    fn test_status_style_differentiation() {
+        let ok = status_style(200);
+        let warn = status_style(404);
+        let err = status_style(500);
+        assert_ne!(ok, err, "success and error should differ");
+        assert_ne!(warn, err, "warning and error should differ");
+    }
+
+    #[test]
+    fn test_method_style_differentiation() {
+        let get = method_style("GET");
+        let post = method_style("POST");
+        let del = method_style("DELETE");
+        assert_ne!(get, del, "GET and DELETE should differ");
+        assert_ne!(post, del, "POST and DELETE should differ");
+    }
+
+    #[test]
+    fn test_request_panel_non_ansi() {
+        let panel = render_http_request_panel(100, "GET", "/api", 200, 42, "127.0.0.1", false)
+            .expect("panel should render");
+        assert!(!panel.contains("\x1b["), "non-ANSI panel: no escapes");
+        assert!(panel.contains('+'), "non-ANSI: + corners");
+        assert!(panel.contains("GET"), "panel: method");
+        assert!(panel.contains("42ms"), "panel: duration");
+        assert!(panel.contains("client: 127.0.0.1"), "panel: client IP");
+    }
+
+    #[test]
+    fn test_request_panel_ansi_uses_theme() {
+        let panel = render_http_request_panel(100, "POST", "/mcp", 201, 5, "10.0.0.1", true)
+            .expect("panel should render");
+        assert!(panel.contains("38;2;"), "ANSI: 24-bit color");
+        assert!(panel.contains('\u{256d}'), "ANSI: rounded corner");
+    }
+
+    #[test]
+    fn test_request_panel_tiny_width() {
+        assert!(render_http_request_panel(0, "GET", "/", 200, 1, "x", false).is_none());
+        assert!(render_http_request_panel(19, "GET", "/", 200, 1, "x", true).is_none());
+    }
+
+    #[test]
+    fn test_request_panel_long_path_truncated() {
+        let long = "/".to_string() + &"a".repeat(200);
+        let panel = render_http_request_panel(100, "GET", &long, 200, 1, "x", false)
+            .expect("panel should render");
+        assert!(panel.contains("..."), "long path should be truncated");
+    }
+
+    #[test]
+    fn test_request_panel_all_status_ranges() {
+        for (status, label) in [(200, "2xx"), (301, "3xx"), (404, "4xx"), (500, "5xx")] {
+            let panel = render_http_request_panel(100, "GET", "/x", status, 1, "x", true)
+                .unwrap_or_else(|| panic!("{label} panel should render"));
+            assert!(panel.contains("38;2;"), "{label}: 24-bit color");
+        }
+    }
+}

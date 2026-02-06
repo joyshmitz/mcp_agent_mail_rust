@@ -3,9 +3,10 @@
 //! Configuration is loaded from environment variables, matching the legacy Python
 //! implementation's python-decouple pattern.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -173,8 +174,23 @@ pub struct Config {
     // Logging
     pub log_level: String,
     pub log_rich_enabled: bool,
+    pub log_tool_calls_enabled: bool,
+    pub log_tool_calls_result_max_chars: usize,
     pub log_include_trace: bool,
     pub log_json_enabled: bool,
+
+    // Console / TUI layout + persistence
+    pub console_persist_path: PathBuf,
+    pub console_auto_save: bool,
+    pub console_interactive_enabled: bool,
+    pub console_ui_height_percent: u16,
+    pub console_ui_anchor: ConsoleUiAnchor,
+    pub console_ui_auto_size: bool,
+    pub console_inline_auto_min_rows: u16,
+    pub console_inline_auto_max_rows: u16,
+    pub console_split_mode: ConsoleSplitMode,
+    pub console_split_ratio_percent: u16,
+    pub console_theme: ConsoleThemeId,
 }
 
 /// Application environment
@@ -207,6 +223,71 @@ pub enum ProjectIdentityMode {
 pub enum RateLimitBackend {
     Memory,
     Redis,
+}
+
+/// `StartupDashboard` UI anchor for Inline mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConsoleUiAnchor {
+    #[default]
+    Bottom,
+    Top,
+}
+
+impl ConsoleUiAnchor {
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "bottom" | "b" => Some(Self::Bottom),
+            "top" | "t" => Some(Self::Top),
+            _ => None,
+        }
+    }
+}
+
+/// `StartupDashboard` console split mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConsoleSplitMode {
+    #[default]
+    Inline,
+    Left,
+}
+
+impl ConsoleSplitMode {
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "inline" | "i" => Some(Self::Inline),
+            "left" | "l" => Some(Self::Left),
+            _ => None,
+        }
+    }
+}
+
+/// Console theme selection (`FrankenTUI`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConsoleThemeId {
+    #[default]
+    CyberpunkAurora,
+    Darcula,
+    LumenLight,
+    NordicFrost,
+    HighContrast,
+}
+
+impl ConsoleThemeId {
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "cyberpunk_aurora" | "cyberpunk-aurora" | "cyberpunk" | "aurora" => {
+                Some(Self::CyberpunkAurora)
+            }
+            "darcula" => Some(Self::Darcula),
+            "lumen_light" | "lumen-light" | "lumen" | "light" => Some(Self::LumenLight),
+            "nordic_frost" | "nordic-frost" | "nordic" => Some(Self::NordicFrost),
+            "high_contrast" | "high-contrast" | "contrast" | "hc" => Some(Self::HighContrast),
+            _ => None,
+        }
+    }
 }
 
 /// Agent name enforcement mode
@@ -390,8 +471,27 @@ impl Default for Config {
             // Logging
             log_level: "INFO".to_string(),
             log_rich_enabled: true,
+            log_tool_calls_enabled: true,
+            log_tool_calls_result_max_chars: 2000,
             log_include_trace: false,
             log_json_enabled: false,
+
+            // Console / TUI layout + persistence
+            console_persist_path: dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".config")
+                .join("mcp-agent-mail")
+                .join("config.env"),
+            console_auto_save: true,
+            console_interactive_enabled: true,
+            console_ui_height_percent: 33,
+            console_ui_anchor: ConsoleUiAnchor::Bottom,
+            console_ui_auto_size: false,
+            console_inline_auto_min_rows: 8,
+            console_inline_auto_max_rows: 18,
+            console_split_mode: ConsoleSplitMode::Inline,
+            console_split_ratio_percent: 30,
+            console_theme: ConsoleThemeId::CyberpunkAurora,
         }
     }
 }
@@ -747,8 +847,86 @@ impl Config {
             config.log_level = v;
         }
         config.log_rich_enabled = env_bool("LOG_RICH_ENABLED", config.log_rich_enabled);
+        config.log_tool_calls_enabled =
+            env_bool("LOG_TOOL_CALLS_ENABLED", config.log_tool_calls_enabled);
+        config.log_tool_calls_result_max_chars = env_usize(
+            "LOG_TOOL_CALLS_RESULT_MAX_CHARS",
+            config.log_tool_calls_result_max_chars,
+        );
         config.log_include_trace = env_bool("LOG_INCLUDE_TRACE", config.log_include_trace);
         config.log_json_enabled = env_bool("LOG_JSON_ENABLED", config.log_json_enabled);
+
+        // Console / TUI layout + persistence
+        //
+        // Console layout is a *user preference* and must not require editing a repo `.env`.
+        // For `CONSOLE_*` keys we read:
+        //   real env > user config envfile > defaults
+        // and we do NOT fall back to working-directory `.env`.
+        if let Some(v) = real_env_value("CONSOLE_PERSIST_PATH") {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                config.console_persist_path = PathBuf::from(trimmed);
+            }
+        }
+        let persisted_console = load_dotenv_file(&config.console_persist_path);
+        let console_value = |key: &str| -> Option<String> {
+            #[cfg(test)]
+            if let Some(v) = test_env_override_value(key) {
+                return Some(v);
+            }
+            env::var(key)
+                .ok()
+                .or_else(|| persisted_console.get(key).cloned())
+        };
+        let console_bool = |key: &str, default: bool| -> bool {
+            console_value(key).map_or(default, |v| parse_bool(&v, default))
+        };
+        let console_u16 = |key: &str, default: u16| -> u16 {
+            console_value(key)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+
+        config.console_auto_save = console_bool("CONSOLE_AUTO_SAVE", config.console_auto_save);
+        config.console_interactive_enabled =
+            console_bool("CONSOLE_INTERACTIVE", config.console_interactive_enabled);
+        config.console_ui_height_percent = console_u16(
+            "CONSOLE_UI_HEIGHT_PERCENT",
+            config.console_ui_height_percent,
+        )
+        .clamp(10, 80);
+        if let Some(v) = console_value("CONSOLE_UI_ANCHOR") {
+            if let Some(anchor) = ConsoleUiAnchor::parse(&v) {
+                config.console_ui_anchor = anchor;
+            }
+        }
+        config.console_ui_auto_size =
+            console_bool("CONSOLE_UI_AUTO_SIZE", config.console_ui_auto_size);
+        config.console_inline_auto_min_rows = console_u16(
+            "CONSOLE_INLINE_AUTO_MIN_ROWS",
+            config.console_inline_auto_min_rows,
+        )
+        .max(4);
+        config.console_inline_auto_max_rows = console_u16(
+            "CONSOLE_INLINE_AUTO_MAX_ROWS",
+            config.console_inline_auto_max_rows,
+        )
+        .max(config.console_inline_auto_min_rows);
+        if let Some(v) = console_value("CONSOLE_SPLIT_MODE") {
+            if let Some(mode) = ConsoleSplitMode::parse(&v) {
+                config.console_split_mode = mode;
+            }
+        }
+        config.console_split_ratio_percent = console_u16(
+            "CONSOLE_SPLIT_RATIO_PERCENT",
+            config.console_split_ratio_percent,
+        )
+        .clamp(10, 80);
+        if let Some(v) = console_value("CONSOLE_THEME") {
+            if let Some(theme) = ConsoleThemeId::parse(&v) {
+                config.console_theme = theme;
+            }
+        }
 
         config
     }
@@ -827,6 +1005,17 @@ impl Config {
 
 static DOTENV_VALUES: OnceLock<HashMap<String, String>> = OnceLock::new();
 
+#[cfg(test)]
+thread_local! {
+    static TEST_ENV_OVERRIDES: std::cell::RefCell<HashMap<String, String>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+#[cfg(test)]
+fn test_env_override_value(key: &str) -> Option<String> {
+    TEST_ENV_OVERRIDES.with(|cell| cell.borrow().get(key).cloned())
+}
+
 fn dotenv_values() -> &'static HashMap<String, String> {
     DOTENV_VALUES.get_or_init(|| load_dotenv_file(Path::new(".env")))
 }
@@ -840,7 +1029,21 @@ pub fn dotenv_value(key: &str) -> Option<String> {
 /// Read a value from the real environment first, falling back to .env.
 #[must_use]
 pub fn env_value(key: &str) -> Option<String> {
+    #[cfg(test)]
+    if let Some(v) = test_env_override_value(key) {
+        return Some(v);
+    }
     env::var(key).ok().or_else(|| dotenv_value(key))
+}
+
+/// Read from the real environment only (no working-directory `.env` fallback).
+#[must_use]
+fn real_env_value(key: &str) -> Option<String> {
+    #[cfg(test)]
+    if let Some(v) = test_env_override_value(key) {
+        return Some(v);
+    }
+    env::var(key).ok()
 }
 
 fn load_dotenv_file(path: &Path) -> HashMap<String, String> {
@@ -848,6 +1051,58 @@ fn load_dotenv_file(path: &Path) -> HashMap<String, String> {
         return HashMap::new();
     };
     parse_dotenv_contents(&contents)
+}
+
+/// Update (or create) an envfile at `path` by replacing/adding the provided `KEY=value` pairs.
+///
+/// Preserves unrelated lines and comments. Keys are matched on `KEY=` after optional leading
+/// whitespace and optional `export ` prefix.
+pub fn update_envfile<S: std::hash::BuildHasher>(
+    path: &Path,
+    updates: &HashMap<&str, String, S>,
+) -> io::Result<()> {
+    let existing = fs::read_to_string(path).unwrap_or_default();
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut out_lines: Vec<String> = Vec::new();
+
+    for line in existing.lines() {
+        let trimmed = line.trim_start();
+        let maybe = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+        let Some((key, _)) = maybe.split_once('=') else {
+            out_lines.push(line.to_string());
+            continue;
+        };
+        let key = key.trim();
+        let Some(value) = updates.get(key) else {
+            out_lines.push(line.to_string());
+            continue;
+        };
+
+        let comment = extract_inline_comment(line);
+        let mut replaced = format!("{key}={value}");
+        if let Some(suffix) = comment {
+            replaced.push(' ');
+            replaced.push_str(suffix.trim_start());
+        }
+        out_lines.push(replaced);
+        seen.insert(key);
+    }
+
+    for (key, value) in updates {
+        if !seen.contains(key) {
+            out_lines.push(format!("{key}={value}"));
+        }
+    }
+
+    let mut out = out_lines.join("\n");
+    out.push('\n');
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    fs::write(path, out)
 }
 
 fn parse_dotenv_contents(contents: &str) -> HashMap<String, String> {
@@ -896,6 +1151,16 @@ fn strip_inline_comment(value: &str) -> &str {
         }
     }
     value
+}
+
+fn extract_inline_comment(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] == b'#' && (i == 0 || bytes[i - 1].is_ascii_whitespace()) {
+            return Some(&line[i..]);
+        }
+    }
+    None
 }
 
 fn unescape_double_quotes(input: &str) -> String {
@@ -1009,6 +1274,43 @@ fn env_f64(key: &str, default: f64) -> f64 {
 mod tests {
     use super::*;
 
+    struct TestEnvOverrideGuard {
+        previous: Vec<(String, Option<String>)>,
+    }
+
+    impl TestEnvOverrideGuard {
+        fn set(vars: &[(&str, &str)]) -> Self {
+            let mut previous = Vec::new();
+            TEST_ENV_OVERRIDES.with(|cell| {
+                let mut map = cell.borrow_mut();
+                for (key, value) in vars {
+                    let old = map.get(*key).cloned();
+                    previous.push(((*key).to_string(), old));
+                    map.insert((*key).to_string(), (*value).to_string());
+                }
+            });
+            Self { previous }
+        }
+    }
+
+    impl Drop for TestEnvOverrideGuard {
+        fn drop(&mut self) {
+            TEST_ENV_OVERRIDES.with(|cell| {
+                let mut map = cell.borrow_mut();
+                for (key, value) in self.previous.drain(..) {
+                    match value {
+                        Some(v) => {
+                            map.insert(key, v);
+                        }
+                        None => {
+                            map.remove(&key);
+                        }
+                    }
+                }
+            });
+        }
+    }
+
     #[test]
     fn test_default_config() {
         let config = Config::default();
@@ -1022,6 +1324,143 @@ mod tests {
         );
         assert!(config.contact_enforcement_enabled);
         assert!(config.allow_absolute_attachment_paths);
+    }
+
+    #[test]
+    fn test_tool_call_logging_config_defaults() {
+        let config = Config::default();
+        assert!(config.log_tool_calls_enabled);
+        assert_eq!(config.log_tool_calls_result_max_chars, 2000);
+    }
+
+    #[test]
+    fn test_tool_call_logging_config_from_env() {
+        let _env = TestEnvOverrideGuard::set(&[
+            ("LOG_TOOL_CALLS_ENABLED", "false"),
+            ("LOG_TOOL_CALLS_RESULT_MAX_CHARS", "1234"),
+        ]);
+
+        let config = Config::from_env();
+        assert!(!config.log_tool_calls_enabled);
+        assert_eq!(config.log_tool_calls_result_max_chars, 1234);
+    }
+
+    #[test]
+    fn test_console_layout_defaults() {
+        let config = Config::default();
+        assert_eq!(config.console_ui_height_percent, 33);
+        assert_eq!(config.console_ui_anchor, ConsoleUiAnchor::Bottom);
+        assert!(!config.console_ui_auto_size);
+        assert_eq!(config.console_inline_auto_min_rows, 8);
+        assert_eq!(config.console_inline_auto_max_rows, 18);
+        assert_eq!(config.console_split_mode, ConsoleSplitMode::Inline);
+        assert_eq!(config.console_split_ratio_percent, 30);
+        assert_eq!(config.console_theme, ConsoleThemeId::CyberpunkAurora);
+        assert!(config.console_auto_save);
+        assert!(config.console_interactive_enabled);
+    }
+
+    #[test]
+    fn test_console_layout_from_env_overrides() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let env_path = tmp.path().join("config.env");
+        let env_path_str = env_path.to_string_lossy().to_string();
+        let vars = vec![
+            ("CONSOLE_PERSIST_PATH", env_path_str.as_str()),
+            ("CONSOLE_UI_HEIGHT_PERCENT", "50"),
+            ("CONSOLE_UI_ANCHOR", "top"),
+            ("CONSOLE_UI_AUTO_SIZE", "true"),
+            ("CONSOLE_INLINE_AUTO_MIN_ROWS", "4"),
+            ("CONSOLE_INLINE_AUTO_MAX_ROWS", "10"),
+            ("CONSOLE_SPLIT_MODE", "left"),
+            ("CONSOLE_SPLIT_RATIO_PERCENT", "40"),
+            ("CONSOLE_THEME", "high_contrast"),
+            ("CONSOLE_AUTO_SAVE", "false"),
+            ("CONSOLE_INTERACTIVE", "false"),
+        ];
+        let _env = TestEnvOverrideGuard::set(&vars);
+
+        let config = Config::from_env();
+        assert_eq!(config.console_persist_path, env_path);
+        assert_eq!(config.console_ui_height_percent, 50);
+        assert_eq!(config.console_ui_anchor, ConsoleUiAnchor::Top);
+        assert!(config.console_ui_auto_size);
+        assert_eq!(config.console_inline_auto_min_rows, 4);
+        assert_eq!(config.console_inline_auto_max_rows, 10);
+        assert_eq!(config.console_split_mode, ConsoleSplitMode::Left);
+        assert_eq!(config.console_split_ratio_percent, 40);
+        assert_eq!(config.console_theme, ConsoleThemeId::HighContrast);
+        assert!(!config.console_auto_save);
+        assert!(!config.console_interactive_enabled);
+    }
+
+    #[test]
+    fn test_console_layout_reads_user_envfile_when_env_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let env_path = tmp.path().join("config.env");
+        std::fs::write(
+            &env_path,
+            "CONSOLE_UI_HEIGHT_PERCENT=55\nCONSOLE_UI_ANCHOR=top\nCONSOLE_UI_AUTO_SIZE=1\nCONSOLE_THEME=darcula\n",
+        )
+        .expect("write envfile");
+        let env_path_str = env_path.to_string_lossy().to_string();
+        let vars = vec![("CONSOLE_PERSIST_PATH", env_path_str.as_str())];
+        let _env = TestEnvOverrideGuard::set(&vars);
+
+        let config = Config::from_env();
+        assert_eq!(config.console_persist_path, env_path);
+        assert_eq!(config.console_ui_height_percent, 55);
+        assert_eq!(config.console_ui_anchor, ConsoleUiAnchor::Top);
+        assert!(config.console_ui_auto_size);
+        assert_eq!(config.console_theme, ConsoleThemeId::Darcula);
+    }
+
+    #[test]
+    fn test_console_layout_env_overrides_user_envfile() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let env_path = tmp.path().join("config.env");
+        std::fs::write(
+            &env_path,
+            "CONSOLE_UI_HEIGHT_PERCENT=40\nCONSOLE_THEME=darcula\n",
+        )
+        .expect("write envfile");
+        let env_path_str = env_path.to_string_lossy().to_string();
+        let vars = vec![
+            ("CONSOLE_PERSIST_PATH", env_path_str.as_str()),
+            ("CONSOLE_UI_HEIGHT_PERCENT", "60"),
+            ("CONSOLE_THEME", "high_contrast"),
+        ];
+        let _env = TestEnvOverrideGuard::set(&vars);
+
+        let config = Config::from_env();
+        assert_eq!(config.console_ui_height_percent, 60);
+        assert_eq!(config.console_theme, ConsoleThemeId::HighContrast);
+    }
+
+    #[test]
+    fn test_update_envfile_preserves_unrelated_and_is_idempotent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let env_path = tmp.path().join("config.env");
+        std::fs::write(
+            &env_path,
+            "# Header comment\nOTHER=1\nexport CONSOLE_UI_HEIGHT_PERCENT=33 # trailing\n\n",
+        )
+        .expect("write envfile");
+
+        let mut updates: HashMap<&str, String> = HashMap::new();
+        updates.insert("CONSOLE_UI_HEIGHT_PERCENT", "50".to_string());
+        updates.insert("CONSOLE_UI_ANCHOR", "top".to_string());
+
+        update_envfile(&env_path, &updates).expect("update envfile");
+        let content1 = std::fs::read_to_string(&env_path).expect("read envfile");
+        assert!(content1.contains("# Header comment"));
+        assert!(content1.contains("OTHER=1"));
+        assert!(content1.contains("CONSOLE_UI_HEIGHT_PERCENT=50"));
+        assert!(content1.contains("CONSOLE_UI_ANCHOR=top"));
+
+        update_envfile(&env_path, &updates).expect("update envfile again");
+        let content2 = std::fs::read_to_string(&env_path).expect("read envfile");
+        assert_eq!(content1, content2, "expected update to be idempotent");
     }
 
     #[test]

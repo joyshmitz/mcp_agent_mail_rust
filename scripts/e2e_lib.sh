@@ -22,6 +22,16 @@ E2E_SUITE="${E2E_SUITE:-unknown}"
 # Keep temp dirs on failure for debugging
 AM_E2E_KEEP_TMP="${AM_E2E_KEEP_TMP:-0}"
 
+# Prefer a large temp root when available (some environments run out of /tmp tmpfs).
+# Honor an explicit TMPDIR if the caller provided one.
+if [ -z "${TMPDIR:-}" ]; then
+    if [ -d "/data/tmp" ]; then
+        export TMPDIR="/data/tmp"
+    else
+        export TMPDIR="/tmp"
+    fi
+fi
+
 # Cargo target dir: avoid multi-agent contention
 if [ -z "${CARGO_TARGET_DIR:-}" ]; then
     export CARGO_TARGET_DIR="/data/tmp/cargo-target"
@@ -184,7 +194,7 @@ e2e_assert_exit_code() {
 e2e_mktemp() {
     local prefix="${1:-e2e}"
     local td
-    td="$(mktemp -d "/tmp/${prefix}.XXXXXX")"
+    td="$(mktemp -d "${TMPDIR%/}/${prefix}.XXXXXX")"
     _E2E_TMP_DIRS+=("$td")
     echo "$td"
 }
