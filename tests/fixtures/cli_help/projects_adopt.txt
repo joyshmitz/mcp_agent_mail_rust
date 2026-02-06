@@ -1,0 +1,10 @@
+Usage: am projects adopt [OPTIONS] <SOURCE> <TARGET>
+
+Arguments:
+  <SOURCE>
+  <TARGET>
+
+Options:
+      --dry-run
+      --apply
+  -h, --help     Print help

@@ -1,0 +1,9 @@
+Usage: am projects mark-identity [OPTIONS] <PROJECT_PATH>
+
+Arguments:
+  <PROJECT_PATH>
+
+Options:
+      --commit
+      --no-commit
+  -h, --help       Print help

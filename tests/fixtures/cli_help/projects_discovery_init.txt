@@ -1,0 +1,8 @@
+Usage: am projects discovery-init [OPTIONS] <PROJECT_PATH>
+
+Arguments:
+  <PROJECT_PATH>
+
+Options:
+  -P, --product <PRODUCT>
+  -h, --help               Print help
