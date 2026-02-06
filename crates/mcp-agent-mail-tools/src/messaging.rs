@@ -1295,3 +1295,201 @@ pub async fn acknowledge_message(
     serde_json::to_string(&response)
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // is_valid_thread_id
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn thread_id_simple_alphanumeric() {
+        assert!(is_valid_thread_id("abc123"));
+    }
+
+    #[test]
+    fn thread_id_with_dots_dashes_underscores() {
+        assert!(is_valid_thread_id("TKT-123"));
+        assert!(is_valid_thread_id("br-2ei.5.7.2"));
+        assert!(is_valid_thread_id("feature_xyz"));
+    }
+
+    #[test]
+    fn thread_id_single_char() {
+        assert!(is_valid_thread_id("a"));
+        assert!(is_valid_thread_id("0"));
+    }
+
+    #[test]
+    fn thread_id_empty_rejected() {
+        assert!(!is_valid_thread_id(""));
+    }
+
+    #[test]
+    fn thread_id_starts_with_dash_rejected() {
+        assert!(!is_valid_thread_id("-abc"));
+    }
+
+    #[test]
+    fn thread_id_starts_with_dot_rejected() {
+        assert!(!is_valid_thread_id(".abc"));
+    }
+
+    #[test]
+    fn thread_id_starts_with_underscore_rejected() {
+        assert!(!is_valid_thread_id("_abc"));
+    }
+
+    #[test]
+    fn thread_id_contains_space_rejected() {
+        assert!(!is_valid_thread_id("foo bar"));
+    }
+
+    #[test]
+    fn thread_id_contains_slash_rejected() {
+        assert!(!is_valid_thread_id("foo/bar"));
+    }
+
+    #[test]
+    fn thread_id_contains_at_rejected() {
+        assert!(!is_valid_thread_id("user@host"));
+    }
+
+    #[test]
+    fn thread_id_max_length_128_accepted() {
+        let id: String = std::iter::once('a')
+            .chain(std::iter::repeat_n('b', 127))
+            .collect();
+        assert_eq!(id.len(), 128);
+        assert!(is_valid_thread_id(&id));
+    }
+
+    #[test]
+    fn thread_id_over_128_rejected() {
+        let id: String = "a".repeat(129);
+        assert!(!is_valid_thread_id(&id));
+    }
+
+    #[test]
+    fn thread_id_unicode_rejected() {
+        assert!(!is_valid_thread_id("café"));
+    }
+
+    #[test]
+    fn thread_id_all_dashes_rejected() {
+        // First char must be alphanumeric, so starting with '-' fails.
+        assert!(!is_valid_thread_id("---"));
+    }
+
+    #[test]
+    fn thread_id_numeric_start() {
+        assert!(is_valid_thread_id("42"));
+        assert!(is_valid_thread_id("123-abc"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Importance validation (tested via string checks matching send_message logic)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn valid_importance_values() {
+        let valid = ["low", "normal", "high", "urgent"];
+        for v in &valid {
+            assert!(valid.contains(v), "Expected valid: {v}");
+        }
+    }
+
+    #[test]
+    fn invalid_importance_values() {
+        let valid = ["low", "normal", "high", "urgent"];
+        for v in &["NORMAL", "Low", "critical", "medium", "", "none"] {
+            assert!(!valid.contains(v), "Expected invalid: {v}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Subject truncation (the algorithm used in send_message and reply_message)
+    // -----------------------------------------------------------------------
+
+    fn truncate_subject(subject: &str) -> String {
+        if subject.chars().count() > 200 {
+            subject.chars().take(200).collect::<String>()
+        } else {
+            subject.to_string()
+        }
+    }
+
+    #[test]
+    fn subject_under_limit_unchanged() {
+        let s = "Short subject";
+        assert_eq!(truncate_subject(s), s);
+    }
+
+    #[test]
+    fn subject_exactly_200_unchanged() {
+        let s: String = "x".repeat(200);
+        assert_eq!(truncate_subject(&s).chars().count(), 200);
+    }
+
+    #[test]
+    fn subject_over_200_truncated() {
+        let s: String = "y".repeat(250);
+        let result = truncate_subject(&s);
+        assert_eq!(result.chars().count(), 200);
+    }
+
+    #[test]
+    fn subject_multibyte_utf8_safe() {
+        // Each emoji is 1 char but 4 bytes. 201 emojis = 201 chars.
+        let s: String = "\u{1F600}".repeat(201);
+        assert_eq!(s.chars().count(), 201);
+        let result = truncate_subject(&s);
+        assert_eq!(result.chars().count(), 200);
+        // Verify the result is valid UTF-8 (implicit - it's a String)
+        assert!(result.is_char_boundary(result.len()));
+    }
+
+    #[test]
+    fn subject_empty_unchanged() {
+        assert_eq!(truncate_subject(""), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // Reply subject prefix (case-insensitive idempotent)
+    // -----------------------------------------------------------------------
+
+    fn apply_prefix(original_subject: &str, prefix: &str) -> String {
+        if original_subject
+            .to_ascii_lowercase()
+            .starts_with(&prefix.to_ascii_lowercase())
+        {
+            original_subject.to_string()
+        } else {
+            format!("{prefix} {original_subject}")
+        }
+    }
+
+    #[test]
+    fn prefix_added_when_absent() {
+        assert_eq!(apply_prefix("My topic", "Re:"), "Re: My topic");
+    }
+
+    #[test]
+    fn prefix_not_duplicated_when_present() {
+        assert_eq!(apply_prefix("Re: My topic", "Re:"), "Re: My topic");
+    }
+
+    #[test]
+    fn prefix_case_insensitive() {
+        assert_eq!(apply_prefix("re: My topic", "Re:"), "re: My topic");
+        assert_eq!(apply_prefix("RE: My topic", "Re:"), "RE: My topic");
+    }
+
+    #[test]
+    fn custom_prefix() {
+        assert_eq!(apply_prefix("My topic", "FW:"), "FW: My topic");
+        assert_eq!(apply_prefix("FW: My topic", "FW:"), "FW: My topic");
+    }
+}

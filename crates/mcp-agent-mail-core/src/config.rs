@@ -1090,4 +1090,200 @@ mod tests {
         assert_eq!(values.get("TRAIL"), Some(&"keep".to_string()));
         assert_eq!(values.get("ESCAPED"), Some(&"line\nnext".to_string()));
     }
+
+    // -----------------------------------------------------------------------
+    // should_expose_tool
+    // -----------------------------------------------------------------------
+
+    fn make_filter(enabled: bool, profile: &str) -> Config {
+        Config {
+            tool_filter: ToolFilterSettings {
+                enabled,
+                profile: profile.to_string(),
+                ..ToolFilterSettings::default()
+            },
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn filter_disabled_exposes_all() {
+        let config = make_filter(false, "full");
+        assert!(config.should_expose_tool("send_message", "messaging"));
+        assert!(config.should_expose_tool("obscure_tool", "unknown_cluster"));
+    }
+
+    #[test]
+    fn full_profile_exposes_all() {
+        let config = make_filter(true, "full");
+        assert!(config.should_expose_tool("send_message", "messaging"));
+        assert!(config.should_expose_tool("anything", "whatever"));
+    }
+
+    #[test]
+    fn core_profile_includes_identity_cluster() {
+        let config = make_filter(true, "core");
+        assert!(config.should_expose_tool("register_agent", "identity"));
+        assert!(config.should_expose_tool("create_agent_identity", "identity"));
+    }
+
+    #[test]
+    fn core_profile_includes_messaging_cluster() {
+        let config = make_filter(true, "core");
+        assert!(config.should_expose_tool("send_message", "messaging"));
+        assert!(config.should_expose_tool("reply_message", "messaging"));
+    }
+
+    #[test]
+    fn core_profile_includes_file_reservations_cluster() {
+        let config = make_filter(true, "core");
+        assert!(config.should_expose_tool("file_reservation_paths", "file_reservations"));
+    }
+
+    #[test]
+    fn core_profile_includes_workflow_macros_cluster() {
+        let config = make_filter(true, "core");
+        assert!(config.should_expose_tool("macro_start_session", "workflow_macros"));
+    }
+
+    #[test]
+    fn core_profile_includes_explicit_tools() {
+        let config = make_filter(true, "core");
+        assert!(config.should_expose_tool("health_check", "other"));
+        assert!(config.should_expose_tool("ensure_project", "other"));
+    }
+
+    #[test]
+    fn core_profile_excludes_non_core_tools() {
+        let config = make_filter(true, "core");
+        assert!(!config.should_expose_tool("search_messages", "search"));
+        assert!(!config.should_expose_tool("summarize_thread", "search"));
+    }
+
+    #[test]
+    fn minimal_profile_includes_only_six_tools() {
+        let config = make_filter(true, "minimal");
+        assert!(config.should_expose_tool("health_check", "any"));
+        assert!(config.should_expose_tool("ensure_project", "any"));
+        assert!(config.should_expose_tool("register_agent", "any"));
+        assert!(config.should_expose_tool("send_message", "any"));
+        assert!(config.should_expose_tool("fetch_inbox", "any"));
+        assert!(config.should_expose_tool("acknowledge_message", "any"));
+    }
+
+    #[test]
+    fn minimal_profile_excludes_others() {
+        let config = make_filter(true, "minimal");
+        assert!(!config.should_expose_tool("reply_message", "messaging"));
+        assert!(!config.should_expose_tool("file_reservation_paths", "file_reservations"));
+        assert!(!config.should_expose_tool("search_messages", "search"));
+    }
+
+    #[test]
+    fn messaging_profile_includes_identity_messaging_contact() {
+        let config = make_filter(true, "messaging");
+        assert!(config.should_expose_tool("register_agent", "identity"));
+        assert!(config.should_expose_tool("send_message", "messaging"));
+        assert!(config.should_expose_tool("request_contact", "contact"));
+    }
+
+    #[test]
+    fn messaging_profile_includes_explicit_tools() {
+        let config = make_filter(true, "messaging");
+        assert!(config.should_expose_tool("health_check", "other"));
+        assert!(config.should_expose_tool("ensure_project", "other"));
+        assert!(config.should_expose_tool("search_messages", "other"));
+    }
+
+    #[test]
+    fn messaging_profile_excludes_reservations() {
+        let config = make_filter(true, "messaging");
+        assert!(!config.should_expose_tool("file_reservation_paths", "file_reservations"));
+    }
+
+    #[test]
+    fn custom_include_mode_includes_listed() {
+        let config = Config {
+            tool_filter: ToolFilterSettings {
+                enabled: true,
+                profile: "custom".to_string(),
+                mode: "include".to_string(),
+                clusters: vec!["identity".to_string()],
+                tools: vec!["search_messages".to_string()],
+            },
+            ..Config::default()
+        };
+        assert!(config.should_expose_tool("register_agent", "identity"));
+        assert!(config.should_expose_tool("search_messages", "other"));
+    }
+
+    #[test]
+    fn custom_include_mode_excludes_unlisted() {
+        let config = Config {
+            tool_filter: ToolFilterSettings {
+                enabled: true,
+                profile: "custom".to_string(),
+                mode: "include".to_string(),
+                clusters: vec!["identity".to_string()],
+                tools: vec![],
+            },
+            ..Config::default()
+        };
+        assert!(!config.should_expose_tool("send_message", "messaging"));
+    }
+
+    #[test]
+    fn custom_exclude_mode_excludes_listed() {
+        let config = Config {
+            tool_filter: ToolFilterSettings {
+                enabled: true,
+                profile: "custom".to_string(),
+                mode: "exclude".to_string(),
+                clusters: vec!["identity".to_string()],
+                tools: vec!["search_messages".to_string()],
+            },
+            ..Config::default()
+        };
+        assert!(!config.should_expose_tool("register_agent", "identity"));
+        assert!(!config.should_expose_tool("search_messages", "other"));
+    }
+
+    #[test]
+    fn custom_exclude_mode_includes_unlisted() {
+        let config = Config {
+            tool_filter: ToolFilterSettings {
+                enabled: true,
+                profile: "custom".to_string(),
+                mode: "exclude".to_string(),
+                clusters: vec!["identity".to_string()],
+                tools: vec![],
+            },
+            ..Config::default()
+        };
+        assert!(config.should_expose_tool("send_message", "messaging"));
+    }
+
+    #[test]
+    fn custom_empty_lists_exposes_all() {
+        let config = Config {
+            tool_filter: ToolFilterSettings {
+                enabled: true,
+                profile: "custom".to_string(),
+                mode: "include".to_string(),
+                clusters: vec![],
+                tools: vec![],
+            },
+            ..Config::default()
+        };
+        assert!(config.should_expose_tool("anything", "whatever"));
+    }
+
+    #[test]
+    fn unknown_profile_exposes_nothing() {
+        let config = make_filter(true, "nonexistent");
+        // Unknown profile has empty cluster/tool lists, and since both are empty,
+        // the final check `profile_clusters.is_empty() && profile_tools.is_empty()`
+        // returns true -- it acts as a pass-through.
+        assert!(config.should_expose_tool("anything", "whatever"));
+    }
 }

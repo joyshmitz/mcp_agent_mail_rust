@@ -292,3 +292,105 @@ pub async fn release_build_slot(
     serde_json::to_string(&response)
         .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // safe_component
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn safe_component_simple() {
+        assert_eq!(safe_component("myslot"), "myslot");
+    }
+
+    #[test]
+    fn safe_component_replaces_slashes() {
+        assert_eq!(safe_component("path/to/slot"), "path_to_slot");
+    }
+
+    #[test]
+    fn safe_component_replaces_backslash() {
+        assert_eq!(safe_component("path\\to\\slot"), "path_to_slot");
+    }
+
+    #[test]
+    fn safe_component_replaces_colon() {
+        assert_eq!(safe_component("C:slot"), "C_slot");
+    }
+
+    #[test]
+    fn safe_component_replaces_spaces() {
+        assert_eq!(safe_component("my slot"), "my_slot");
+    }
+
+    #[test]
+    fn safe_component_replaces_angle_brackets() {
+        assert_eq!(safe_component("<slot>"), "_slot_");
+    }
+
+    #[test]
+    fn safe_component_replaces_pipe() {
+        assert_eq!(safe_component("a|b"), "a_b");
+    }
+
+    #[test]
+    fn safe_component_replaces_star_and_question() {
+        assert_eq!(safe_component("glob*pattern?"), "glob_pattern_");
+    }
+
+    #[test]
+    fn safe_component_replaces_double_quote() {
+        assert_eq!(safe_component(r#"a"b"#), "a_b");
+    }
+
+    #[test]
+    fn safe_component_trims_whitespace() {
+        assert_eq!(safe_component("  hello  "), "hello");
+    }
+
+    #[test]
+    fn safe_component_empty_returns_unknown() {
+        assert_eq!(safe_component(""), "unknown");
+    }
+
+    #[test]
+    fn safe_component_only_whitespace_returns_unknown() {
+        assert_eq!(safe_component("   "), "unknown");
+    }
+
+    #[test]
+    fn safe_component_multiple_special_chars() {
+        assert_eq!(safe_component("a/b\\c:d*e"), "a_b_c_d_e");
+    }
+
+    // -----------------------------------------------------------------------
+    // project_archive_root
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn project_archive_root_builds_path() {
+        let config = Config {
+            storage_root: PathBuf::from("/data/archives"),
+            ..Config::default()
+        };
+        let root = project_archive_root(&config, "my-project");
+        assert_eq!(root, PathBuf::from("/data/archives/projects/my-project"));
+    }
+
+    // -----------------------------------------------------------------------
+    // slot_dir
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn slot_dir_sanitizes_name() {
+        let root = PathBuf::from("/archive/my-project");
+        let dir = slot_dir(&root, "my slot/name");
+        assert_eq!(
+            dir,
+            PathBuf::from("/archive/my-project/build_slots/my_slot_name")
+        );
+    }
+}
