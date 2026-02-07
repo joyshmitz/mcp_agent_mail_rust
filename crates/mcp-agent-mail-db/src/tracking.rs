@@ -5,9 +5,10 @@
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
+use mcp_agent_mail_core::{LockLevel, OrderedMutex};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
@@ -40,7 +41,7 @@ pub struct QueryTracker {
     total_time_us: AtomicU64,
     slow_enabled: AtomicBool,
     slow_threshold_us: AtomicU64,
-    inner: Mutex<TrackerInner>,
+    inner: OrderedMutex<TrackerInner>,
 }
 
 #[derive(Debug, Default)]
@@ -65,7 +66,7 @@ impl QueryTracker {
             total_time_us: AtomicU64::new(0),
             slow_enabled: AtomicBool::new(true),
             slow_threshold_us: AtomicU64::new(250_000), // 250ms default
-            inner: Mutex::new(TrackerInner::default()),
+            inner: OrderedMutex::new(LockLevel::DbQueryTrackerInner, TrackerInner::default()),
         }
     }
 
@@ -107,10 +108,7 @@ impl QueryTracker {
 
         let table = extract_table(sql);
 
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = self.inner.lock();
 
         // Per-table count
         if let Some(ref table_name) = table {
@@ -133,10 +131,7 @@ impl QueryTracker {
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
     pub fn snapshot(&self) -> QueryTrackerSnapshot {
-        let inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = self.inner.lock();
         let slow_query_ms = if self.slow_enabled.load(Ordering::Acquire) {
             Some(self.slow_threshold_us.load(Ordering::Relaxed) as f64 / 1000.0)
         } else {
@@ -155,10 +150,7 @@ impl QueryTracker {
     pub fn reset(&self) {
         self.total.store(0, Ordering::Relaxed);
         self.total_time_us.store(0, Ordering::Relaxed);
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = self.inner.lock();
         inner.per_table.clear();
         inner.slow_queries.clear();
     }

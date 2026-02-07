@@ -11,10 +11,11 @@
 //! - Deferred touch: `touch_agent` timestamps are buffered and flushed in batches
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock, RwLock};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::models::{AgentRow, ProjectRow};
+use mcp_agent_mail_core::{LockLevel, OrderedMutex, OrderedRwLock};
 
 const PROJECT_TTL: Duration = Duration::from_secs(300); // 5 min
 const AGENT_TTL: Duration = Duration::from_secs(60); // 60s
@@ -42,25 +43,37 @@ impl<T> CacheEntry<T> {
 
 /// In-memory read cache for projects and agents.
 pub struct ReadCache {
-    projects_by_slug: RwLock<HashMap<String, CacheEntry<ProjectRow>>>,
-    projects_by_human_key: RwLock<HashMap<String, CacheEntry<ProjectRow>>>,
-    agents_by_key: RwLock<HashMap<(i64, String), CacheEntry<AgentRow>>>,
-    agents_by_id: RwLock<HashMap<i64, CacheEntry<AgentRow>>>,
+    projects_by_slug: OrderedRwLock<HashMap<String, CacheEntry<ProjectRow>>>,
+    projects_by_human_key: OrderedRwLock<HashMap<String, CacheEntry<ProjectRow>>>,
+    agents_by_key: OrderedRwLock<HashMap<(i64, String), CacheEntry<AgentRow>>>,
+    agents_by_id: OrderedRwLock<HashMap<i64, CacheEntry<AgentRow>>>,
     /// Deferred touch queue: `agent_id` → latest requested timestamp (micros).
-    deferred_touches: Mutex<HashMap<i64, i64>>,
+    deferred_touches: OrderedMutex<HashMap<i64, i64>>,
     /// Last time we flushed the deferred touches.
-    last_touch_flush: Mutex<Instant>,
+    last_touch_flush: OrderedMutex<Instant>,
 }
 
 impl ReadCache {
     fn new() -> Self {
         Self {
-            projects_by_slug: RwLock::new(HashMap::new()),
-            projects_by_human_key: RwLock::new(HashMap::new()),
-            agents_by_key: RwLock::new(HashMap::new()),
-            agents_by_id: RwLock::new(HashMap::new()),
-            deferred_touches: Mutex::new(HashMap::new()),
-            last_touch_flush: Mutex::new(Instant::now()),
+            projects_by_slug: OrderedRwLock::new(
+                LockLevel::DbReadCacheProjectsBySlug,
+                HashMap::new(),
+            ),
+            projects_by_human_key: OrderedRwLock::new(
+                LockLevel::DbReadCacheProjectsByHumanKey,
+                HashMap::new(),
+            ),
+            agents_by_key: OrderedRwLock::new(LockLevel::DbReadCacheAgentsByKey, HashMap::new()),
+            agents_by_id: OrderedRwLock::new(LockLevel::DbReadCacheAgentsById, HashMap::new()),
+            deferred_touches: OrderedMutex::new(
+                LockLevel::DbReadCacheDeferredTouches,
+                HashMap::new(),
+            ),
+            last_touch_flush: OrderedMutex::new(
+                LockLevel::DbReadCacheLastTouchFlush,
+                Instant::now(),
+            ),
         }
     }
 
@@ -70,10 +83,7 @@ impl ReadCache {
 
     /// Look up a project by slug. Returns `None` if not cached or expired.
     pub fn get_project(&self, slug: &str) -> Option<ProjectRow> {
-        let map = self
-            .projects_by_slug
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = self.projects_by_slug.read();
         map.get(slug)
             .filter(|e| !e.is_expired(PROJECT_TTL))
             .map(|e| e.value.clone())
@@ -81,10 +91,7 @@ impl ReadCache {
 
     /// Look up a project by `human_key`.
     pub fn get_project_by_human_key(&self, human_key: &str) -> Option<ProjectRow> {
-        let map = self
-            .projects_by_human_key
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = self.projects_by_human_key.read();
         map.get(human_key)
             .filter(|e| !e.is_expired(PROJECT_TTL))
             .map(|e| e.value.clone())
@@ -95,10 +102,7 @@ impl ReadCache {
     pub fn put_project(&self, project: &ProjectRow) {
         // Index by slug
         {
-            let mut map = self
-                .projects_by_slug
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut map = self.projects_by_slug.write();
             if map.len() >= MAX_ENTRIES_PER_CATEGORY {
                 evict_expired(&mut map, PROJECT_TTL);
             }
@@ -108,10 +112,7 @@ impl ReadCache {
         }
         // Index by human_key
         {
-            let mut map = self
-                .projects_by_human_key
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut map = self.projects_by_human_key.write();
             if map.len() >= MAX_ENTRIES_PER_CATEGORY {
                 evict_expired(&mut map, PROJECT_TTL);
             }
@@ -127,10 +128,7 @@ impl ReadCache {
 
     /// Look up an agent by (`project_id`, name). Returns `None` if not cached or expired.
     pub fn get_agent(&self, project_id: i64, name: &str) -> Option<AgentRow> {
-        let map = self
-            .agents_by_key
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = self.agents_by_key.read();
         let key = (project_id, name.to_string());
         map.get(&key)
             .filter(|e| !e.is_expired(AGENT_TTL))
@@ -139,10 +137,7 @@ impl ReadCache {
 
     /// Look up an agent by id.
     pub fn get_agent_by_id(&self, agent_id: i64) -> Option<AgentRow> {
-        let map = self
-            .agents_by_id
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = self.agents_by_id.read();
         map.get(&agent_id)
             .filter(|e| !e.is_expired(AGENT_TTL))
             .map(|e| e.value.clone())
@@ -153,10 +148,7 @@ impl ReadCache {
     pub fn put_agent(&self, agent: &AgentRow) {
         // Index by (project_id, name)
         {
-            let mut map = self
-                .agents_by_key
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut map = self.agents_by_key.write();
             if map.len() >= MAX_ENTRIES_PER_CATEGORY {
                 evict_expired_agents(&mut map, AGENT_TTL);
             }
@@ -169,10 +161,7 @@ impl ReadCache {
         }
         // Index by id (if present)
         if let Some(id) = agent.id {
-            let mut map = self
-                .agents_by_id
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut map = self.agents_by_id.write();
             if map.len() >= MAX_ENTRIES_PER_CATEGORY {
                 map.retain(|_, entry| !entry.is_expired(AGENT_TTL));
             }
@@ -184,18 +173,12 @@ impl ReadCache {
 
     /// Invalidate a specific agent entry (call after `register_agent` update).
     pub fn invalidate_agent(&self, project_id: i64, name: &str) {
-        let mut map = self
-            .agents_by_key
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self.agents_by_key.write();
         if let Some(entry) = map.remove(&(project_id, name.to_string())) {
             // Also remove from id index
             if let Some(id) = entry.value.id {
                 drop(map); // release key map lock first
-                let mut id_map = self
-                    .agents_by_id
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut id_map = self.agents_by_id.write();
                 id_map.remove(&id);
             }
         }
@@ -209,10 +192,7 @@ impl ReadCache {
     /// interval has elapsed and the caller should drain.
     pub fn enqueue_touch(&self, agent_id: i64, ts_micros: i64) -> bool {
         {
-            let mut touches = self
-                .deferred_touches
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut touches = self.deferred_touches.lock();
             // Keep only the latest timestamp per agent
             touches
                 .entry(agent_id)
@@ -224,10 +204,7 @@ impl ReadCache {
                 .or_insert(ts_micros);
         }
 
-        let last = self
-            .last_touch_flush
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let last = self.last_touch_flush.lock();
         last.elapsed() >= TOUCH_FLUSH_INTERVAL
     }
 
@@ -235,26 +212,17 @@ impl ReadCache {
     /// Returns the map of `agent_id` → latest timestamp.
     pub fn drain_touches(&self) -> HashMap<i64, i64> {
         let drained: HashMap<i64, i64> = {
-            let mut touches = self
-                .deferred_touches
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut touches = self.deferred_touches.lock();
             touches.drain().collect()
         };
-        let mut last = self
-            .last_touch_flush
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut last = self.last_touch_flush.lock();
         *last = Instant::now();
         drained
     }
 
     /// Check if there are pending touches.
     pub fn has_pending_touches(&self) -> bool {
-        let touches = self
-            .deferred_touches
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let touches = self.deferred_touches.lock();
         !touches.is_empty()
     }
 
@@ -267,11 +235,11 @@ impl ReadCache {
     /// Clear all cache entries (for testing).
     #[cfg(test)]
     pub fn clear(&self) {
-        self.projects_by_slug.write().unwrap().clear();
-        self.projects_by_human_key.write().unwrap().clear();
-        self.agents_by_key.write().unwrap().clear();
-        self.agents_by_id.write().unwrap().clear();
-        self.deferred_touches.lock().unwrap().clear();
+        self.projects_by_slug.write().clear();
+        self.projects_by_human_key.write().clear();
+        self.agents_by_key.write().clear();
+        self.agents_by_id.write().clear();
+        self.deferred_touches.lock().clear();
     }
 }
 
@@ -393,7 +361,7 @@ mod tests {
             cache.put_project(&make_project(&slug));
         }
 
-        let map_len = cache.projects_by_slug.read().unwrap().len();
+        let map_len = cache.projects_by_slug.read().len();
         assert!(map_len <= MAX_ENTRIES_PER_CATEGORY);
     }
 
