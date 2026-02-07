@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Write as IoWrite;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -151,6 +152,18 @@ pub enum WriteOp {
     },
 }
 
+#[inline]
+fn now_micros_u64() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros()
+            .min(u128::from(u64::MAX)),
+    )
+    .unwrap_or(u64::MAX)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct WbqStats {
     pub enqueued: u64,
@@ -162,14 +175,22 @@ pub struct WbqStats {
 enum WbqMsg {
     // `WriteOp` is large (contains `Config` + payloads). Boxing keeps the channel
     // messages small and avoids repeatedly moving ~KB-sized values around.
-    Op(Box<WriteOp>),
+    Op(WbqOpEnvelope),
     Flush(std::sync::mpsc::SyncSender<()>),
     Shutdown,
+}
+
+#[derive(Debug)]
+struct WbqOpEnvelope {
+    enqueued_us: u64,
+    op: Box<WriteOp>,
 }
 
 struct WriteBehindQueue {
     sender: std::sync::mpsc::SyncSender<WbqMsg>,
     drain_handle: OrderedMutex<Option<std::thread::JoinHandle<()>>>,
+    op_depth: Arc<AtomicU64>,
+    last_peak_reset_us: Arc<AtomicU64>,
 }
 
 const WBQ_CHANNEL_CAPACITY: usize = 256;
@@ -189,6 +210,8 @@ pub fn wbq_start() {
         WriteBehindQueue {
             sender: tx,
             drain_handle: OrderedMutex::new(LockLevel::StorageWbqDrainHandle, Some(handle)),
+            op_depth: Arc::new(AtomicU64::new(0)),
+            last_peak_reset_us: Arc::new(AtomicU64::new(0)),
         }
     });
 }
@@ -198,7 +221,15 @@ pub fn wbq_start() {
 pub fn wbq_enqueue(op: WriteOp) -> bool {
     wbq_start();
     let wbq = WBQ.get().expect("WBQ must be initialised");
-    match wbq.sender.try_send(WbqMsg::Op(Box::new(op))) {
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64;
+    let envelope = WbqOpEnvelope {
+        enqueued_us: now_us,
+        op: Box::new(op),
+    };
+    match wbq.sender.try_send(WbqMsg::Op(envelope)) {
         Ok(()) => {
             mcp_agent_mail_core::global_metrics()
                 .storage
@@ -270,7 +301,7 @@ fn wbq_drain_loop(rx: std::sync::mpsc::Receiver<WbqMsg>) {
     let mut shutting_down = false;
 
     loop {
-        let mut batch: Vec<Box<WriteOp>> = Vec::new();
+        let mut batch: Vec<WbqOpEnvelope> = Vec::new();
 
         match rx.recv_timeout(flush_interval) {
             Ok(WbqMsg::Op(op)) => batch.push(op),
@@ -297,8 +328,8 @@ fn wbq_drain_loop(rx: std::sync::mpsc::Receiver<WbqMsg>) {
 
         let drained = batch.len();
         let mut errors = 0usize;
-        for op in batch {
-            if let Err(e) = wbq_execute_op(&op) {
+        for envelope in batch {
+            if let Err(e) = wbq_execute_op(&envelope.op) {
                 tracing::warn!("[wbq-drain] op failed: {e}");
                 errors += 1;
             }
@@ -326,8 +357,8 @@ fn wbq_drain_loop(rx: std::sync::mpsc::Receiver<WbqMsg>) {
     // Drain any remaining messages after the loop exits.
     for msg in rx.try_iter() {
         match msg {
-            WbqMsg::Op(op) => {
-                let _ = wbq_execute_op(&op);
+            WbqMsg::Op(envelope) => {
+                let _ = wbq_execute_op(&envelope.op);
             }
             WbqMsg::Flush(done_tx) => {
                 let _ = done_tx.try_send(());

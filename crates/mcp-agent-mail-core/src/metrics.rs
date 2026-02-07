@@ -440,6 +440,21 @@ pub struct StorageMetrics {
     pub wbq_drained_total: Counter,
     pub wbq_errors_total: Counter,
     pub wbq_fallbacks_total: Counter,
+    pub wbq_depth: GaugeU64,
+    pub wbq_capacity: GaugeU64,
+    pub wbq_peak_depth: GaugeU64,
+    pub wbq_over_80_since_us: GaugeU64,
+    pub wbq_queue_latency_us: Log2Histogram,
+
+    pub commit_enqueued_total: Counter,
+    pub commit_drained_total: Counter,
+    pub commit_errors_total: Counter,
+    pub commit_sync_fallbacks_total: Counter,
+    pub commit_pending_requests: GaugeU64,
+    pub commit_soft_cap: GaugeU64,
+    pub commit_peak_pending_requests: GaugeU64,
+    pub commit_over_80_since_us: GaugeU64,
+    pub commit_queue_latency_us: Log2Histogram,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -448,6 +463,21 @@ pub struct StorageMetricsSnapshot {
     pub wbq_drained_total: u64,
     pub wbq_errors_total: u64,
     pub wbq_fallbacks_total: u64,
+    pub wbq_depth: u64,
+    pub wbq_capacity: u64,
+    pub wbq_peak_depth: u64,
+    pub wbq_over_80_since_us: u64,
+    pub wbq_queue_latency_us: HistogramSnapshot,
+
+    pub commit_enqueued_total: u64,
+    pub commit_drained_total: u64,
+    pub commit_errors_total: u64,
+    pub commit_sync_fallbacks_total: u64,
+    pub commit_pending_requests: u64,
+    pub commit_soft_cap: u64,
+    pub commit_peak_pending_requests: u64,
+    pub commit_over_80_since_us: u64,
+    pub commit_queue_latency_us: HistogramSnapshot,
 }
 
 impl Default for StorageMetrics {
@@ -457,6 +487,21 @@ impl Default for StorageMetrics {
             wbq_drained_total: Counter::new(),
             wbq_errors_total: Counter::new(),
             wbq_fallbacks_total: Counter::new(),
+            wbq_depth: GaugeU64::new(),
+            wbq_capacity: GaugeU64::new(),
+            wbq_peak_depth: GaugeU64::new(),
+            wbq_over_80_since_us: GaugeU64::new(),
+            wbq_queue_latency_us: Log2Histogram::new(),
+
+            commit_enqueued_total: Counter::new(),
+            commit_drained_total: Counter::new(),
+            commit_errors_total: Counter::new(),
+            commit_sync_fallbacks_total: Counter::new(),
+            commit_pending_requests: GaugeU64::new(),
+            commit_soft_cap: GaugeU64::new(),
+            commit_peak_pending_requests: GaugeU64::new(),
+            commit_over_80_since_us: GaugeU64::new(),
+            commit_queue_latency_us: Log2Histogram::new(),
         }
     }
 }
@@ -469,6 +514,21 @@ impl StorageMetrics {
             wbq_drained_total: self.wbq_drained_total.load(),
             wbq_errors_total: self.wbq_errors_total.load(),
             wbq_fallbacks_total: self.wbq_fallbacks_total.load(),
+            wbq_depth: self.wbq_depth.load(),
+            wbq_capacity: self.wbq_capacity.load(),
+            wbq_peak_depth: self.wbq_peak_depth.load(),
+            wbq_over_80_since_us: self.wbq_over_80_since_us.load(),
+            wbq_queue_latency_us: self.wbq_queue_latency_us.snapshot(),
+
+            commit_enqueued_total: self.commit_enqueued_total.load(),
+            commit_drained_total: self.commit_drained_total.load(),
+            commit_errors_total: self.commit_errors_total.load(),
+            commit_sync_fallbacks_total: self.commit_sync_fallbacks_total.load(),
+            commit_pending_requests: self.commit_pending_requests.load(),
+            commit_soft_cap: self.commit_soft_cap.load(),
+            commit_peak_pending_requests: self.commit_peak_pending_requests.load(),
+            commit_over_80_since_us: self.commit_over_80_since_us.load(),
+            commit_queue_latency_us: self.commit_queue_latency_us.snapshot(),
         }
     }
 }
