@@ -295,7 +295,17 @@ async def _call_tool(mcp: Any, ctx: Any, name: str, args: dict[str, Any]) -> Any
 
 
 async def _read_resource_json(mcp: Any, uri: str) -> Any:
-    contents = await mcp._read_resource_mcp(f"{uri}?format=json" if "?" not in uri else f"{uri}&format=json")
+    read_uri = uri
+    if "?" in uri:
+        # Avoid duplicating format=json when callers already include it.
+        _base, query = uri.split("?", 1)
+        has_format = any(part.split("=", 1)[0] == "format" for part in query.split("&") if part)
+        if not has_format:
+            read_uri = f"{uri}&format=json"
+    else:
+        read_uri = f"{uri}?format=json"
+
+    contents = await mcp._read_resource_mcp(read_uri)
     if not contents:
         raise RuntimeError(f"resource returned no contents: {uri}")
     item = contents[0]
@@ -645,14 +655,24 @@ async def _generate() -> dict[str, Any]:
                 "limit": 10,
             },
         )
-        await record_tool_error(
+        await record_tool(
             "search_messages",
-            "empty_query_error",
+            "empty_query_returns_empty",
             {
                 "project_key": project_slug,
                 "query": "",
+                "limit": 10,
             },
-            "empty",
+        )
+        await record_tool_error(
+            "search_messages",
+            "project_not_found_error",
+            {
+                "project_key": "ZzzNonExistentProject",
+                "query": "Hello",
+                "limit": 10,
+            },
+            "not found",
         )
         await record_tool(
             "summarize_thread",
@@ -664,14 +684,26 @@ async def _generate() -> dict[str, Any]:
                 "llm_mode": False,
             },
         )
-        await record_tool_error(
+        await record_tool(
             "summarize_thread",
-            "empty_thread_id_error",
+            "empty_thread_id_returns_empty_digest",
             {
                 "project_key": project_slug,
                 "thread_id": "",
+                "include_examples": True,
+                "llm_mode": False,
             },
-            "empty",
+        )
+        await record_tool_error(
+            "summarize_thread",
+            "project_not_found_error",
+            {
+                "project_key": "ZzzNonExistentProject",
+                "thread_id": str(message_id),
+                "include_examples": True,
+                "llm_mode": False,
+            },
+            "not found",
         )
 
         await record_tool(
@@ -767,15 +799,24 @@ async def _generate() -> dict[str, Any]:
                 "extend_seconds": 600,
             },
         )
-        await record_tool_error(
+        await record_tool(
             "renew_file_reservations",
-            "insufficient_extend_seconds_error",
+            "extend_seconds_clamped_to_60",
             {
                 "project_key": project_slug,
                 "agent_name": "BlueLake",
                 "extend_seconds": 5,
             },
-            "60",
+        )
+        await record_tool_error(
+            "renew_file_reservations",
+            "agent_not_found_error",
+            {
+                "project_key": project_slug,
+                "agent_name": "ZzzNonExistentAgent",
+                "extend_seconds": 600,
+            },
+            "not found",
         )
         await record_tool(
             "release_file_reservations",
@@ -896,7 +937,11 @@ async def _generate() -> dict[str, Any]:
         resource_uris: list[tuple[str, str]] = []
 
         resource_uris.append(("resource://config/environment", "default"))
+        # Static resources with query params must be routed via FastMCP URI templates.
+        # Include explicit format cases so the Rust router must match `...?format=json`.
+        resource_uris.append(("resource://config/environment?format=json", "default_format_json"))
         resource_uris.append(("resource://projects", "all_projects"))
+        resource_uris.append(("resource://projects?format=json", "all_projects_format_json"))
         resource_uris.append((f"resource://project/{project_slug}", "project_detail"))
         resource_uris.append((f"resource://identity/{project_slug}", "identity_project"))
         resource_uris.append((f"resource://agents/{project_slug}", "agents_list"))
@@ -906,9 +951,13 @@ async def _generate() -> dict[str, Any]:
         resource_uris.append((f"resource://thread/{message_id}?project={project_slug}&include_bodies=true", "thread_detail"))
         resource_uris.append((f"resource://file_reservations/{project_slug}?active_only=false", "file_reservations_all"))
         resource_uris.append((f"resource://tooling/directory", "tooling_directory"))
+        resource_uris.append((f"resource://tooling/directory?format=json", "tooling_directory_format_json"))
         resource_uris.append((f"resource://tooling/schemas", "tooling_schemas"))
+        resource_uris.append((f"resource://tooling/schemas?format=json", "tooling_schemas_format_json"))
         resource_uris.append((f"resource://tooling/metrics", "tooling_metrics"))
+        resource_uris.append((f"resource://tooling/metrics?format=json", "tooling_metrics_format_json"))
         resource_uris.append((f"resource://tooling/locks", "tooling_locks"))
+        resource_uris.append((f"resource://tooling/locks?format=json", "tooling_locks_format_json"))
         resource_uris.append((f"resource://tooling/capabilities/BlueLake?project={project_slug}", "tooling_capabilities"))
         resource_uris.append((f"resource://tooling/recent/60?agent=BlueLake&project={project_slug}", "tooling_recent"))
         resource_uris.append((f"resource://views/urgent-unread/GreenCastle?project={project_slug}&limit=10", "urgent_unread"))

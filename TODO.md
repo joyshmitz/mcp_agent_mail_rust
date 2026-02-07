@@ -126,7 +126,7 @@
 - [ ] Maintain perf regression notes in `FEATURE_PARITY.md` or dedicated doc.
 
 ## 10. Dependency Integration (Local /dp Crates)
-- [ ] Confirm zero direct `tokio` usage in code paths (only via optional deps).
+- [x] Confirm zero direct `tokio` usage in code paths (only via optional deps).
 - [x] Use `sqlmodel_rust` for SQLite access (no direct `rusqlite`).
 - [x] Use `asupersync` for HTTP + async runtime.
 - [x] Use `frankentui` (`ftui`) for CLI rendering.
