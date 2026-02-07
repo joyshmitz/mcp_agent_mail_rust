@@ -4249,6 +4249,7 @@ dependencies = [
  "ftui 0.1.1",
  "ftui-extras 0.1.1",
  "ftui-runtime 0.1.1",
+ "ftui-widgets 0.1.1",
  "glob",
  "include_dir",
  "jsonwebtoken",

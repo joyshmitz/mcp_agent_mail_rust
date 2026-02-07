@@ -10,7 +10,7 @@ Usage: am [serve] [options] [-- <extra args for `mcp-agent-mail serve`>]
 
 Convenience runner for local MCP Agent Mail development.
 Defaults:
-- HTTP_PATH=/mcp/
+- MCP transport path (`/mcp/`)
 - LOG_RICH_ENABLED=true
 - host=127.0.0.1, port=8765
 - loads HTTP_BEARER_TOKEN from ~/mcp_agent_mail/.env if not set
@@ -19,13 +19,18 @@ Options:
   --host <host>          Server host (default: 127.0.0.1)
   --port <port>          Server port (default: 8765)
   --path <mcp|api|/x/>   Base path (default: mcp)
+  --mcp                  Shortcut for --path mcp
+  --api                  Shortcut for --path api
   --env-file <path>      Env file for HTTP_BEARER_TOKEN (default: ~/mcp_agent_mail/.env)
   --no-auth              Unset HTTP_BEARER_TOKEN for this run
+  --no-tui               Disable interactive TUI (headless mode)
   -h, --help             Show help
 
 Examples:
+  scripts/am
   scripts/am serve
   scripts/am --path api
+  scripts/am --api
   scripts/am --host 0.0.0.0 --port 9000
 EOF
 }
@@ -71,6 +76,7 @@ port="8765"
 path_mode="mcp"
 env_file="${HOME}/mcp_agent_mail/.env"
 no_auth=0
+no_tui=0
 extra_args=()
 
 while [[ $# -gt 0 ]]; do
@@ -87,12 +93,24 @@ while [[ $# -gt 0 ]]; do
       path_mode="${2:-}"
       shift 2
       ;;
+    --mcp)
+      path_mode="mcp"
+      shift
+      ;;
+    --api)
+      path_mode="api"
+      shift
+      ;;
     --env-file)
       env_file="${2:-}"
       shift 2
       ;;
     --no-auth)
       no_auth=1
+      shift
+      ;;
+    --no-tui)
+      no_tui=1
       shift
       ;;
     -h|--help)
@@ -112,7 +130,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-export HTTP_PATH="$(normalize_http_path "$path_mode")"
+resolved_path="$(normalize_http_path "$path_mode")"
 export LOG_RICH_ENABLED="${LOG_RICH_ENABLED:-true}"
 
 if [[ "$no_auth" -eq 1 ]]; then
@@ -129,7 +147,12 @@ else
   fi
 fi
 
-cd "$repo_root"
-echo "am: host=${host} port=${port} path=${HTTP_PATH} rich=${LOG_RICH_ENABLED}" >&2
+tui_flag=()
+if [[ "$no_tui" -eq 1 ]]; then
+  tui_flag=(--no-tui)
+fi
 
-exec cargo run -p mcp-agent-mail -- serve --host "$host" --port "$port" "${extra_args[@]}"
+cd "$repo_root"
+echo "am: host=${host} port=${port} path=${resolved_path} tui=$([[ "$no_tui" -eq 0 ]] && echo on || echo off) rich=${LOG_RICH_ENABLED}" >&2
+
+exec cargo run -p mcp-agent-mail -- serve --host "$host" --port "$port" --path "$resolved_path" "${tui_flag[@]}" "${extra_args[@]}"

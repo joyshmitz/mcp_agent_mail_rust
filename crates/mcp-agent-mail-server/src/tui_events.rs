@@ -35,6 +35,97 @@ pub enum MailEventKind {
     ServerShutdown,
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// EventSeverity — derived importance level for filtering
+// ──────────────────────────────────────────────────────────────────────
+
+/// Severity level derived from event data, used for verbosity filtering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventSeverity {
+    /// High-frequency background noise (tool starts, health pulses).
+    Trace,
+    /// Routine operational detail (tool completions, successful HTTP).
+    Debug,
+    /// Noteworthy business events (messages, reservations, lifecycle).
+    Info,
+    /// Abnormal but non-critical (HTTP 4xx, server shutdown).
+    Warn,
+    /// Failures requiring attention (HTTP 5xx).
+    Error,
+}
+
+impl EventSeverity {
+    /// Short badge label for rendering.
+    #[must_use]
+    pub const fn badge(self) -> &'static str {
+        match self {
+            Self::Trace => "TRC",
+            Self::Debug => "DBG",
+            Self::Info => "INF",
+            Self::Warn => "WRN",
+            Self::Error => "ERR",
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// VerbosityTier — preset filter levels
+// ──────────────────────────────────────────────────────────────────────
+
+/// Preset verbosity tiers controlling which severity levels are visible.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerbosityTier {
+    /// Only errors and warnings.
+    Minimal,
+    /// Errors, warnings, and info (default).
+    #[default]
+    Standard,
+    /// Errors, warnings, info, and debug.
+    Verbose,
+    /// Everything including trace.
+    All,
+}
+
+impl VerbosityTier {
+    /// Whether a given severity passes this tier's filter.
+    #[must_use]
+    pub const fn includes(self, severity: EventSeverity) -> bool {
+        match self {
+            Self::All => true,
+            Self::Verbose => !matches!(severity, EventSeverity::Trace),
+            Self::Standard => matches!(
+                severity,
+                EventSeverity::Info | EventSeverity::Warn | EventSeverity::Error
+            ),
+            Self::Minimal => matches!(severity, EventSeverity::Warn | EventSeverity::Error),
+        }
+    }
+
+    /// Cycle to the next tier.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Minimal => Self::Standard,
+            Self::Standard => Self::Verbose,
+            Self::Verbose => Self::All,
+            Self::All => Self::Minimal,
+        }
+    }
+
+    /// Short display label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Minimal => "Minimal",
+            Self::Standard => "Standard",
+            Self::Verbose => "Verbose",
+            Self::All => "All",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AgentSummary {
     pub name: String,
@@ -372,6 +463,35 @@ impl MailEvent {
             timestamp_micros: 0,
             source: EventSource::Lifecycle,
             redacted: false,
+        }
+    }
+
+    /// Derive severity from the event data.
+    ///
+    /// HTTP severity depends on status code; tool starts and health pulses
+    /// are trace-level; tool completions are debug; messages, reservations,
+    /// and lifecycle events are info; server shutdown is warn.
+    #[must_use]
+    pub const fn severity(&self) -> EventSeverity {
+        match self {
+            Self::ToolCallStart { .. } | Self::HealthPulse { .. } => EventSeverity::Trace,
+            Self::ToolCallEnd { .. } => EventSeverity::Debug,
+            Self::MessageSent { .. }
+            | Self::MessageReceived { .. }
+            | Self::ReservationGranted { .. }
+            | Self::ReservationReleased { .. }
+            | Self::AgentRegistered { .. }
+            | Self::ServerStarted { .. } => EventSeverity::Info,
+            Self::HttpRequest { status, .. } => {
+                if *status >= 500 {
+                    EventSeverity::Error
+                } else if *status >= 400 {
+                    EventSeverity::Warn
+                } else {
+                    EventSeverity::Debug
+                }
+            }
+            Self::ServerShutdown { .. } => EventSeverity::Warn,
         }
     }
 
@@ -1158,5 +1278,164 @@ mod tests {
         assert_send_sync::<MailEvent>();
         assert_send_sync::<DbStatSnapshot>();
         assert_send_sync::<AgentSummary>();
+    }
+
+    // ── EventSeverity tests ────────────────────────────────────────
+
+    #[test]
+    fn severity_badge_values() {
+        assert_eq!(EventSeverity::Trace.badge(), "TRC");
+        assert_eq!(EventSeverity::Debug.badge(), "DBG");
+        assert_eq!(EventSeverity::Info.badge(), "INF");
+        assert_eq!(EventSeverity::Warn.badge(), "WRN");
+        assert_eq!(EventSeverity::Error.badge(), "ERR");
+    }
+
+    #[test]
+    fn severity_ordering() {
+        assert!(EventSeverity::Trace < EventSeverity::Debug);
+        assert!(EventSeverity::Debug < EventSeverity::Info);
+        assert!(EventSeverity::Info < EventSeverity::Warn);
+        assert!(EventSeverity::Warn < EventSeverity::Error);
+    }
+
+    #[test]
+    fn severity_derived_from_event_kind() {
+        assert_eq!(
+            MailEvent::tool_call_start("t", Value::Null, None, None).severity(),
+            EventSeverity::Trace
+        );
+        assert_eq!(
+            MailEvent::tool_call_end("t", 1, None, 0, 0.0, vec![], None, None).severity(),
+            EventSeverity::Debug
+        );
+        assert_eq!(
+            MailEvent::message_sent(1, "a", vec![], "s", "t", "p").severity(),
+            EventSeverity::Info
+        );
+        assert_eq!(
+            MailEvent::message_received(1, "a", vec![], "s", "t", "p").severity(),
+            EventSeverity::Info
+        );
+        assert_eq!(
+            MailEvent::reservation_granted("a", vec![], true, 60, "p").severity(),
+            EventSeverity::Info
+        );
+        assert_eq!(
+            MailEvent::agent_registered("n", "p", "m", "proj").severity(),
+            EventSeverity::Info
+        );
+        assert_eq!(
+            MailEvent::server_started("http://test", "cfg").severity(),
+            EventSeverity::Info
+        );
+        assert_eq!(MailEvent::server_shutdown().severity(), EventSeverity::Warn);
+        assert_eq!(
+            MailEvent::health_pulse(DbStatSnapshot::default()).severity(),
+            EventSeverity::Trace
+        );
+    }
+
+    #[test]
+    fn severity_http_by_status_code() {
+        assert_eq!(
+            MailEvent::http_request("GET", "/", 200, 1, "127.0.0.1").severity(),
+            EventSeverity::Debug
+        );
+        assert_eq!(
+            MailEvent::http_request("GET", "/", 301, 1, "127.0.0.1").severity(),
+            EventSeverity::Debug
+        );
+        assert_eq!(
+            MailEvent::http_request("GET", "/", 404, 1, "127.0.0.1").severity(),
+            EventSeverity::Warn
+        );
+        assert_eq!(
+            MailEvent::http_request("GET", "/", 500, 1, "127.0.0.1").severity(),
+            EventSeverity::Error
+        );
+    }
+
+    // ── VerbosityTier tests ────────────────────────────────────────
+
+    #[test]
+    fn verbosity_default_is_standard() {
+        assert_eq!(VerbosityTier::default(), VerbosityTier::Standard);
+    }
+
+    #[test]
+    fn verbosity_includes_logic() {
+        // Minimal: only Warn + Error
+        assert!(!VerbosityTier::Minimal.includes(EventSeverity::Trace));
+        assert!(!VerbosityTier::Minimal.includes(EventSeverity::Debug));
+        assert!(!VerbosityTier::Minimal.includes(EventSeverity::Info));
+        assert!(VerbosityTier::Minimal.includes(EventSeverity::Warn));
+        assert!(VerbosityTier::Minimal.includes(EventSeverity::Error));
+
+        // Standard: Info + Warn + Error
+        assert!(!VerbosityTier::Standard.includes(EventSeverity::Trace));
+        assert!(!VerbosityTier::Standard.includes(EventSeverity::Debug));
+        assert!(VerbosityTier::Standard.includes(EventSeverity::Info));
+        assert!(VerbosityTier::Standard.includes(EventSeverity::Warn));
+        assert!(VerbosityTier::Standard.includes(EventSeverity::Error));
+
+        // Verbose: Debug + Info + Warn + Error
+        assert!(!VerbosityTier::Verbose.includes(EventSeverity::Trace));
+        assert!(VerbosityTier::Verbose.includes(EventSeverity::Debug));
+        assert!(VerbosityTier::Verbose.includes(EventSeverity::Info));
+        assert!(VerbosityTier::Verbose.includes(EventSeverity::Warn));
+        assert!(VerbosityTier::Verbose.includes(EventSeverity::Error));
+
+        // All: everything
+        assert!(VerbosityTier::All.includes(EventSeverity::Trace));
+        assert!(VerbosityTier::All.includes(EventSeverity::Debug));
+        assert!(VerbosityTier::All.includes(EventSeverity::Info));
+        assert!(VerbosityTier::All.includes(EventSeverity::Warn));
+        assert!(VerbosityTier::All.includes(EventSeverity::Error));
+    }
+
+    #[test]
+    fn verbosity_next_cycles() {
+        assert_eq!(VerbosityTier::Minimal.next(), VerbosityTier::Standard);
+        assert_eq!(VerbosityTier::Standard.next(), VerbosityTier::Verbose);
+        assert_eq!(VerbosityTier::Verbose.next(), VerbosityTier::All);
+        assert_eq!(VerbosityTier::All.next(), VerbosityTier::Minimal);
+    }
+
+    #[test]
+    fn verbosity_label_values() {
+        assert_eq!(VerbosityTier::Minimal.label(), "Minimal");
+        assert_eq!(VerbosityTier::Standard.label(), "Standard");
+        assert_eq!(VerbosityTier::Verbose.label(), "Verbose");
+        assert_eq!(VerbosityTier::All.label(), "All");
+    }
+
+    #[test]
+    fn verbosity_serde_roundtrip() {
+        for tier in [
+            VerbosityTier::Minimal,
+            VerbosityTier::Standard,
+            VerbosityTier::Verbose,
+            VerbosityTier::All,
+        ] {
+            let json = serde_json::to_string(&tier).expect("serialize");
+            let round: VerbosityTier = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(round, tier);
+        }
+    }
+
+    #[test]
+    fn severity_serde_roundtrip() {
+        for sev in [
+            EventSeverity::Trace,
+            EventSeverity::Debug,
+            EventSeverity::Info,
+            EventSeverity::Warn,
+            EventSeverity::Error,
+        ] {
+            let json = serde_json::to_string(&sev).expect("serialize");
+            let round: EventSeverity = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(round, sev);
+        }
     }
 }

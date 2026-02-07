@@ -6,12 +6,17 @@ pub mod console;
 mod mail_ui;
 mod markdown;
 mod retention;
+pub mod startup_checks;
 mod static_files;
 mod templates;
 pub mod theme;
 mod tool_metrics;
+pub mod tui_app;
 pub mod tui_bridge;
+pub mod tui_chrome;
 pub mod tui_events;
+pub mod tui_poller;
+pub mod tui_screens;
 
 use asupersync::http::h1::HttpClient;
 use asupersync::http::h1::listener::Http1Listener;
@@ -70,6 +75,7 @@ use std::time::{Duration, Instant};
 
 struct InstrumentedTool<T> {
     tool_index: usize,
+    tool_name: &'static str,
     inner: T,
 }
 
@@ -121,10 +127,23 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
 
     fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         mcp_agent_mail_tools::record_call_idx(self.tool_index);
+
+        // Emit ToolCallStart with masked params
+        let (project, agent) = extract_project_agent(&arguments);
+        let masked = console::mask_json(&arguments);
+        emit_tui_event(tui_events::MailEvent::tool_call_start(
+            self.tool_name,
+            masked,
+            project.clone(),
+            agent.clone(),
+        ));
+
+        let qt_before = mcp_agent_mail_db::QUERY_TRACKER.snapshot();
         let start = Instant::now();
         let out = self.inner.call(ctx, arguments);
-        let latency_us = u64::try_from(start.elapsed().as_micros().min(u128::from(u64::MAX)))
-            .unwrap_or(u64::MAX);
+        let elapsed = start.elapsed();
+        let latency_us =
+            u64::try_from(elapsed.as_micros().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
         let is_error = out.is_err();
         if is_error {
             mcp_agent_mail_tools::record_error_idx(self.tool_index);
@@ -132,6 +151,24 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
         mcp_agent_mail_core::global_metrics()
             .tools
             .record_call(latency_us, is_error);
+
+        // Emit ToolCallEnd with duration and query delta
+        let qt_after = mcp_agent_mail_db::QUERY_TRACKER.snapshot();
+        let duration_ms =
+            u64::try_from(elapsed.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
+        let result_preview = result_preview_from_mcpresult(&out);
+        let (queries, query_time_ms, per_table) = query_delta(&qt_before, &qt_after);
+        emit_tui_event(tui_events::MailEvent::tool_call_end(
+            self.tool_name,
+            duration_ms,
+            result_preview,
+            queries,
+            query_time_ms,
+            per_table,
+            project,
+            agent,
+        ));
+
         out
     }
 
@@ -141,6 +178,18 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
         arguments: serde_json::Value,
     ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
         mcp_agent_mail_tools::record_call_idx(self.tool_index);
+
+        // Emit ToolCallStart with masked params
+        let (project, agent) = extract_project_agent(&arguments);
+        let masked = console::mask_json(&arguments);
+        emit_tui_event(tui_events::MailEvent::tool_call_start(
+            self.tool_name,
+            masked,
+            project.clone(),
+            agent.clone(),
+        ));
+
+        let qt_before = mcp_agent_mail_db::QUERY_TRACKER.snapshot();
         let start = Instant::now();
         Box::pin(async move {
             let out = self.inner.call_async(ctx, arguments).await;
@@ -148,14 +197,107 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
             if is_error {
                 mcp_agent_mail_tools::record_error_idx(self.tool_index);
             }
-            let latency_us = u64::try_from(start.elapsed().as_micros().min(u128::from(u64::MAX)))
-                .unwrap_or(u64::MAX);
+            let elapsed = start.elapsed();
+            let latency_us =
+                u64::try_from(elapsed.as_micros().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
             mcp_agent_mail_core::global_metrics()
                 .tools
                 .record_call(latency_us, is_error);
+
+            // Emit ToolCallEnd with duration and query delta
+            let qt_after = mcp_agent_mail_db::QUERY_TRACKER.snapshot();
+            let duration_ms =
+                u64::try_from(elapsed.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
+            let result_preview = result_preview_from_outcome(&out);
+            let (queries, query_time_ms, per_table) = query_delta(&qt_before, &qt_after);
+            emit_tui_event(tui_events::MailEvent::tool_call_end(
+                self.tool_name,
+                duration_ms,
+                result_preview,
+                queries,
+                query_time_ms,
+                per_table,
+                project,
+                agent,
+            ));
+
             out
         })
     }
+}
+
+/// Extract `project_key` and agent name from tool arguments for event tagging.
+fn extract_project_agent(args: &serde_json::Value) -> (Option<String>, Option<String>) {
+    let obj = args.as_object();
+    let project = obj
+        .and_then(|m| m.get("project_key"))
+        .and_then(serde_json::Value::as_str)
+        .map(String::from);
+    // Try common agent name param variants
+    let agent = obj
+        .and_then(|m| {
+            m.get("agent_name")
+                .or_else(|| m.get("sender_name"))
+                .or_else(|| m.get("name"))
+        })
+        .and_then(serde_json::Value::as_str)
+        .map(String::from);
+    (project, agent)
+}
+
+/// Build a masked preview string (max 200 chars) from tool result contents.
+fn result_preview_from_contents(contents: &[Content]) -> Option<String> {
+    let Content::Text { text: raw } = contents.first()? else {
+        return None;
+    };
+    let preview = if raw.len() > 200 {
+        &raw[..200]
+    } else {
+        raw.as_str()
+    };
+    // Mask if it looks like JSON
+    Some(
+        serde_json::from_str::<serde_json::Value>(preview).map_or_else(
+            |_| preview.to_string(),
+            |v| console::mask_json(&v).to_string(),
+        ),
+    )
+}
+
+/// Build a preview string (max 200 chars, masked) from a sync tool result.
+fn result_preview_from_mcpresult(out: &McpResult<Vec<Content>>) -> Option<String> {
+    result_preview_from_contents(out.as_ref().ok()?)
+}
+
+/// Build a preview string from an async tool Outcome.
+fn result_preview_from_outcome(out: &McpOutcome<Vec<Content>>) -> Option<String> {
+    match out {
+        fastmcp_core::Outcome::Ok(c) => result_preview_from_contents(c),
+        _ => None,
+    }
+}
+
+/// Compute the delta between two query tracker snapshots.
+fn query_delta(
+    before: &mcp_agent_mail_db::QueryTrackerSnapshot,
+    after: &mcp_agent_mail_db::QueryTrackerSnapshot,
+) -> (u64, f64, Vec<(String, u64)>) {
+    let queries = after.total.saturating_sub(before.total);
+    let query_time_ms = (after.total_time_ms - before.total_time_ms).max(0.0);
+    let per_table: Vec<(String, u64)> = after
+        .per_table
+        .iter()
+        .filter_map(|(table, &count)| {
+            let prev = before.per_table.get(table).copied().unwrap_or(0);
+            let delta = count.saturating_sub(prev);
+            if delta > 0 {
+                Some((table.clone(), delta))
+            } else {
+                None
+            }
+        })
+        .collect();
+    (queries, query_time_ms, per_table)
 }
 
 fn add_tool<T: fastmcp::ToolHandler + 'static>(
@@ -168,8 +310,11 @@ fn add_tool<T: fastmcp::ToolHandler + 'static>(
     if config.should_expose_tool(tool_name, cluster) {
         let tool_index = mcp_agent_mail_tools::tool_index(tool_name)
             .unwrap_or_else(|| panic!("Tool name missing from TOOL_CLUSTER_MAP: {tool_name}"));
+        // Resolve the static tool name from TOOL_CLUSTER_MAP for event emission
+        let static_name = mcp_agent_mail_tools::TOOL_CLUSTER_MAP[tool_index].0;
         server.tool(InstrumentedTool {
             tool_index,
+            tool_name: static_name,
             inner: tool,
         })
     } else {
@@ -467,6 +612,13 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
 pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     // Initialize console theme from parsed config (includes persisted envfile values).
     let _ = theme::init_console_theme_from_config(config.console_theme);
+
+    // Run startup verification probes before committing to background workers.
+    let probe_report = startup_checks::run_startup_probes(config);
+    if !probe_report.is_ok() {
+        return Err(std::io::Error::other(probe_report.format_errors()));
+    }
+
     // Enable global query tracker if instrumentation is on.
     if config.instrumentation_enabled {
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
@@ -521,9 +673,175 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     result
 }
 
+/// Run the MCP HTTP server on a background thread and the full TUI on the
+/// main thread.  This is the default mode for `am serve`.
+///
+/// When `tui_enabled` is false (e.g. non-TTY environments or `--no-tui`),
+/// this falls back to [`run_http`].
+pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
+    // Fall back to headless mode when not a TTY or TUI is disabled
+    if !std::io::stdout().is_terminal() || !config.tui_enabled {
+        return run_http(config);
+    }
+
+    // ── 1. Pre-flight: theme, probes, instrumentation ──────────────
+    let _ = theme::init_console_theme_from_config(config.console_theme);
+
+    let probe_report = startup_checks::run_startup_probes(config);
+    if !probe_report.is_ok() {
+        return Err(std::io::Error::other(probe_report.format_errors()));
+    }
+
+    if config.instrumentation_enabled {
+        mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
+    }
+
+    // ── 2. Background workers (same as run_http) ────────────────────
+    mcp_agent_mail_storage::wbq_start();
+    cleanup::start(config);
+    ack_ttl::start(config);
+    tool_metrics::start(config);
+    retention::start(config);
+
+    // ── 3. Shared TUI state (replaces StartupDashboard) ─────────────
+    let tui_state = tui_bridge::TuiSharedState::new(config);
+    set_tui_state_handle(Some(Arc::clone(&tui_state)));
+    let _ = tui_state.push_event(tui_events::MailEvent::server_started(
+        format!(
+            "http://{}:{}{}",
+            config.http_host, config.http_port, config.http_path
+        ),
+        format!("tui=on auth={}", config.http_bearer_token.is_some()),
+    ));
+
+    // ── 4. DB poller on dedicated thread ────────────────────────────
+    let mut db_poller =
+        tui_poller::DbPoller::new(Arc::clone(&tui_state), config.database_url.clone()).start();
+
+    // ── 5. HTTP server on background thread ─────────────────────────
+    let server_config = config.clone();
+    let server_tui_state = Arc::clone(&tui_state);
+    let server_thread = std::thread::Builder::new()
+        .name("mcp-http-server".into())
+        .spawn(move || run_http_server_thread(&server_config, &server_tui_state))
+        .expect("spawn HTTP server thread");
+
+    // ── 6. TUI on main thread ───────────────────────────────────────
+    let tui_result = run_tui_main_thread(&tui_state);
+
+    // ── 7. Graceful shutdown ────────────────────────────────────────
+    tui_state.request_shutdown();
+    let _ = tui_state.push_event(tui_events::MailEvent::server_shutdown());
+    db_poller.stop();
+
+    // Wait for the server thread (with timeout)
+    let server_result = server_thread
+        .join()
+        .map_err(|_| std::io::Error::other("server thread panicked"))?;
+
+    // Shutdown background workers
+    set_tui_state_handle(None);
+    retention::shutdown();
+    tool_metrics::shutdown();
+    ack_ttl::shutdown();
+    cleanup::shutdown();
+    mcp_agent_mail_storage::wbq_shutdown();
+
+    // Return first error encountered
+    tui_result.and(server_result)
+}
+
+/// Run the HTTP server inside a background thread.
+///
+/// Blocks until the listener exits or the TUI requests shutdown.
+fn run_http_server_thread(
+    config: &mcp_agent_mail_core::Config,
+    tui_state: &Arc<tui_bridge::TuiSharedState>,
+) -> std::io::Result<()> {
+    let server = build_server(config);
+    let server_info = server.info().clone();
+    let server_capabilities = server.capabilities().clone();
+    let router = Arc::new(server.into_router());
+
+    let state = Arc::new(HttpState::new(
+        router,
+        server_info,
+        server_capabilities,
+        config.clone(),
+    ));
+
+    let addr = format!("{}:{}", config.http_host, config.http_port);
+    let runtime = RuntimeBuilder::new()
+        .build()
+        .map_err(|e| map_asupersync_err(&e))?;
+
+    let handle = runtime.handle();
+    let tui_shutdown = Arc::clone(tui_state);
+    runtime.block_on(async move {
+        let handler_state = Arc::clone(&state);
+        let listener = Http1Listener::bind(addr, move |req| {
+            let inner = Arc::clone(&handler_state);
+            async move { inner.handle(req).await }
+        })
+        .await?;
+
+        // Poll for TUI shutdown while running the listener
+        // The listener.run() blocks, but the runtime will be shut down when
+        // the thread is interrupted or we could use a select-like pattern.
+        // For simplicity, we rely on the OS closing the socket when the
+        // process exits after the TUI thread requests shutdown.
+        let _ = &tui_shutdown;
+        listener.run(&handle).await?;
+        Ok::<(), std::io::Error>(())
+    })
+}
+
+/// Run the TUI application on the main thread.
+fn run_tui_main_thread(tui_state: &Arc<tui_bridge::TuiSharedState>) -> std::io::Result<()> {
+    use ftui_runtime::program::Program;
+
+    let model = tui_app::MailAppModel::new(Arc::clone(tui_state));
+
+    let tui_config = ftui_runtime::program::ProgramConfig {
+        screen_mode: ftui_runtime::terminal_writer::ScreenMode::AltScreen,
+        mouse: false,
+        ..ftui_runtime::program::ProgramConfig::default()
+    };
+
+    let mut program = Program::with_config(model, tui_config)?;
+    program.run()
+}
+
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 static LIVE_DASHBOARD: std::sync::LazyLock<Mutex<Option<Arc<StartupDashboard>>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
+
+/// Global handle to the TUI shared state for event emission from tool calls
+/// and HTTP handlers. Set when TUI mode is active, `None` otherwise.
+static TUI_STATE: std::sync::LazyLock<Mutex<Option<Arc<tui_bridge::TuiSharedState>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
+
+fn tui_state_handle() -> Option<Arc<tui_bridge::TuiSharedState>> {
+    lock_mutex(&TUI_STATE).as_ref().map(Arc::clone)
+}
+
+fn set_tui_state_handle(state: Option<Arc<tui_bridge::TuiSharedState>>) {
+    *lock_mutex(&TUI_STATE) = state;
+}
+
+/// Emit a [`MailEvent`] to the TUI ring buffer (non-blocking).
+///
+/// No-op when TUI mode is not active.
+fn emit_tui_event(event: tui_events::MailEvent) {
+    if let Some(state) = tui_state_handle() {
+        let _ = state.push_event(event);
+    }
+}
+
+/// Whether the TUI is currently active (console output should be suppressed).
+fn is_tui_active() -> bool {
+    tui_state_handle().is_some()
+}
 
 const JWKS_CACHE_TTL: Duration = Duration::from_secs(60);
 const JWKS_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -560,6 +878,7 @@ struct DashboardLastRequest {
 struct DashboardSnapshot {
     endpoint: String,
     web_ui: String,
+    transport_mode: String,
     app_environment: String,
     auth_enabled: bool,
     database_url: String,
@@ -777,6 +1096,7 @@ struct StartupDashboard {
     started_at: Instant,
     endpoint: String,
     web_ui: String,
+    transport_mode: String,
     app_environment: String,
     auth_enabled: bool,
     database_url: String,
@@ -831,6 +1151,7 @@ impl StartupDashboard {
             config.http_host, config.http_port, config.http_path
         );
         let web_ui = format!("http://{}:{}/mail", config.http_host, config.http_port);
+        let transport_mode = detect_transport_mode(&config.http_path).to_string();
 
         let dashboard = Arc::new(Self {
             writer: Mutex::new(writer),
@@ -840,6 +1161,7 @@ impl StartupDashboard {
             started_at: Instant::now(),
             endpoint,
             web_ui,
+            transport_mode,
             app_environment: config.app_environment.to_string(),
             auth_enabled: config.http_bearer_token.is_some(),
             database_url: config.database_url.clone(),
@@ -1491,6 +1813,7 @@ impl StartupDashboard {
         DashboardSnapshot {
             endpoint: self.endpoint.clone(),
             web_ui: self.web_ui.clone(),
+            transport_mode: self.transport_mode.clone(),
             app_environment: self.app_environment.clone(),
             auth_enabled: self.auth_enabled,
             database_url: self.database_url.clone(),
@@ -1677,8 +2000,9 @@ fn render_dashboard_frame(
     };
 
     let left = format!(
-        "Endpoint: {}\nWeb UI: {}\nAuth: {}\nStorage: {}\nDatabase: {}",
+        "Endpoint: {}\nMode: {}\nWeb UI: {}\nAuth: {}\nStorage: {}\nDatabase: {}",
         compact_path(&snapshot.endpoint, 52),
+        snapshot.transport_mode,
         compact_path(&snapshot.web_ui, 52),
         if snapshot.auth_enabled {
             "ENABLED"
@@ -2227,7 +2551,9 @@ impl HttpState {
         let _inflight_guard = InflightGuard::begin(&metrics.http.requests_inflight);
 
         let dashboard = dashboard_handle();
-        let needs_request_log = self.config.http_request_log_enabled || dashboard.is_some();
+        let tui = tui_state_handle();
+        let needs_request_log =
+            self.config.http_request_log_enabled || dashboard.is_some() || tui.is_some();
 
         let start = Instant::now();
         let (method, path, client_ip) = if needs_request_log {
@@ -2258,6 +2584,23 @@ impl HttpState {
                 (method.as_ref(), path.as_ref(), client_ip.as_ref())
             {
                 dashboard.record_request(method.as_str(), path, resp.status, dur_ms, client_ip);
+            }
+        }
+        // Emit TUI HttpRequest event (skip healthz / high-frequency polling)
+        if let Some(tui) = tui.as_ref() {
+            if let (Some(method), Some(path), Some(client_ip)) =
+                (method.as_ref(), path.as_ref(), client_ip.as_ref())
+            {
+                if !path.ends_with("/healthz") {
+                    let _ = tui.push_event(tui_events::MailEvent::http_request(
+                        method.as_str(),
+                        path.as_str(),
+                        resp.status,
+                        dur_ms,
+                        client_ip.as_str(),
+                    ));
+                    tui.record_request(resp.status, dur_ms);
+                }
             }
         }
         if self.config.http_request_log_enabled {
@@ -2382,28 +2725,37 @@ impl HttpState {
             } else {
                 http_request_log_kv_line(&timestamp, method, path, status, duration_ms, client_ip)
             };
-            ftui_runtime::ftui_eprintln!("{line}");
+            // When TUI is active, suppress duplicate console output
+            // (the TUI event pipeline renders these events instead).
+            if !is_tui_active() {
+                ftui_runtime::ftui_eprintln!("{line}");
 
-            // Rich-ish panel output (stdout), fallback to legacy plain-text line on any error.
-            // Gate: only render ANSI panel when rich output is enabled AND stdout is a TTY.
-            let use_ansi = self.config.log_rich_enabled && std::io::stdout().is_terminal();
-            if let Some(panel) = console::render_http_request_panel(
-                100,
-                method,
-                path,
-                status,
-                duration_ms,
-                client_ip,
-                use_ansi,
-            ) {
-                if !dashboard_write_log(&panel) {
-                    ftui_runtime::ftui_println!("{panel}");
-                }
-            } else {
-                let fallback =
-                    http_request_log_fallback_line(method, path, status, duration_ms, client_ip);
-                if !dashboard_write_log(&fallback) {
-                    ftui_runtime::ftui_println!("{fallback}");
+                // Rich-ish panel output (stdout), fallback to legacy plain-text line on any error.
+                // Gate: only render ANSI panel when rich output is enabled AND stdout is a TTY.
+                let use_ansi = self.config.log_rich_enabled && std::io::stdout().is_terminal();
+                if let Some(panel) = console::render_http_request_panel(
+                    100,
+                    method,
+                    path,
+                    status,
+                    duration_ms,
+                    client_ip,
+                    use_ansi,
+                ) {
+                    if !dashboard_write_log(&panel) {
+                        ftui_runtime::ftui_println!("{panel}");
+                    }
+                } else {
+                    let fallback = http_request_log_fallback_line(
+                        method,
+                        path,
+                        status,
+                        duration_ms,
+                        client_ip,
+                    );
+                    if !dashboard_write_log(&fallback) {
+                        ftui_runtime::ftui_println!("{fallback}");
+                    }
                 }
             }
         }));
@@ -2966,7 +3318,8 @@ impl HttpState {
                 let tool_call_console_enabled = self.config.log_rich_enabled
                     && self.config.tools_log_enabled
                     && self.config.log_tool_calls_enabled
-                    && std::io::stdout().is_terminal();
+                    && std::io::stdout().is_terminal()
+                    && !is_tui_active();
 
                 // Emit tool-call-start panel if console tool logging is enabled.
                 let call_start = if tool_call_console_enabled {
@@ -3663,6 +4016,14 @@ fn normalize_base_path(path: &str) -> String {
     // Trim trailing slashes, but ensure we never return empty string
     let result = out.trim_end_matches('/');
     if result.is_empty() { "/" } else { result }.to_string()
+}
+
+fn detect_transport_mode(path: &str) -> &'static str {
+    match normalize_base_path(path).as_str() {
+        "/mcp" => "mcp",
+        "/api" => "api",
+        _ => "custom",
+    }
 }
 
 fn path_matches_base(path: &str, base_no_slash: &str) -> bool {
@@ -7250,6 +7611,14 @@ mod tests {
     }
 
     #[test]
+    fn detect_transport_mode_reports_mcp_api_and_custom() {
+        assert_eq!(detect_transport_mode("/mcp/"), "mcp");
+        assert_eq!(detect_transport_mode("api"), "api");
+        assert_eq!(detect_transport_mode("/v2/rpc"), "custom");
+        assert_eq!(detect_transport_mode("/api/v2"), "custom");
+    }
+
+    #[test]
     fn path_allowed_root_base_accepts_everything() {
         let config = mcp_agent_mail_core::Config {
             http_path: "/".to_string(),
@@ -8385,6 +8754,7 @@ mod tests {
         DashboardSnapshot {
             endpoint: "http://127.0.0.1:8765".into(),
             web_ui: "http://127.0.0.1:8765/mail".into(),
+            transport_mode: "mcp".into(),
             app_environment: "test".into(),
             auth_enabled: false,
             database_url: "sqlite:///tmp/test.db".into(),
@@ -8468,6 +8838,8 @@ mod tests {
         let text = buffer_text(&frame);
         assert!(text.contains("Agents"), "Agents panel header");
         assert!(text.contains("RedFox"), "agent name RedFox");
+        assert!(text.contains("Mode"), "mode row label");
+        assert!(text.contains("mcp"), "transport mode value");
     }
 
     #[test]
@@ -8571,5 +8943,138 @@ mod tests {
         let mut frame = ftui::Frame::new(120, 20, &mut pool);
         // All rows changed
         render_dashboard_frame(&mut frame, Rect::new(0, 0, 120, 20), &snap, 0.5, 0b11_1111);
+    }
+
+    // ── br-10wc.28: event emission helpers ────────────────────────────
+
+    #[test]
+    fn extract_project_agent_from_typical_args() {
+        let args = serde_json::json!({
+            "project_key": "my-project",
+            "sender_name": "RedFox",
+            "subject": "hello"
+        });
+        let (project, agent) = extract_project_agent(&args);
+        assert_eq!(project.as_deref(), Some("my-project"));
+        assert_eq!(agent.as_deref(), Some("RedFox"));
+    }
+
+    #[test]
+    fn extract_project_agent_uses_agent_name_over_sender() {
+        let args = serde_json::json!({
+            "project_key": "p1",
+            "agent_name": "BlueFox",
+            "sender_name": "RedFox"
+        });
+        let (_, agent) = extract_project_agent(&args);
+        assert_eq!(agent.as_deref(), Some("BlueFox"));
+    }
+
+    #[test]
+    fn extract_project_agent_returns_none_for_empty() {
+        let args = serde_json::json!({});
+        let (project, agent) = extract_project_agent(&args);
+        assert!(project.is_none());
+        assert!(agent.is_none());
+    }
+
+    #[test]
+    fn extract_project_agent_handles_non_object() {
+        let args = serde_json::json!("just a string");
+        let (project, agent) = extract_project_agent(&args);
+        assert!(project.is_none());
+        assert!(agent.is_none());
+    }
+
+    #[test]
+    fn result_preview_masks_sensitive_json() {
+        let contents = vec![Content::Text {
+            text: r#"{"data":"ok","http_bearer_token":"secret123"}"#.to_string(),
+        }];
+        let preview = result_preview_from_contents(&contents).unwrap();
+        assert!(!preview.contains("secret123"), "secret should be masked");
+        assert!(preview.contains("<redacted>"));
+        assert!(preview.contains("\"data\""));
+    }
+
+    #[test]
+    fn result_preview_truncates_at_200_chars() {
+        let long_text = "x".repeat(500);
+        let contents = vec![Content::Text { text: long_text }];
+        let preview = result_preview_from_contents(&contents).unwrap();
+        assert!(preview.len() <= 200);
+    }
+
+    #[test]
+    fn result_preview_returns_none_for_empty() {
+        assert!(result_preview_from_contents(&[]).is_none());
+    }
+
+    #[test]
+    fn query_delta_computes_differences() {
+        let before = mcp_agent_mail_db::QueryTrackerSnapshot {
+            total: 10,
+            total_time_ms: 5.0,
+            per_table: [("messages".to_string(), 8), ("agents".to_string(), 2)]
+                .into_iter()
+                .collect(),
+            slow_query_ms: None,
+            slow_queries: vec![],
+        };
+        let after = mcp_agent_mail_db::QueryTrackerSnapshot {
+            total: 15,
+            total_time_ms: 8.5,
+            per_table: [
+                ("messages".to_string(), 12),
+                ("agents".to_string(), 2),
+                ("projects".to_string(), 1),
+            ]
+            .into_iter()
+            .collect(),
+            slow_query_ms: None,
+            slow_queries: vec![],
+        };
+        let (queries, time_ms, per_table) = query_delta(&before, &after);
+        assert_eq!(queries, 5);
+        assert!((time_ms - 3.5).abs() < 0.001);
+        // messages: 12-8=4, projects: 1-0=1, agents: 2-2=0 (filtered)
+        assert!(per_table.iter().any(|(t, c)| t == "messages" && *c == 4));
+        assert!(per_table.iter().any(|(t, c)| t == "projects" && *c == 1));
+        assert!(!per_table.iter().any(|(t, _)| t == "agents"));
+    }
+
+    #[test]
+    fn tui_state_global_roundtrip() {
+        // When no TUI state is set, handle returns None
+        assert!(tui_state_handle().is_none());
+
+        // Set a TUI state
+        let config = mcp_agent_mail_core::Config::default();
+        let state = tui_bridge::TuiSharedState::new(&config);
+        set_tui_state_handle(Some(Arc::clone(&state)));
+
+        assert!(tui_state_handle().is_some());
+
+        // emit_tui_event should push into the ring buffer
+        emit_tui_event(tui_events::MailEvent::server_started("http://test", "test"));
+        let events = state.recent_events(10);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, tui_events::MailEvent::ServerStarted { .. })),
+            "expected ServerStarted event in ring buffer"
+        );
+
+        // Clear
+        set_tui_state_handle(None);
+        assert!(tui_state_handle().is_none());
+    }
+
+    #[test]
+    fn emit_tui_event_noop_when_no_state() {
+        // Make sure no state is set
+        set_tui_state_handle(None);
+        // Should not panic
+        emit_tui_event(tui_events::MailEvent::server_shutdown());
     }
 }

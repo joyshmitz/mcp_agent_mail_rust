@@ -19,6 +19,7 @@ include_dir.workspace = true
 ftui.workspace = true
 ftui-extras.workspace = true
 ftui-runtime = { workspace = true, features = ["stdio-capture"] }
+ftui-widgets.workspace = true
 fastmcp.workspace = true
 fastmcp-core.workspace = true
 fastmcp-protocol.workspace = true

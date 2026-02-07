@@ -191,6 +191,9 @@ pub struct Config {
     pub console_split_mode: ConsoleSplitMode,
     pub console_split_ratio_percent: u16,
     pub console_theme: ConsoleThemeId,
+
+    // TUI
+    pub tui_enabled: bool,
 }
 
 /// Application environment
@@ -492,6 +495,7 @@ impl Default for Config {
             console_split_mode: ConsoleSplitMode::Inline,
             console_split_ratio_percent: 30,
             console_theme: ConsoleThemeId::CyberpunkAurora,
+            tui_enabled: true,
         }
     }
 }
@@ -927,6 +931,8 @@ impl Config {
                 config.console_theme = theme;
             }
         }
+
+        config.tui_enabled = env_bool("TUI_ENABLED", config.tui_enabled);
 
         config
     }
@@ -1724,5 +1730,25 @@ mod tests {
         // the final check `profile_clusters.is_empty() && profile_tools.is_empty()`
         // returns true -- it acts as a pass-through.
         assert!(config.should_expose_tool("anything", "whatever"));
+    }
+
+    #[test]
+    fn tui_enabled_defaults_to_true() {
+        let config = Config::default();
+        assert!(config.tui_enabled);
+    }
+
+    #[test]
+    fn tui_enabled_from_env_false() {
+        let _env = TestEnvOverrideGuard::set(&[("TUI_ENABLED", "false")]);
+        let config = Config::from_env();
+        assert!(!config.tui_enabled);
+    }
+
+    #[test]
+    fn tui_enabled_from_env_true() {
+        let _env = TestEnvOverrideGuard::set(&[("TUI_ENABLED", "true")]);
+        let config = Config::from_env();
+        assert!(config.tui_enabled);
     }
 }

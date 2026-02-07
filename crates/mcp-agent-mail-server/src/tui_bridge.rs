@@ -134,7 +134,8 @@ impl TuiSharedState {
             if sparkline.len() >= REQUEST_SPARKLINE_CAPACITY {
                 let _ = sparkline.pop_front();
             }
-            sparkline.push_back(duration_ms as f64);
+            let duration_u32 = u32::try_from(duration_ms).unwrap_or(u32::MAX);
+            sparkline.push_back(f64::from(duration_u32));
         }
     }
 
@@ -205,10 +206,11 @@ mod tests {
     use std::thread;
 
     fn config_for_test() -> Config {
-        let mut config = Config::default();
-        config.database_url = "postgres://alice:supersecret@localhost:5432/mail".to_string();
-        config.http_bearer_token = Some("token".to_string());
-        config
+        Config {
+            database_url: "postgres://alice:supersecret@localhost:5432/mail".to_string(),
+            http_bearer_token: Some("token".to_string()),
+            ..Config::default()
+        }
     }
 
     #[test]
