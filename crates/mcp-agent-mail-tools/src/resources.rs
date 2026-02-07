@@ -1159,6 +1159,38 @@ pub fn tooling_metrics_query(ctx: &McpContext, query: String) -> McpResult<Strin
     tooling_metrics(ctx)
 }
 
+/// Core system metrics response.
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolingMetricsCoreResponse {
+    pub generated_at: Option<String>,
+    pub metrics: mcp_agent_mail_core::GlobalMetricsSnapshot,
+}
+
+/// Get core system metrics (HTTP/DB/Storage).
+#[resource(
+    uri = "resource://tooling/metrics_core",
+    description = "Core system metrics (HTTP/DB/Storage)"
+)]
+pub fn tooling_metrics_core(_ctx: &McpContext) -> McpResult<String> {
+    let response = ToolingMetricsCoreResponse {
+        generated_at: None,
+        metrics: mcp_agent_mail_core::global_metrics().snapshot(),
+    };
+
+    serde_json::to_string(&response)
+        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+}
+
+/// Get core system metrics (query-aware variant).
+#[resource(
+    uri = "resource://tooling/metrics_core?{query}",
+    description = "Core system metrics (HTTP/DB/Storage) (with query)"
+)]
+pub fn tooling_metrics_core_query(ctx: &McpContext, query: String) -> McpResult<String> {
+    let _query = parse_query(&query);
+    tooling_metrics_core(ctx)
+}
+
 /// Archive lock info
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchiveLock {

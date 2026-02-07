@@ -29,6 +29,10 @@ fn redact_database_url(url: &str) -> String {
     url.to_string()
 }
 
+const fn us_to_ms_ceil(us: u64) -> u64 {
+    us.saturating_add(999).saturating_div(1000)
+}
+
 /// Try to write an agent profile to the git archive. Failures are logged
 /// but do not fail the tool call – the DB is the source of truth.
 ///
@@ -64,6 +68,23 @@ pub struct HealthCheckResponse {
     pub http_host: String,
     pub http_port: u16,
     pub database_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_utilization: Option<PoolUtilizationResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolUtilizationResponse {
+    pub active: u64,
+    pub idle: u64,
+    pub total: u64,
+    pub pending: u64,
+    pub peak_active: u64,
+    pub utilization_pct: u64,
+    pub acquire_p50_ms: u64,
+    pub acquire_p95_ms: u64,
+    pub acquire_p99_ms: u64,
+    pub over_80_for_s: u64,
+    pub warning: bool,
 }
 
 /// Project response
@@ -120,6 +141,18 @@ pub struct CommitInfo {
 #[tool(description = "Return basic readiness information for the Agent Mail server.")]
 pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     let config = Config::from_env();
+    let pool = get_db_pool()?;
+    pool.sample_pool_stats_now();
+    let metrics = mcp_agent_mail_core::global_metrics().snapshot();
+
+    let now_us = u64::try_from(mcp_agent_mail_db::now_micros()).unwrap_or(0);
+    let over_80_for_s = if metrics.db.pool_over_80_since_us == 0 {
+        0
+    } else {
+        now_us
+            .saturating_sub(metrics.db.pool_over_80_since_us)
+            .saturating_div(1_000_000)
+    };
 
     let response = HealthCheckResponse {
         status: "ok".to_string(),
@@ -127,6 +160,19 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
         http_host: config.http_host,
         http_port: config.http_port,
         database_url: redact_database_url(&config.database_url),
+        pool_utilization: Some(PoolUtilizationResponse {
+            active: metrics.db.pool_active_connections,
+            idle: metrics.db.pool_idle_connections,
+            total: metrics.db.pool_total_connections,
+            pending: metrics.db.pool_pending_requests,
+            peak_active: metrics.db.pool_peak_active_connections,
+            utilization_pct: metrics.db.pool_utilization_pct,
+            acquire_p50_ms: us_to_ms_ceil(metrics.db.pool_acquire_latency_us.p50),
+            acquire_p95_ms: us_to_ms_ceil(metrics.db.pool_acquire_latency_us.p95),
+            acquire_p99_ms: us_to_ms_ceil(metrics.db.pool_acquire_latency_us.p99),
+            over_80_for_s,
+            warning: over_80_for_s >= 300,
+        }),
     };
 
     serde_json::to_string(&response)
@@ -701,6 +747,7 @@ mod tests {
             http_host: "0.0.0.0".into(),
             http_port: 8765,
             database_url: "sqlite:///data/test.db".into(),
+            pool_utilization: None,
         };
         let json: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
