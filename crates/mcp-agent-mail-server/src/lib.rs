@@ -853,6 +853,10 @@ impl StartupDashboard {
         for line in console::render_startup_banner(&params) {
             self.log_line(&line);
         }
+        // Capabilities banner section.
+        for line in self.console_caps.banner_lines() {
+            self.log_line(&line);
+        }
         let summary = lock_mutex(&self.console_layout).summary_line();
         self.log_line(&format!("Console: {summary}"));
         self.log_line(&self.console_caps.one_liner());
@@ -1157,6 +1161,7 @@ impl StartupDashboard {
             aid::SHOW_CONFIG => {
                 let summary = lock_mutex(&self.console_layout).summary_line();
                 self.log_line(&format!("Console: {summary}"));
+                self.log_line(&format!("  {}", self.console_caps.help_hint()));
             }
 
             _ => {

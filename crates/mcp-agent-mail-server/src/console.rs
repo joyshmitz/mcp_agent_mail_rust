@@ -2692,4 +2692,156 @@ mod tests {
             // HUD renderer called as fallback.
         });
     }
+
+    // ── ConsoleCaps tests ──
+
+    #[test]
+    fn console_caps_oneliner_format_is_stable() {
+        let caps = ConsoleCaps {
+            true_color: true,
+            osc8_hyperlinks: false,
+            mouse_sgr: true,
+            sync_output: true,
+            kitty_keyboard: false,
+            focus_events: false,
+            in_mux: false,
+        };
+        let line = caps.one_liner();
+        assert!(line.starts_with("ConsoleCaps:"));
+        assert!(line.contains("tc=1"));
+        assert!(line.contains("osc8=0"));
+        assert!(line.contains("mouse=1"));
+        assert!(line.contains("sync=1"));
+        assert!(line.contains("kitty=0"));
+        assert!(line.contains("focus=0"));
+        assert!(line.contains("mux=0"));
+    }
+
+    #[test]
+    fn console_caps_oneliner_all_keys_present() {
+        let caps = ConsoleCaps {
+            true_color: false,
+            osc8_hyperlinks: false,
+            mouse_sgr: false,
+            sync_output: false,
+            kitty_keyboard: false,
+            focus_events: false,
+            in_mux: false,
+        };
+        let line = caps.one_liner();
+        for key in [
+            "tc=", "osc8=", "mouse=", "sync=", "kitty=", "focus=", "mux=",
+        ] {
+            assert!(line.contains(key), "missing key '{key}' in: {line}");
+        }
+    }
+
+    #[test]
+    fn console_caps_oneliner_is_ascii_only() {
+        let caps = ConsoleCaps {
+            true_color: true,
+            osc8_hyperlinks: true,
+            mouse_sgr: true,
+            sync_output: true,
+            kitty_keyboard: true,
+            focus_events: true,
+            in_mux: true,
+        };
+        let line = caps.one_liner();
+        assert!(line.is_ascii(), "one-liner must be ASCII: {line}");
+    }
+
+    #[test]
+    fn console_caps_banner_lines_not_empty() {
+        let caps = ConsoleCaps {
+            true_color: true,
+            osc8_hyperlinks: false,
+            mouse_sgr: false,
+            sync_output: true,
+            kitty_keyboard: false,
+            focus_events: false,
+            in_mux: false,
+        };
+        let lines = caps.banner_lines();
+        assert!(!lines.is_empty());
+        let joined = lines.join("\n");
+        let stripped = strip_ansi_content(&joined);
+        assert!(
+            stripped.contains("Console Capabilities"),
+            "expected 'Console Capabilities' in banner: {stripped}"
+        );
+    }
+
+    #[test]
+    fn console_caps_banner_mux_warning() {
+        let caps = ConsoleCaps {
+            true_color: false,
+            osc8_hyperlinks: false,
+            mouse_sgr: false,
+            sync_output: false,
+            kitty_keyboard: false,
+            focus_events: false,
+            in_mux: true,
+        };
+        let lines = caps.banner_lines();
+        let joined = lines.join("\n");
+        let stripped = strip_ansi_content(&joined);
+        assert!(
+            stripped.contains("multiplexer"),
+            "mux warning expected: {stripped}"
+        );
+    }
+
+    #[test]
+    fn console_caps_help_hint_contains_enabled_caps() {
+        let caps = ConsoleCaps {
+            true_color: true,
+            osc8_hyperlinks: true,
+            mouse_sgr: false,
+            sync_output: false,
+            kitty_keyboard: false,
+            focus_events: false,
+            in_mux: false,
+        };
+        let hint = caps.help_hint();
+        assert!(hint.contains("tc"), "expected 'tc' in hint: {hint}");
+        assert!(hint.contains("osc8"), "expected 'osc8' in hint: {hint}");
+        assert!(
+            !hint.contains("mouse"),
+            "mouse disabled, should not appear: {hint}"
+        );
+    }
+
+    #[test]
+    fn console_caps_help_hint_none_when_empty() {
+        let caps = ConsoleCaps {
+            true_color: false,
+            osc8_hyperlinks: false,
+            mouse_sgr: false,
+            sync_output: false,
+            kitty_keyboard: false,
+            focus_events: false,
+            in_mux: false,
+        };
+        let hint = caps.help_hint();
+        assert_eq!(hint, "Caps: none");
+    }
+
+    #[test]
+    fn console_caps_from_capabilities_maps_fields() {
+        let mut ftui_caps = ftui::TerminalCapabilities::basic();
+        ftui_caps.true_color = true;
+        ftui_caps.osc8_hyperlinks = true;
+        ftui_caps.mouse_sgr = false;
+        ftui_caps.sync_output = true;
+        ftui_caps.kitty_keyboard = false;
+        ftui_caps.focus_events = true;
+        let caps = ConsoleCaps::from_capabilities(&ftui_caps);
+        assert!(caps.true_color);
+        assert!(caps.osc8_hyperlinks);
+        assert!(!caps.mouse_sgr);
+        assert!(caps.sync_output);
+        assert!(!caps.kitty_keyboard);
+        assert!(caps.focus_events);
+    }
 }
