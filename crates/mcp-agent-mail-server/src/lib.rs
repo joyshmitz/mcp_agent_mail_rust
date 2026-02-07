@@ -10,6 +10,7 @@ mod static_files;
 mod templates;
 pub mod theme;
 mod tool_metrics;
+pub mod tui_events;
 
 use asupersync::http::h1::HttpClient;
 use asupersync::http::h1::listener::Http1Listener;
@@ -52,10 +53,11 @@ use mcp_agent_mail_tools::{
     RespondContact, SearchMessages, SearchMessagesProduct, SendMessage, SetContactPolicy,
     SummarizeThread, SummarizeThreadProduct, ThreadDetailsResource, ToolingCapabilitiesResource,
     ToolingDirectoryQueryResource, ToolingDirectoryResource, ToolingLocksQueryResource,
-    ToolingLocksResource, ToolingMetricsQueryResource, ToolingMetricsResource,
-    ToolingRecentResource, ToolingSchemasQueryResource, ToolingSchemasResource,
-    UninstallPrecommitGuard, ViewsAckOverdueResource, ViewsAckRequiredResource,
-    ViewsAcksStaleResource, ViewsUrgentUnreadResource, Whois, clusters,
+    ToolingLocksResource, ToolingMetricsCoreQueryResource, ToolingMetricsCoreResource,
+    ToolingMetricsQueryResource, ToolingMetricsResource, ToolingRecentResource,
+    ToolingSchemasQueryResource, ToolingSchemasResource, UninstallPrecommitGuard,
+    ViewsAckOverdueResource, ViewsAckRequiredResource, ViewsAcksStaleResource,
+    ViewsUrgentUnreadResource, Whois, clusters,
 };
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
@@ -66,8 +68,25 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 struct InstrumentedTool<T> {
-    tool_name: String,
+    tool_index: usize,
     inner: T,
+}
+
+struct InflightGuard {
+    gauge: &'static mcp_agent_mail_core::GaugeI64,
+}
+
+impl InflightGuard {
+    fn begin(gauge: &'static mcp_agent_mail_core::GaugeI64) -> Self {
+        gauge.add(1);
+        Self { gauge }
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.gauge.add(-1);
+    }
 }
 
 impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
@@ -100,14 +119,19 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
     }
 
     fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
-        mcp_agent_mail_tools::record_call(&self.tool_name);
-        match self.inner.call(ctx, arguments) {
-            Ok(v) => Ok(v),
-            Err(e) => {
-                mcp_agent_mail_tools::record_error(&self.tool_name);
-                Err(e)
-            }
+        mcp_agent_mail_tools::record_call_idx(self.tool_index);
+        let start = Instant::now();
+        let out = self.inner.call(ctx, arguments);
+        let latency_us = u64::try_from(start.elapsed().as_micros().min(u128::from(u64::MAX)))
+            .unwrap_or(u64::MAX);
+        let is_error = out.is_err();
+        if is_error {
+            mcp_agent_mail_tools::record_error_idx(self.tool_index);
         }
+        mcp_agent_mail_core::global_metrics()
+            .tools
+            .record_call(latency_us, is_error);
+        out
     }
 
     fn call_async<'a>(
@@ -115,12 +139,19 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
         ctx: &'a McpContext,
         arguments: serde_json::Value,
     ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
-        mcp_agent_mail_tools::record_call(&self.tool_name);
+        mcp_agent_mail_tools::record_call_idx(self.tool_index);
+        let start = Instant::now();
         Box::pin(async move {
             let out = self.inner.call_async(ctx, arguments).await;
-            if !matches!(out, fastmcp_core::Outcome::Ok(_)) {
-                mcp_agent_mail_tools::record_error(&self.tool_name);
+            let is_error = !matches!(out, fastmcp_core::Outcome::Ok(_));
+            if is_error {
+                mcp_agent_mail_tools::record_error_idx(self.tool_index);
             }
+            let latency_us = u64::try_from(start.elapsed().as_micros().min(u128::from(u64::MAX)))
+                .unwrap_or(u64::MAX);
+            mcp_agent_mail_core::global_metrics()
+                .tools
+                .record_call(latency_us, is_error);
             out
         })
     }
@@ -134,8 +165,10 @@ fn add_tool<T: fastmcp::ToolHandler + 'static>(
     tool: T,
 ) -> fastmcp_server::ServerBuilder {
     if config.should_expose_tool(tool_name, cluster) {
+        let tool_index = mcp_agent_mail_tools::tool_index(tool_name)
+            .unwrap_or_else(|| panic!("Tool name missing from TOOL_CLUSTER_MAP: {tool_name}"));
         server.tool(InstrumentedTool {
-            tool_name: tool_name.to_string(),
+            tool_index,
             inner: tool,
         })
     } else {
@@ -392,6 +425,8 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> Server {
         .resource(ToolingSchemasQueryResource)
         .resource(ToolingMetricsResource)
         .resource(ToolingMetricsQueryResource)
+        .resource(ToolingMetricsCoreResource)
+        .resource(ToolingMetricsCoreQueryResource)
         .resource(ToolingLocksResource)
         .resource(ToolingLocksQueryResource)
         .resource(ToolingCapabilitiesResource)
@@ -2187,26 +2222,49 @@ impl HttpState {
 
     #[allow(clippy::unused_async)] // Required for Http1Listener interface
     async fn handle(&self, req: Http1Request) -> Http1Response {
+        let metrics = mcp_agent_mail_core::global_metrics();
+        let _inflight_guard = InflightGuard::begin(&metrics.http.requests_inflight);
+
         let dashboard = dashboard_handle();
-        if !self.config.http_request_log_enabled && dashboard.is_none() {
-            return self.handle_inner(req).await;
-        }
+        let needs_request_log = self.config.http_request_log_enabled || dashboard.is_some();
 
         let start = Instant::now();
-        let method = req.method.clone();
-        let (path, _query) = split_path_query(&req.uri);
-        let client_ip = req
-            .peer_addr
-            .map_or_else(|| "-".to_string(), |addr| addr.ip().to_string());
+        let (method, path, client_ip) = if needs_request_log {
+            let method = req.method.clone();
+            let (path, _query) = split_path_query(&req.uri);
+            let client_ip = req
+                .peer_addr
+                .map_or_else(|| "-".to_string(), |addr| addr.ip().to_string());
+            (Some(method), Some(path), Some(client_ip))
+        } else {
+            (None, None, None)
+        };
 
         let resp = self.handle_inner(req).await;
-        let dur_ms = u64::try_from(start.elapsed().as_millis().min(u128::from(u64::MAX)))
-            .unwrap_or(u64::MAX);
+        let elapsed = start.elapsed();
+        let latency_us =
+            u64::try_from(elapsed.as_micros().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
+        metrics.http.record_response(resp.status, latency_us);
+
+        if !needs_request_log {
+            return resp;
+        }
+
+        let dur_ms =
+            u64::try_from(elapsed.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
         if let Some(dashboard) = dashboard.as_ref() {
-            dashboard.record_request(method.as_str(), &path, resp.status, dur_ms, &client_ip);
+            if let (Some(method), Some(path), Some(client_ip)) =
+                (method.as_ref(), path.as_ref(), client_ip.as_ref())
+            {
+                dashboard.record_request(method.as_str(), path, resp.status, dur_ms, client_ip);
+            }
         }
         if self.config.http_request_log_enabled {
-            self.emit_http_request_log(method.as_str(), &path, resp.status, dur_ms, &client_ip);
+            if let (Some(method), Some(path), Some(client_ip)) =
+                (method.as_ref(), path.as_ref(), client_ip.as_ref())
+            {
+                self.emit_http_request_log(method.as_str(), path, resp.status, dur_ms, client_ip);
+            }
         }
         resp
     }
@@ -3357,12 +3415,11 @@ fn map_asupersync_err(err: &asupersync::Error) -> std::io::Error {
 }
 
 fn readiness_check(config: &mcp_agent_mail_core::Config) -> Result<(), String> {
-    let pool_size = config
-        .database_pool_size
-        .unwrap_or(mcp_agent_mail_db::pool::DEFAULT_POOL_SIZE);
-    let max_overflow = config
-        .database_max_overflow
-        .unwrap_or(mcp_agent_mail_db::pool::DEFAULT_MAX_OVERFLOW);
+    // Use auto_pool_size when config values are not explicitly set, so the
+    // server automatically scales to the available hardware.
+    let (auto_min, auto_max) = mcp_agent_mail_db::pool::auto_pool_size();
+    let pool_size = config.database_pool_size.unwrap_or(auto_min);
+    let max_overflow = config.database_max_overflow.unwrap_or(auto_max.saturating_sub(auto_min));
     let pool_timeout_ms = config
         .database_pool_timeout
         .map_or(mcp_agent_mail_db::pool::DEFAULT_POOL_TIMEOUT_MS, |v| {
