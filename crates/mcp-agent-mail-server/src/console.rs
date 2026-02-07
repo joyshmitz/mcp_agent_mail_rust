@@ -1144,15 +1144,29 @@ use ftui::widgets::StatefulWidget;
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
 use ftui::widgets::borders::BorderType;
+use ftui::widgets::input::TextInput;
 use ftui::widgets::log_viewer::{LogViewer, LogViewerState, LogWrapMode};
 
 /// Maximum log lines retained in the ring buffer.
 const LOG_PANE_MAX_LINES: usize = 5_000;
 
+/// Input focus mode for the log pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogPaneMode {
+    /// Normal scrolling/navigation mode.
+    Normal,
+    /// Search input mode (`/` to enter, Enter to confirm, Escape to cancel).
+    Search,
+    /// Help overlay visible (`?` to toggle).
+    Help,
+}
+
 /// Wrapper around `ftui::LogViewer` for the right-side log pane.
 pub struct LogPane {
     viewer: LogViewer,
     state: LogViewerState,
+    mode: LogPaneMode,
+    search_input: TextInput,
 }
 
 impl LogPane {
@@ -1161,7 +1175,53 @@ impl LogPane {
         Self {
             viewer: LogViewer::new(LOG_PANE_MAX_LINES).wrap_mode(LogWrapMode::CharWrap),
             state: LogViewerState::default(),
+            mode: LogPaneMode::Normal,
+            search_input: TextInput::new().with_placeholder("Search..."),
         }
+    }
+
+    /// Current input mode.
+    pub const fn mode(&self) -> LogPaneMode {
+        self.mode
+    }
+
+    /// Enter search input mode.
+    pub fn enter_search_mode(&mut self) {
+        self.mode = LogPaneMode::Search;
+        self.search_input.clear();
+        self.search_input.set_focused(true);
+    }
+
+    /// Confirm search and return to normal mode.
+    pub fn confirm_search(&mut self) {
+        let query = self.search_input.value().to_string();
+        self.mode = LogPaneMode::Normal;
+        self.search_input.set_focused(false);
+        if query.is_empty() {
+            self.viewer.clear_search();
+        } else {
+            self.viewer.search(&query);
+        }
+    }
+
+    /// Cancel search input and return to normal mode.
+    pub fn cancel_search(&mut self) {
+        self.mode = LogPaneMode::Normal;
+        self.search_input.set_focused(false);
+    }
+
+    /// Toggle help overlay.
+    pub fn toggle_help(&mut self) {
+        self.mode = if self.mode == LogPaneMode::Help {
+            LogPaneMode::Normal
+        } else {
+            LogPaneMode::Help
+        };
+    }
+
+    /// Handle a key event in search mode. Returns true if consumed.
+    pub fn handle_search_event(&mut self, event: &ftui::Event) -> bool {
+        self.search_input.handle_event(event)
     }
 
     /// Append a log line (plain text or ANSI-stripped).
@@ -1292,6 +1352,17 @@ pub fn split_columns(total_width: u16, ratio_percent: u16) -> Option<(u16, u16)>
     Some((left, right))
 }
 
+/// Help text for the log pane keybindings.
+const LOG_PANE_HELP: &str = "\
+ /         Search
+ n / N     Next / prev match
+ Escape    Cancel search / close help
+ f         Toggle follow mode
+ Up/Down   Scroll 1 line
+ PgUp/PgDn Scroll 1 page
+ Home/End  Jump to top / bottom
+ ?         Toggle this help";
+
 /// Render a two-pane split frame: HUD on the left, `LogViewer` on the right.
 ///
 /// `render_hud_fn` is a closure that renders the existing HUD into a given area.
@@ -1340,7 +1411,251 @@ pub fn render_split_frame(
     let inner = log_block.inner(cols[1]);
     log_block.render(cols[1], frame);
 
-    log_pane.render(inner, frame);
+    match log_pane.mode() {
+        LogPaneMode::Normal => {
+            log_pane.render(inner, frame);
+        }
+        LogPaneMode::Search => {
+            // Split inner: log viewer on top, search bar at bottom (1 row).
+            if inner.height > 2 {
+                let rows = Flex::vertical()
+                    .constraints([Constraint::Fill, Constraint::Fixed(1)])
+                    .split(inner);
+                log_pane.render(rows[0], frame);
+                // Render search input bar.
+                log_pane.search_input.render(rows[1], frame);
+            } else {
+                // Too short for search bar — just render the input.
+                log_pane.search_input.render(inner, frame);
+            }
+        }
+        LogPaneMode::Help => {
+            // Help overlay: render help text centered within the log pane.
+            use ftui::widgets::paragraph::Paragraph;
+            let help = Paragraph::new(LOG_PANE_HELP);
+            let help_block = Block::bordered()
+                .border_type(BorderType::Rounded)
+                .title(" Log Pane Help ");
+            let help_widget = help.block(help_block);
+            // Center the help box within the inner area.
+            #[allow(clippy::cast_possible_truncation)] // help text is always small
+            let h = LOG_PANE_HELP.lines().count() as u16 + 2; // +2 for borders
+            let w = 40u16.min(inner.width);
+            let x = inner.x + inner.width.saturating_sub(w) / 2;
+            let y = inner.y + inner.height.saturating_sub(h) / 2;
+            let help_area = Rect::new(x, y, w, h.min(inner.height));
+            // Render logs behind the overlay first.
+            log_pane.render(inner, frame);
+            help_widget.render(help_area, frame);
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Command palette (br-1m6a.21)
+// ──────────────────────────────────────────────────────────────────────
+
+use ftui::widgets::command_palette::{ActionItem, CommandPalette, PaletteAction};
+
+/// Action IDs for command palette entries.
+pub mod action_ids {
+    // Layout actions
+    pub const MODE_INLINE: &str = "layout:mode_inline";
+    pub const MODE_LEFT_SPLIT: &str = "layout:mode_left_split";
+    pub const SPLIT_RATIO_20: &str = "layout:split_ratio_20";
+    pub const SPLIT_RATIO_30: &str = "layout:split_ratio_30";
+    pub const SPLIT_RATIO_40: &str = "layout:split_ratio_40";
+    pub const SPLIT_RATIO_50: &str = "layout:split_ratio_50";
+    pub const HUD_HEIGHT_INC: &str = "layout:hud_height_inc";
+    pub const HUD_HEIGHT_DEC: &str = "layout:hud_height_dec";
+    pub const ANCHOR_TOP: &str = "layout:anchor_top";
+    pub const ANCHOR_BOTTOM: &str = "layout:anchor_bottom";
+    pub const TOGGLE_AUTO_SIZE: &str = "layout:toggle_auto_size";
+    pub const PERSIST_NOW: &str = "layout:persist_now";
+    // Theme actions
+    pub const THEME_CYCLE: &str = "theme:cycle";
+    pub const THEME_CYBERPUNK: &str = "theme:cyberpunk_aurora";
+    pub const THEME_DARCULA: &str = "theme:darcula";
+    pub const THEME_LUMEN: &str = "theme:lumen_light";
+    pub const THEME_NORDIC: &str = "theme:nordic_frost";
+    pub const THEME_HIGH_CONTRAST: &str = "theme:high_contrast";
+    // Log actions
+    pub const LOG_TOGGLE_FOLLOW: &str = "logs:toggle_follow";
+    pub const LOG_SEARCH: &str = "logs:search";
+    pub const LOG_CLEAR: &str = "logs:clear";
+    // Tool panel toggles
+    pub const TOGGLE_TOOL_CALLS_LOG: &str = "tools:toggle_tool_calls_log";
+    pub const TOGGLE_TOOLS_LOG: &str = "tools:toggle_tools_log";
+    // Help
+    pub const SHOW_KEYBINDINGS: &str = "help:keybindings";
+    pub const SHOW_CONFIG: &str = "help:config_summary";
+}
+
+/// Build the ordered list of command palette actions.
+#[must_use]
+fn build_palette_actions() -> Vec<ActionItem> {
+    use action_ids as id;
+    vec![
+        // Layout
+        ActionItem::new(id::MODE_INLINE, "Switch to Inline Mode")
+            .with_description("Use inline HUD with terminal scrollback")
+            .with_tags(&["layout", "inline"])
+            .with_category("Layout"),
+        ActionItem::new(id::MODE_LEFT_SPLIT, "Switch to Left Split Mode")
+            .with_description("AltScreen: HUD left, log viewer right")
+            .with_tags(&["layout", "split", "altscreen"])
+            .with_category("Layout"),
+        ActionItem::new(id::SPLIT_RATIO_20, "Split Ratio 20%")
+            .with_description("Set HUD width to 20%")
+            .with_tags(&["layout", "ratio"])
+            .with_category("Layout"),
+        ActionItem::new(id::SPLIT_RATIO_30, "Split Ratio 30%")
+            .with_description("Set HUD width to 30%")
+            .with_tags(&["layout", "ratio"])
+            .with_category("Layout"),
+        ActionItem::new(id::SPLIT_RATIO_40, "Split Ratio 40%")
+            .with_description("Set HUD width to 40%")
+            .with_tags(&["layout", "ratio"])
+            .with_category("Layout"),
+        ActionItem::new(id::SPLIT_RATIO_50, "Split Ratio 50%")
+            .with_description("Set HUD width to 50%")
+            .with_tags(&["layout", "ratio"])
+            .with_category("Layout"),
+        ActionItem::new(id::HUD_HEIGHT_INC, "Increase HUD Height (+5%)")
+            .with_description("Increase inline HUD height by 5%")
+            .with_tags(&["layout", "height"])
+            .with_category("Layout"),
+        ActionItem::new(id::HUD_HEIGHT_DEC, "Decrease HUD Height (-5%)")
+            .with_description("Decrease inline HUD height by 5%")
+            .with_tags(&["layout", "height"])
+            .with_category("Layout"),
+        ActionItem::new(id::ANCHOR_TOP, "Anchor HUD to Top")
+            .with_tags(&["layout", "anchor"])
+            .with_category("Layout"),
+        ActionItem::new(id::ANCHOR_BOTTOM, "Anchor HUD to Bottom")
+            .with_tags(&["layout", "anchor"])
+            .with_category("Layout"),
+        ActionItem::new(id::TOGGLE_AUTO_SIZE, "Toggle Auto-Size")
+            .with_description("Toggle inline auto-sizing (min/max rows)")
+            .with_tags(&["layout", "auto"])
+            .with_category("Layout"),
+        ActionItem::new(id::PERSIST_NOW, "Save Console Settings")
+            .with_description("Persist current CONSOLE_* settings to envfile")
+            .with_tags(&["save", "persist"])
+            .with_category("Layout"),
+        // Theme
+        ActionItem::new(id::THEME_CYCLE, "Cycle Theme")
+            .with_description("Switch to the next available theme")
+            .with_tags(&["theme", "color"])
+            .with_category("Theme"),
+        ActionItem::new(id::THEME_CYBERPUNK, "Theme: Cyberpunk Aurora")
+            .with_tags(&["theme"])
+            .with_category("Theme"),
+        ActionItem::new(id::THEME_DARCULA, "Theme: Darcula")
+            .with_tags(&["theme"])
+            .with_category("Theme"),
+        ActionItem::new(id::THEME_LUMEN, "Theme: Lumen Light")
+            .with_tags(&["theme"])
+            .with_category("Theme"),
+        ActionItem::new(id::THEME_NORDIC, "Theme: Nordic Frost")
+            .with_tags(&["theme"])
+            .with_category("Theme"),
+        ActionItem::new(id::THEME_HIGH_CONTRAST, "Theme: High Contrast")
+            .with_tags(&["theme"])
+            .with_category("Theme"),
+        // Logs
+        ActionItem::new(id::LOG_TOGGLE_FOLLOW, "Toggle Follow Mode")
+            .with_description("Toggle log auto-scroll (follow tail)")
+            .with_tags(&["log", "follow", "tail"])
+            .with_category("Logs"),
+        ActionItem::new(id::LOG_SEARCH, "Search Logs")
+            .with_description("Open log search (split mode only)")
+            .with_tags(&["log", "search", "find"])
+            .with_category("Logs"),
+        ActionItem::new(id::LOG_CLEAR, "Clear Log Buffer")
+            .with_description("Clear all log lines from the viewer")
+            .with_tags(&["log", "clear"])
+            .with_category("Logs"),
+        // Tool panels
+        ActionItem::new(id::TOGGLE_TOOL_CALLS_LOG, "Toggle Tool Calls Logging")
+            .with_description("Toggle LOG_TOOL_CALLS_ENABLED at runtime")
+            .with_tags(&["tools", "logging"])
+            .with_category("Tools"),
+        ActionItem::new(id::TOGGLE_TOOLS_LOG, "Toggle Tools Detail Logging")
+            .with_description("Toggle TOOLS_LOG_ENABLED at runtime")
+            .with_tags(&["tools", "logging"])
+            .with_category("Tools"),
+        // Help
+        ActionItem::new(id::SHOW_KEYBINDINGS, "Show Keybindings")
+            .with_description("Display keyboard shortcut reference")
+            .with_tags(&["help", "keys"])
+            .with_category("Help"),
+        ActionItem::new(id::SHOW_CONFIG, "Show Current Config")
+            .with_description("Display sanitized console configuration")
+            .with_tags(&["help", "config", "status"])
+            .with_category("Help"),
+    ]
+}
+
+/// Wrapper around ftui `CommandPalette` with pre-registered console actions.
+pub struct ConsoleCommandPalette {
+    palette: CommandPalette,
+}
+
+impl ConsoleCommandPalette {
+    /// Create a new command palette pre-populated with console actions.
+    #[must_use]
+    pub fn new() -> Self {
+        let mut palette = CommandPalette::new().with_max_visible(10);
+        for action in build_palette_actions() {
+            palette.register_action(action);
+        }
+        Self { palette }
+    }
+
+    /// Open the palette (clears previous query).
+    pub fn open(&mut self) {
+        self.palette.open();
+    }
+
+    /// Close the palette.
+    pub fn close(&mut self) {
+        self.palette.close();
+    }
+
+    /// Toggle visibility.
+    pub fn toggle(&mut self) {
+        self.palette.toggle();
+    }
+
+    /// Whether the palette is currently visible.
+    #[must_use]
+    pub fn is_visible(&self) -> bool {
+        self.palette.is_visible()
+    }
+
+    /// Forward a key event to the palette. Returns a `PaletteAction` if the
+    /// user executed or dismissed.
+    pub fn handle_event(&mut self, event: &ftui::Event) -> Option<PaletteAction> {
+        self.palette.handle_event(event)
+    }
+
+    /// Render the palette overlay onto the frame.
+    pub fn render(&self, area: Rect, frame: &mut ftui::Frame<'_>) {
+        self.palette.render(area, frame);
+    }
+
+    /// Number of registered actions.
+    #[must_use]
+    pub fn action_count(&self) -> usize {
+        self.palette.action_count()
+    }
+}
+
+impl Default for ConsoleCommandPalette {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -2030,5 +2345,232 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── Command palette tests ──
+
+    #[test]
+    fn command_palette_has_expected_action_count() {
+        let palette = ConsoleCommandPalette::new();
+        assert_eq!(palette.action_count(), 25);
+    }
+
+    #[test]
+    fn command_palette_action_ids_are_unique() {
+        let actions = build_palette_actions();
+        let mut seen = std::collections::HashSet::new();
+        for action in &actions {
+            assert!(
+                seen.insert(&action.id),
+                "duplicate action id: {}",
+                action.id
+            );
+        }
+    }
+
+    #[test]
+    fn command_palette_all_actions_have_category() {
+        let actions = build_palette_actions();
+        for action in &actions {
+            assert!(
+                action.category.is_some(),
+                "action {} missing category",
+                action.id
+            );
+        }
+    }
+
+    #[test]
+    fn command_palette_categories_are_expected() {
+        let actions = build_palette_actions();
+        let expected = ["Layout", "Theme", "Logs", "Tools", "Help"];
+        for action in &actions {
+            let cat = action.category.as_deref().unwrap();
+            assert!(
+                expected.contains(&cat),
+                "unexpected category '{}' on action {}",
+                cat,
+                action.id
+            );
+        }
+    }
+
+    #[test]
+    fn command_palette_default_not_visible() {
+        let palette = ConsoleCommandPalette::new();
+        assert!(!palette.is_visible());
+    }
+
+    #[test]
+    fn command_palette_toggle_visibility() {
+        let mut palette = ConsoleCommandPalette::new();
+        assert!(!palette.is_visible());
+        palette.open();
+        assert!(palette.is_visible());
+        palette.close();
+        assert!(!palette.is_visible());
+        palette.toggle();
+        assert!(palette.is_visible());
+        palette.toggle();
+        assert!(!palette.is_visible());
+    }
+
+    #[test]
+    fn command_palette_stable_action_order() {
+        let a1 = build_palette_actions();
+        let a2 = build_palette_actions();
+        let ids1: Vec<&str> = a1.iter().map(|a| a.id.as_str()).collect();
+        let ids2: Vec<&str> = a2.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids1, ids2, "action order must be deterministic");
+    }
+
+    #[test]
+    fn command_palette_render_no_panic() {
+        let palette = ConsoleCommandPalette::new();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 20, &mut pool);
+        let area = Rect::new(0, 0, 120, 20);
+        palette.render(area, &mut frame);
+    }
+
+    #[test]
+    fn command_palette_render_open_no_panic() {
+        let mut palette = ConsoleCommandPalette::new();
+        palette.open();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 20, &mut pool);
+        let area = Rect::new(0, 0, 120, 20);
+        palette.render(area, &mut frame);
+    }
+
+    // ── LogPane mode transition tests (br-1m6a.20) ──
+
+    #[test]
+    fn log_pane_mode_defaults_to_normal() {
+        let pane = LogPane::new();
+        assert_eq!(pane.mode(), LogPaneMode::Normal);
+    }
+
+    #[test]
+    fn log_pane_enter_search_mode() {
+        let mut pane = LogPane::new();
+        pane.enter_search_mode();
+        assert_eq!(pane.mode(), LogPaneMode::Search);
+    }
+
+    #[test]
+    fn log_pane_confirm_search_returns_to_normal() {
+        let mut pane = LogPane::new();
+        pane.push("hello world");
+        pane.push("goodbye world");
+        pane.enter_search_mode();
+        pane.search_input.set_value("hello");
+        pane.confirm_search();
+        assert_eq!(pane.mode(), LogPaneMode::Normal);
+        assert!(pane.search_info().is_some());
+        let (cur, total) = pane.search_info().unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(cur, 1);
+    }
+
+    #[test]
+    fn log_pane_confirm_empty_search_clears() {
+        let mut pane = LogPane::new();
+        pane.push("hello world");
+        pane.search("hello");
+        assert!(pane.search_info().is_some());
+        pane.enter_search_mode();
+        pane.confirm_search();
+        assert_eq!(pane.mode(), LogPaneMode::Normal);
+        assert!(pane.search_info().is_none());
+    }
+
+    #[test]
+    fn log_pane_cancel_search_returns_to_normal() {
+        let mut pane = LogPane::new();
+        pane.enter_search_mode();
+        pane.cancel_search();
+        assert_eq!(pane.mode(), LogPaneMode::Normal);
+    }
+
+    #[test]
+    fn log_pane_toggle_help() {
+        let mut pane = LogPane::new();
+        assert_eq!(pane.mode(), LogPaneMode::Normal);
+        pane.toggle_help();
+        assert_eq!(pane.mode(), LogPaneMode::Help);
+        pane.toggle_help();
+        assert_eq!(pane.mode(), LogPaneMode::Normal);
+    }
+
+    #[test]
+    fn log_pane_help_from_search_goes_to_help() {
+        let mut pane = LogPane::new();
+        pane.enter_search_mode();
+        pane.toggle_help();
+        assert_eq!(pane.mode(), LogPaneMode::Help);
+    }
+
+    #[test]
+    fn log_pane_ring_buffer_overflow() {
+        let mut pane = LogPane::new();
+        for i in 0..LOG_PANE_MAX_LINES + 100 {
+            pane.push(format!("line {i}"));
+        }
+        assert_eq!(pane.len(), LOG_PANE_MAX_LINES);
+    }
+
+    #[test]
+    fn render_split_frame_no_panic() {
+        let mut pane = LogPane::new();
+        pane.push("line 1");
+        pane.push("line 2");
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 40, &mut pool);
+        let area = Rect::new(0, 0, 120, 40);
+        render_split_frame(&mut frame, area, 30, &mut pane, |f, a| {
+            let block = Block::bordered().title(" HUD ");
+            block.render(a, f);
+        });
+    }
+
+    #[test]
+    fn render_split_frame_search_mode_no_panic() {
+        let mut pane = LogPane::new();
+        pane.push("line 1");
+        pane.enter_search_mode();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 40, &mut pool);
+        let area = Rect::new(0, 0, 120, 40);
+        render_split_frame(&mut frame, area, 30, &mut pane, |f, a| {
+            let block = Block::bordered().title(" HUD ");
+            block.render(a, f);
+        });
+    }
+
+    #[test]
+    fn render_split_frame_help_mode_no_panic() {
+        let mut pane = LogPane::new();
+        pane.push("line 1");
+        pane.toggle_help();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 40, &mut pool);
+        let area = Rect::new(0, 0, 120, 40);
+        render_split_frame(&mut frame, area, 30, &mut pane, |f, a| {
+            let block = Block::bordered().title(" HUD ");
+            block.render(a, f);
+        });
+    }
+
+    #[test]
+    fn render_split_frame_narrow_falls_back() {
+        let mut pane = LogPane::new();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(50, 20, &mut pool);
+        let area = Rect::new(0, 0, 50, 20);
+        // When too narrow (<60), should fall back to full-width HUD rendering.
+        render_split_frame(&mut frame, area, 30, &mut pane, |_f, _a| {
+            // HUD renderer called as fallback.
+        });
     }
 }

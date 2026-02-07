@@ -715,7 +715,9 @@ impl ConsoleLayoutState {
                 self.split_mode = ConsoleSplitMode::Left;
                 (
                     true,
-                    Some("Requested left split mode (br-1m6a.20). Inline console will remain active until AltScreen log viewer lands.".to_string()),
+                    Some(
+                        "Console: switched to left split mode (AltScreen + LogViewer)".to_string(),
+                    ),
                 )
             }
             KeyCode::Char('[') => {
@@ -753,6 +755,12 @@ struct StartupDashboard {
     last_request: Mutex<Option<DashboardLastRequest>>,
     sparkline: console::SparklineBuffer,
     log_pane: Mutex<console::LogPane>,
+    #[allow(dead_code)]
+    command_palette: Mutex<console::ConsoleCommandPalette>,
+    #[allow(dead_code)]
+    tool_calls_log_enabled: AtomicBool,
+    #[allow(dead_code)]
+    tools_log_enabled: AtomicBool,
     tick_count: AtomicU64,
     prev_db_stats: Mutex<DashboardDbStats>,
 }
@@ -803,6 +811,9 @@ impl StartupDashboard {
             last_request: Mutex::new(None),
             sparkline: console::SparklineBuffer::new(),
             log_pane: Mutex::new(console::LogPane::new()),
+            command_palette: Mutex::new(console::ConsoleCommandPalette::new()),
+            tool_calls_log_enabled: AtomicBool::new(config.log_tool_calls_enabled),
+            tools_log_enabled: AtomicBool::new(config.tools_log_enabled),
             tick_count: AtomicU64::new(0),
             prev_db_stats: Mutex::new(DashboardDbStats::default()),
         });
@@ -910,6 +921,7 @@ impl StartupDashboard {
     }
 
     fn handle_console_event(&self, session: &ftui::TerminalSession, event: &ftui::Event) -> bool {
+        use ftui::widgets::command_palette::PaletteAction;
         use ftui::{Event, KeyCode, KeyEventKind, Modifiers};
 
         let Event::Key(key) = event else {
@@ -925,9 +937,36 @@ impl StartupDashboard {
             std::process::exit(130);
         }
 
+        // When the command palette is visible, route all events to it first.
+        {
+            let mut palette = lock_mutex(&self.command_palette);
+            if palette.is_visible() {
+                if let Some(action) = palette.handle_event(event) {
+                    drop(palette); // release lock before dispatch
+                    match action {
+                        PaletteAction::Execute(id) => {
+                            self.dispatch_palette_action(&id, session);
+                        }
+                        PaletteAction::Dismiss => {}
+                    }
+                }
+                self.render_now();
+                return false;
+            }
+        }
+
+        // Ctrl+P or ':' opens the command palette.
+        let is_ctrl_p =
+            key.modifiers.contains(Modifiers::CTRL) && matches!(key.code, KeyCode::Char('p'));
+        if is_ctrl_p || matches!(key.code, KeyCode::Char(':')) {
+            lock_mutex(&self.command_palette).open();
+            self.render_now();
+            return false;
+        }
+
         // In split mode, route log-pane-specific keys to the LogViewer.
         if lock_mutex(&self.console_layout).is_split_mode() {
-            let handled = self.handle_log_pane_key(key.code);
+            let handled = self.handle_log_pane_key(key.code, event);
             if handled {
                 self.render_now();
                 return false;
@@ -949,8 +988,13 @@ impl StartupDashboard {
 
         let (term_width, term_height) = session.size().unwrap_or((80, 24));
         self.apply_console_layout(term_width, term_height);
+        self.persist_console_settings();
 
-        // Persistence (auto-remember).
+        false
+    }
+
+    /// Persist current console settings to the user envfile.
+    fn persist_console_settings(&self) {
         let layout = lock_mutex(&self.console_layout).clone();
         if layout.auto_save {
             let updates = layout.console_updates();
@@ -968,61 +1012,241 @@ impl StartupDashboard {
                 ));
             }
         }
+    }
 
-        false
+    /// Dispatch a command palette action by ID.
+    #[allow(clippy::too_many_lines)]
+    fn dispatch_palette_action(&self, id: &str, session: &ftui::TerminalSession) {
+        use console::action_ids as aid;
+
+        let mut layout_changed = false;
+
+        match id {
+            // ── Layout ──
+            aid::MODE_INLINE => {
+                lock_mutex(&self.console_layout).split_mode = ConsoleSplitMode::Inline;
+                layout_changed = true;
+            }
+            aid::MODE_LEFT_SPLIT => {
+                lock_mutex(&self.console_layout).split_mode = ConsoleSplitMode::Left;
+                layout_changed = true;
+            }
+            aid::SPLIT_RATIO_20 => {
+                lock_mutex(&self.console_layout).split_ratio_percent = 20;
+                layout_changed = true;
+            }
+            aid::SPLIT_RATIO_30 => {
+                lock_mutex(&self.console_layout).split_ratio_percent = 30;
+                layout_changed = true;
+            }
+            aid::SPLIT_RATIO_40 => {
+                lock_mutex(&self.console_layout).split_ratio_percent = 40;
+                layout_changed = true;
+            }
+            aid::SPLIT_RATIO_50 => {
+                lock_mutex(&self.console_layout).split_ratio_percent = 50;
+                layout_changed = true;
+            }
+            aid::HUD_HEIGHT_INC => {
+                let mut l = lock_mutex(&self.console_layout);
+                l.ui_height_percent = l.ui_height_percent.saturating_add(5).clamp(10, 80);
+                drop(l);
+                layout_changed = true;
+            }
+            aid::HUD_HEIGHT_DEC => {
+                let mut l = lock_mutex(&self.console_layout);
+                l.ui_height_percent = l.ui_height_percent.saturating_sub(5).clamp(10, 80);
+                drop(l);
+                layout_changed = true;
+            }
+            aid::ANCHOR_TOP => {
+                lock_mutex(&self.console_layout).ui_anchor = ConsoleUiAnchor::Top;
+                layout_changed = true;
+            }
+            aid::ANCHOR_BOTTOM => {
+                lock_mutex(&self.console_layout).ui_anchor = ConsoleUiAnchor::Bottom;
+                layout_changed = true;
+            }
+            aid::TOGGLE_AUTO_SIZE => {
+                let mut l = lock_mutex(&self.console_layout);
+                l.ui_auto_size = !l.ui_auto_size;
+                drop(l);
+                layout_changed = true;
+            }
+            aid::PERSIST_NOW => {
+                self.persist_console_settings();
+            }
+
+            // ── Theme ──
+            aid::THEME_CYCLE => {
+                let new_theme = ftui_extras::theme::cycle_theme();
+                self.log_line(&format!("Console: theme changed to {}", new_theme.name()));
+            }
+            aid::THEME_CYBERPUNK => {
+                ftui_extras::theme::set_theme(ftui_extras::theme::ThemeId::CyberpunkAurora);
+                self.log_line("Console: theme set to Cyberpunk Aurora");
+            }
+            aid::THEME_DARCULA => {
+                ftui_extras::theme::set_theme(ftui_extras::theme::ThemeId::Darcula);
+                self.log_line("Console: theme set to Darcula");
+            }
+            aid::THEME_LUMEN => {
+                ftui_extras::theme::set_theme(ftui_extras::theme::ThemeId::LumenLight);
+                self.log_line("Console: theme set to Lumen Light");
+            }
+            aid::THEME_NORDIC => {
+                ftui_extras::theme::set_theme(ftui_extras::theme::ThemeId::NordicFrost);
+                self.log_line("Console: theme set to Nordic Frost");
+            }
+            aid::THEME_HIGH_CONTRAST => {
+                ftui_extras::theme::set_theme(ftui_extras::theme::ThemeId::HighContrast);
+                self.log_line("Console: theme set to High Contrast");
+            }
+
+            // ── Logs ──
+            aid::LOG_TOGGLE_FOLLOW => {
+                lock_mutex(&self.log_pane).toggle_follow();
+                self.log_line("Console: toggled follow mode");
+            }
+            aid::LOG_SEARCH => {
+                // Switch log pane to search mode.
+                lock_mutex(&self.log_pane).enter_search_mode();
+            }
+            aid::LOG_CLEAR => {
+                lock_mutex(&self.log_pane).clear();
+                self.log_line("Console: log buffer cleared");
+            }
+
+            // ── Tool panel toggles ──
+            aid::TOGGLE_TOOL_CALLS_LOG => {
+                let prev = self.tool_calls_log_enabled.load(Ordering::Relaxed);
+                self.tool_calls_log_enabled.store(!prev, Ordering::Relaxed);
+                self.log_line(&format!(
+                    "Console: tool calls logging {}",
+                    if prev { "disabled" } else { "enabled" }
+                ));
+            }
+            aid::TOGGLE_TOOLS_LOG => {
+                let prev = self.tools_log_enabled.load(Ordering::Relaxed);
+                self.tools_log_enabled.store(!prev, Ordering::Relaxed);
+                self.log_line(&format!(
+                    "Console: tools detail logging {}",
+                    if prev { "disabled" } else { "enabled" }
+                ));
+            }
+
+            // ── Help ──
+            aid::SHOW_KEYBINDINGS => {
+                self.log_line(
+                    "Keybindings: +/- height, t/b anchor, a auto-size, i/l mode, [/] ratio, \
+                     Ctrl+P palette, ? summary",
+                );
+            }
+            aid::SHOW_CONFIG => {
+                let summary = lock_mutex(&self.console_layout).summary_line();
+                self.log_line(&format!("Console: {summary}"));
+            }
+
+            _ => {
+                self.log_line(&format!("Console: unknown action '{id}'"));
+            }
+        }
+
+        if layout_changed {
+            let (term_width, term_height) = session.size().unwrap_or((80, 24));
+            self.apply_console_layout(term_width, term_height);
+            self.persist_console_settings();
+        }
     }
 
     /// Handle keybindings for the log pane in split mode.
     /// Returns `true` if the key was consumed by the log pane.
-    fn handle_log_pane_key(&self, code: ftui::KeyCode) -> bool {
+    fn handle_log_pane_key(&self, code: ftui::KeyCode, event: &ftui::Event) -> bool {
+        use console::LogPaneMode;
         use ftui::KeyCode;
         let mut pane = lock_mutex(&self.log_pane);
-        match code {
-            // Scrolling
-            KeyCode::Up => {
-                pane.scroll_up(1);
+
+        match pane.mode() {
+            LogPaneMode::Search => {
+                // In search mode, Enter confirms, Escape cancels, everything
+                // else is forwarded to the TextInput widget.
+                match code {
+                    KeyCode::Enter => {
+                        pane.confirm_search();
+                        true
+                    }
+                    KeyCode::Escape => {
+                        pane.cancel_search();
+                        true
+                    }
+                    _ => {
+                        pane.handle_search_event(event);
+                        true
+                    }
+                }
+            }
+            LogPaneMode::Help => {
+                // Any key dismisses the help overlay.
+                pane.toggle_help();
                 true
             }
-            KeyCode::Down => {
-                pane.scroll_down(1);
-                true
-            }
-            KeyCode::PageUp => {
-                pane.page_up();
-                true
-            }
-            KeyCode::PageDown => {
-                pane.page_down();
-                true
-            }
-            KeyCode::Home => {
-                pane.scroll_to_top();
-                true
-            }
-            KeyCode::End => {
-                pane.scroll_to_bottom();
-                true
-            }
-            // Follow mode toggle
-            KeyCode::Char('f') => {
-                pane.toggle_follow();
-                true
-            }
-            // Search navigation
-            KeyCode::Char('n') => {
-                pane.next_match();
-                true
-            }
-            KeyCode::Char('N') => {
-                pane.prev_match();
-                true
-            }
-            // Clear search
-            KeyCode::Escape => {
-                pane.clear_search();
-                true
-            }
-            _ => false,
+            LogPaneMode::Normal => match code {
+                // Open search
+                KeyCode::Char('/') => {
+                    pane.enter_search_mode();
+                    true
+                }
+                // Toggle help
+                KeyCode::Char('?') => {
+                    pane.toggle_help();
+                    true
+                }
+                // Scrolling
+                KeyCode::Up => {
+                    pane.scroll_up(1);
+                    true
+                }
+                KeyCode::Down => {
+                    pane.scroll_down(1);
+                    true
+                }
+                KeyCode::PageUp => {
+                    pane.page_up();
+                    true
+                }
+                KeyCode::PageDown => {
+                    pane.page_down();
+                    true
+                }
+                KeyCode::Home => {
+                    pane.scroll_to_top();
+                    true
+                }
+                KeyCode::End => {
+                    pane.scroll_to_bottom();
+                    true
+                }
+                // Follow mode toggle
+                KeyCode::Char('f') => {
+                    pane.toggle_follow();
+                    true
+                }
+                // Search navigation
+                KeyCode::Char('n') => {
+                    pane.next_match();
+                    true
+                }
+                KeyCode::Char('N') => {
+                    pane.prev_match();
+                    true
+                }
+                // Clear search
+                KeyCode::Escape => {
+                    pane.clear_search();
+                    true
+                }
+                _ => false,
+            },
         }
     }
 
@@ -1166,6 +1390,12 @@ impl StartupDashboard {
             } else {
                 render_dashboard_frame(&mut frame, area, &snapshot, phase, changed_rows);
             }
+            // Render command palette overlay on top of everything.
+            let palette = lock_mutex(&self.command_palette);
+            if palette.is_visible() {
+                palette.render(area, &mut frame);
+            }
+            drop(palette);
             frame.buffer
         };
         let _ = writer.present_ui_owned(rendered, None, false);
@@ -3961,7 +4191,7 @@ mod tests {
             message
                 .as_deref()
                 .unwrap_or_default()
-                .contains("Requested left split mode")
+                .contains("switched to left split mode")
         );
         assert_eq!(layout.split_mode, ConsoleSplitMode::Left);
 
