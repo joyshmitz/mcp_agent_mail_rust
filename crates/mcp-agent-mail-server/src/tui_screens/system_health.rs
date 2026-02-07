@@ -167,7 +167,7 @@ impl MailScreen for SystemHealthScreen {
     fn update(&mut self, event: &Event, _state: &TuiSharedState) -> Cmd<MailScreenMsg> {
         if let Event::Key(key) = event {
             if key.kind == KeyEventKind::Press {
-                if let KeyCode::Char('r') = key.code {
+                if key.code == KeyCode::Char('r') {
                     self.request_refresh();
                 }
             }
@@ -300,7 +300,7 @@ fn diagnostics_worker_loop(
         let now = Instant::now();
         let refresh = refresh_requested.swap(false, Ordering::Relaxed);
         if refresh || now >= next_due {
-            let snap = run_diagnostics(&state);
+            let snap = run_diagnostics(state);
             if let Ok(mut guard) = snapshot.lock() {
                 *guard = snap;
             }
