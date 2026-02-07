@@ -576,6 +576,12 @@ impl ConsoleLayoutState {
         };
 
         let effective_term_height = term_height.saturating_sub(2).max(1);
+
+        // AltScreen mode for left-split layout.
+        if self.split_mode == ConsoleSplitMode::Left {
+            return (ftui::ScreenMode::AltScreen, ui_anchor);
+        }
+
         let screen_mode = if self.ui_auto_size {
             let min_height = self.inline_auto_min_rows.min(effective_term_height).max(1);
             let max_height = self
@@ -594,6 +600,11 @@ impl ConsoleLayoutState {
         };
 
         (screen_mode, ui_anchor)
+    }
+
+    /// Check whether the current split mode is Left (`AltScreen`).
+    fn is_split_mode(&self) -> bool {
+        self.split_mode == ConsoleSplitMode::Left
     }
 
     fn console_updates(&self) -> HashMap<&'static str, String> {
@@ -741,6 +752,9 @@ struct StartupDashboard {
     db_stats: Mutex<DashboardDbStats>,
     last_request: Mutex<Option<DashboardLastRequest>>,
     sparkline: console::SparklineBuffer,
+    log_pane: Mutex<console::LogPane>,
+    tick_count: AtomicU64,
+    prev_db_stats: Mutex<DashboardDbStats>,
 }
 
 impl StartupDashboard {
@@ -788,6 +802,9 @@ impl StartupDashboard {
             db_stats: Mutex::new(DashboardDbStats::default()),
             last_request: Mutex::new(None),
             sparkline: console::SparklineBuffer::new(),
+            log_pane: Mutex::new(console::LogPane::new()),
+            tick_count: AtomicU64::new(0),
+            prev_db_stats: Mutex::new(DashboardDbStats::default()),
         });
 
         dashboard.refresh_db_stats();
@@ -908,6 +925,15 @@ impl StartupDashboard {
             std::process::exit(130);
         }
 
+        // In split mode, route log-pane-specific keys to the LogViewer.
+        if lock_mutex(&self.console_layout).is_split_mode() {
+            let handled = self.handle_log_pane_key(key.code);
+            if handled {
+                self.render_now();
+                return false;
+            }
+        }
+
         let (changed, message) = {
             let mut layout = lock_mutex(&self.console_layout);
             layout.apply_key(key.code)
@@ -946,6 +972,60 @@ impl StartupDashboard {
         false
     }
 
+    /// Handle keybindings for the log pane in split mode.
+    /// Returns `true` if the key was consumed by the log pane.
+    fn handle_log_pane_key(&self, code: ftui::KeyCode) -> bool {
+        use ftui::KeyCode;
+        let mut pane = lock_mutex(&self.log_pane);
+        match code {
+            // Scrolling
+            KeyCode::Up => {
+                pane.scroll_up(1);
+                true
+            }
+            KeyCode::Down => {
+                pane.scroll_down(1);
+                true
+            }
+            KeyCode::PageUp => {
+                pane.page_up();
+                true
+            }
+            KeyCode::PageDown => {
+                pane.page_down();
+                true
+            }
+            KeyCode::Home => {
+                pane.scroll_to_top();
+                true
+            }
+            KeyCode::End => {
+                pane.scroll_to_bottom();
+                true
+            }
+            // Follow mode toggle
+            KeyCode::Char('f') => {
+                pane.toggle_follow();
+                true
+            }
+            // Search navigation
+            KeyCode::Char('n') => {
+                pane.next_match();
+                true
+            }
+            KeyCode::Char('N') => {
+                pane.prev_match();
+                true
+            }
+            // Clear search
+            KeyCode::Escape => {
+                pane.clear_search();
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn apply_console_layout(&self, term_width: u16, term_height: u16) {
         let (screen_mode, ui_anchor) =
             lock_mutex(&self.console_layout).compute_writer_settings(term_height);
@@ -977,8 +1057,19 @@ impl StartupDashboard {
         if !line.ends_with('\n') {
             line.push('\n');
         }
-        let mut writer = lock_mutex(&self.writer);
-        let _ = writer.write_log(&line);
+
+        // In split mode, route logs to the LogPane ring buffer instead of
+        // TerminalWriter::write_log (which is a no-op in AltScreen).
+        if lock_mutex(&self.console_layout).is_split_mode() {
+            let mut pane = lock_mutex(&self.log_pane);
+            // Split on newlines so each line is a separate entry in the viewer.
+            for l in line.trim_end().split('\n') {
+                pane.push(l.to_string());
+            }
+        } else {
+            let mut writer = lock_mutex(&self.writer);
+            let _ = writer.write_log(&line);
+        }
     }
 
     fn record_request(
@@ -1043,7 +1134,21 @@ impl StartupDashboard {
     }
 
     fn render_now(&self) {
+        let tick = self.tick_count.fetch_add(1, Ordering::Relaxed);
         let snapshot = self.snapshot();
+
+        // Detect changed DB stat rows for highlight effects.
+        let changed_rows = {
+            let mut prev = lock_mutex(&self.prev_db_stats);
+            let changed = db_changed_rows(&prev, &snapshot.db);
+            *prev = snapshot.db.clone();
+            changed
+        };
+
+        #[allow(clippy::cast_precision_loss)] // precision loss is fine for animation phase
+        let phase = tick as f32 * 0.08; // ~0.08 per 1200ms tick ≈ one full cycle every ~15s
+        let is_split = lock_mutex(&self.console_layout).is_split_mode();
+        let split_ratio = lock_mutex(&self.console_layout).split_ratio_percent;
         let mut writer = lock_mutex(&self.writer);
         let width = writer.width().max(80);
         let ui_height = writer.ui_height().max(8);
@@ -1053,15 +1158,53 @@ impl StartupDashboard {
             let mut frame = ftui::Frame::from_buffer(buffer, pool);
             frame.links = Some(links);
             let area = Rect::new(0, 0, width, ui_height);
-            render_dashboard_frame(&mut frame, area, &snapshot);
+            if is_split {
+                let mut pane = lock_mutex(&self.log_pane);
+                console::render_split_frame(&mut frame, area, split_ratio, &mut pane, |f, a| {
+                    render_dashboard_frame(f, a, &snapshot, phase, changed_rows);
+                });
+            } else {
+                render_dashboard_frame(&mut frame, area, &snapshot, phase, changed_rows);
+            }
             frame.buffer
         };
         let _ = writer.present_ui_owned(rendered, None, false);
     }
 }
 
+/// Compute a bitmask of DB stat rows that changed since the previous snapshot.
+/// Bits 0-5 correspond to projects, agents, messages, `file_reservations`, `contact_links`, `ack_pending`.
+const fn db_changed_rows(prev: &DashboardDbStats, cur: &DashboardDbStats) -> u8 {
+    let mut mask = 0u8;
+    if prev.projects != cur.projects {
+        mask |= 1 << 0;
+    }
+    if prev.agents != cur.agents {
+        mask |= 1 << 1;
+    }
+    if prev.messages != cur.messages {
+        mask |= 1 << 2;
+    }
+    if prev.file_reservations != cur.file_reservations {
+        mask |= 1 << 3;
+    }
+    if prev.contact_links != cur.contact_links {
+        mask |= 1 << 4;
+    }
+    if prev.ack_pending != cur.ack_pending {
+        mask |= 1 << 5;
+    }
+    mask
+}
+
 #[allow(clippy::too_many_lines)]
-fn render_dashboard_frame(frame: &mut ftui::Frame<'_>, area: Rect, snapshot: &DashboardSnapshot) {
+fn render_dashboard_frame(
+    frame: &mut ftui::Frame<'_>,
+    area: Rect,
+    snapshot: &DashboardSnapshot,
+    phase: f32,
+    changed_rows: u8,
+) {
     if area.width < 40 || area.height < 5 {
         Paragraph::new("MCP Agent Mail Dashboard")
             .block(
@@ -1173,6 +1316,33 @@ fn render_dashboard_frame(frame: &mut ftui::Frame<'_>, area: Rect, snapshot: &Da
             pretty_num(snapshot.db.ack_pending),
         ]),
     ];
+    // Apply highlight style to changed rows (br-1m6a.7)
+    let highlight_style = ftui::Style::default()
+        .fg(ftui::PackedRgba::rgb(120, 255, 180))
+        .bold();
+    let db_rows: Vec<Row> = db_rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, row)| {
+            if changed_rows & (1 << i) != 0 {
+                row.style(highlight_style)
+            } else {
+                row
+            }
+        })
+        .collect();
+
+    // Breathing glow on header: use phase to modulate header brightness
+    let glow = (phase * std::f32::consts::TAU).sin().mul_add(0.5, 0.5) * 0.3;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let hdr_r = (144.0 + glow * 80.0).min(255.0) as u8;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let hdr_g = (205.0 + glow * 40.0).min(255.0) as u8;
+    let hdr_b = 255u8;
+    let animated_title_style = ftui::Style::default()
+        .fg(ftui::PackedRgba::rgb(hdr_r, hdr_g, hdr_b))
+        .bold();
+
     Table::new(
         db_rows,
         [
@@ -1180,7 +1350,7 @@ fn render_dashboard_frame(frame: &mut ftui::Frame<'_>, area: Rect, snapshot: &Da
             Constraint::Fill,
         ],
     )
-    .header(Row::new(vec!["Resource", "Count"]).style(title_style.bold()))
+    .header(Row::new(vec!["Resource", "Count"]).style(animated_title_style))
     .column_spacing(2)
     .block(
         Block::bordered()
@@ -1199,11 +1369,10 @@ fn render_dashboard_frame(frame: &mut ftui::Frame<'_>, area: Rect, snapshot: &Da
         // Narrow width: collapse to a single summary line
         if cols[2].width < 22 {
             let count = snapshot.db.agents_list.len();
-            let summary = if let Some(first) = snapshot.db.agents_list.first() {
-                format!("{count} agents\n{}", first.name)
-            } else {
-                format!("{count} agents")
-            };
+            let summary = snapshot.db.agents_list.first().map_or_else(
+                || format!("{count} agents"),
+                |first| format!("{count} agents\n{}", first.name),
+            );
             Paragraph::new(summary)
                 .block(agent_block)
                 .style(card_style)
@@ -3805,6 +3974,38 @@ mod tests {
         let (changed, message) = layout.apply_key(ftui::KeyCode::Char('?'));
         assert!(!changed);
         assert!(message.as_deref().unwrap_or_default().contains("Console:"));
+    }
+
+    #[test]
+    fn compute_writer_settings_left_split_returns_altscreen() {
+        let mut layout = ConsoleLayoutState {
+            persist_path: std::path::PathBuf::new(),
+            auto_save: false,
+            interactive_enabled: false,
+            ui_height_percent: 50,
+            ui_anchor: ConsoleUiAnchor::Bottom,
+            ui_auto_size: false,
+            inline_auto_min_rows: 8,
+            inline_auto_max_rows: 20,
+            split_mode: ConsoleSplitMode::Left,
+            split_ratio_percent: 30,
+        };
+
+        let (mode, _anchor) = layout.compute_writer_settings(40);
+        assert!(
+            matches!(mode, ftui::ScreenMode::AltScreen),
+            "Left split mode should produce AltScreen, got {mode:?}"
+        );
+        assert!(layout.is_split_mode());
+
+        // Switching back to inline should NOT produce AltScreen.
+        layout.split_mode = ConsoleSplitMode::Inline;
+        let (mode, _anchor) = layout.compute_writer_settings(40);
+        assert!(
+            !matches!(mode, ftui::ScreenMode::AltScreen),
+            "Inline mode should not produce AltScreen, got {mode:?}"
+        );
+        assert!(!layout.is_split_mode());
     }
 
     #[test]
@@ -7521,5 +7722,199 @@ mod tests {
         assert!(a.name.is_empty());
         assert!(a.program.is_empty());
         assert_eq!(a.last_active_ts, 0);
+    }
+
+    // ── Dashboard render tests (br-1m6a.8) ──
+
+    fn make_test_snapshot(agents: Vec<AgentSummary>) -> DashboardSnapshot {
+        DashboardSnapshot {
+            endpoint: "http://127.0.0.1:8765".into(),
+            web_ui: "http://127.0.0.1:8765/mail".into(),
+            app_environment: "test".into(),
+            auth_enabled: false,
+            database_url: "sqlite:///tmp/test.db".into(),
+            storage_root: "/tmp/storage".into(),
+            uptime: "0s".into(),
+            requests_total: 0,
+            requests_2xx: 0,
+            requests_4xx: 0,
+            requests_5xx: 0,
+            avg_latency_ms: 0,
+            db: DashboardDbStats {
+                agents: agents.len() as u64,
+                agents_list: agents,
+                ..DashboardDbStats::default()
+            },
+            last_request: None,
+            sparkline_data: vec![0.0; 10],
+        }
+    }
+
+    fn make_agents(n: usize) -> Vec<AgentSummary> {
+        let names = [
+            "RedFox",
+            "BlueLake",
+            "GreenPeak",
+            "GoldHawk",
+            "SwiftWolf",
+            "CalmRiver",
+            "BoldStone",
+            "DeepCave",
+            "MistyMeadow",
+            "SilverCrest",
+        ];
+        let now = mcp_agent_mail_db::timestamps::now_micros();
+        (0..n)
+            .map(|i| AgentSummary {
+                name: names[i % names.len()].into(),
+                program: "claude-code".into(),
+                #[allow(clippy::cast_possible_wrap)]
+                last_active_ts: now - (i as i64 * 60_000_000),
+            })
+            .collect()
+    }
+
+    fn buffer_text(f: &ftui::Frame<'_>) -> String {
+        let mut t = String::new();
+        for y in 0..f.buffer.height() {
+            for x in 0..f.buffer.width() {
+                if let Some(c) = f.buffer.get(x, y) {
+                    if let Some(ch) = c.content.as_char() {
+                        t.push(ch);
+                    } else if !c.is_continuation() {
+                        t.push(' ');
+                    }
+                }
+            }
+            t.push('\n');
+        }
+        t
+    }
+
+    #[test]
+    fn dashboard_0_agents_no_agent_panel() {
+        let snap = make_test_snapshot(vec![]);
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 20, &mut pool);
+        render_dashboard_frame(&mut frame, Rect::new(0, 0, 120, 20), &snap, 0.0, 0);
+        let text = buffer_text(&frame);
+        assert!(!text.contains(" Agents "), "no Agents panel with 0 agents");
+        assert!(text.contains("Server"));
+        assert!(text.contains("Database"));
+        assert!(text.contains("Traffic"));
+    }
+
+    #[test]
+    fn dashboard_1_agent_shows_panel() {
+        let snap = make_test_snapshot(make_agents(1));
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 20, &mut pool);
+        render_dashboard_frame(&mut frame, Rect::new(0, 0, 120, 20), &snap, 0.0, 0);
+        let text = buffer_text(&frame);
+        assert!(text.contains("Agents"), "Agents panel header");
+        assert!(text.contains("RedFox"), "agent name RedFox");
+    }
+
+    #[test]
+    fn dashboard_5_agents_shows_all() {
+        let snap = make_test_snapshot(make_agents(5));
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(140, 20, &mut pool);
+        render_dashboard_frame(&mut frame, Rect::new(0, 0, 140, 20), &snap, 0.0, 0);
+        let text = buffer_text(&frame);
+        assert!(text.contains("Agents"));
+        assert!(text.contains("RedFox"));
+        assert!(text.contains("SwiftWolf"));
+    }
+
+    #[test]
+    fn dashboard_10_agents_truncates() {
+        let snap = make_test_snapshot(make_agents(10));
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(140, 10, &mut pool);
+        render_dashboard_frame(&mut frame, Rect::new(0, 0, 140, 10), &snap, 0.0, 0);
+        let text = buffer_text(&frame);
+        assert!(text.contains("Agents"));
+        assert!(text.contains("RedFox"));
+    }
+
+    #[test]
+    fn dashboard_narrow_graceful() {
+        let snap = make_test_snapshot(make_agents(3));
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(60, 20, &mut pool);
+        render_dashboard_frame(&mut frame, Rect::new(0, 0, 60, 20), &snap, 0.0, 0);
+        let text = buffer_text(&frame);
+        assert!(text.contains("Agents") || text.contains("agents"));
+    }
+
+    #[test]
+    fn dashboard_tiny_no_panic() {
+        let snap = make_test_snapshot(make_agents(2));
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(30, 5, &mut pool);
+        render_dashboard_frame(&mut frame, Rect::new(0, 0, 30, 5), &snap, 0.0, 0);
+    }
+
+    // ── db_changed_rows tests ──
+
+    #[test]
+    fn db_changed_rows_identical_returns_zero() {
+        let a = DashboardDbStats {
+            projects: 5,
+            agents: 3,
+            messages: 100,
+            ..Default::default()
+        };
+        assert_eq!(db_changed_rows(&a, &a), 0);
+    }
+
+    #[test]
+    fn db_changed_rows_detects_each_field() {
+        let base = DashboardDbStats::default();
+        let mut changed = base.clone();
+        changed.projects = 1;
+        assert_eq!(db_changed_rows(&base, &changed), 0b00_0001);
+
+        let mut changed = base.clone();
+        changed.agents = 1;
+        assert_eq!(db_changed_rows(&base, &changed), 0b00_0010);
+
+        let mut changed = base.clone();
+        changed.messages = 1;
+        assert_eq!(db_changed_rows(&base, &changed), 0b00_0100);
+
+        let mut changed = base.clone();
+        changed.file_reservations = 1;
+        assert_eq!(db_changed_rows(&base, &changed), 0b00_1000);
+
+        let mut changed = base.clone();
+        changed.contact_links = 1;
+        assert_eq!(db_changed_rows(&base, &changed), 0b01_0000);
+
+        let mut changed = base.clone();
+        changed.ack_pending = 1;
+        assert_eq!(db_changed_rows(&base, &changed), 0b10_0000);
+    }
+
+    #[test]
+    fn db_changed_rows_multiple_changes() {
+        let base = DashboardDbStats::default();
+        let changed = DashboardDbStats {
+            projects: 1,
+            messages: 5,
+            ack_pending: 2,
+            ..Default::default()
+        };
+        assert_eq!(db_changed_rows(&base, &changed), 0b10_0101);
+    }
+
+    #[test]
+    fn dashboard_changed_rows_highlight_no_panic() {
+        let snap = make_test_snapshot(make_agents(0));
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(120, 20, &mut pool);
+        // All rows changed
+        render_dashboard_frame(&mut frame, Rect::new(0, 0, 120, 20), &snap, 0.5, 0b11_1111);
     }
 }

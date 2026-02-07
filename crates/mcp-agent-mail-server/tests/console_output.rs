@@ -1,7 +1,8 @@
 mod common;
 
 use mcp_agent_mail_server::console::{
-    BannerParams, render_startup_banner, render_tool_call_end, render_tool_call_start,
+    BannerParams, render_http_request_panel, render_startup_banner, render_tool_call_end,
+    render_tool_call_start,
 };
 
 #[test]
@@ -67,4 +68,30 @@ fn tool_call_end_masks_result_json_after_normalization() {
     assert!(joined.contains("Result:"));
     assert!(!joined.contains("secret123"));
     assert!(joined.contains("<redacted>"));
+}
+
+#[test]
+fn http_request_panel_contains_method_path_status() {
+    let panel =
+        render_http_request_panel(100, "GET", "/health/liveness", 200, 5, "127.0.0.1", true)
+            .expect("expected panel");
+    let joined = common::normalize_console_text(&panel);
+    assert!(joined.contains("GET"));
+    assert!(joined.contains("/health/liveness"));
+    assert!(joined.contains("200"));
+    assert!(joined.contains("5ms"));
+    assert!(joined.contains("client:"));
+    assert!(joined.contains("127.0.0.1"));
+}
+
+#[test]
+fn http_request_panel_plain_has_no_ansi_escapes() {
+    let panel = render_http_request_panel(100, "POST", "/mcp", 201, 42, "10.0.0.1", false)
+        .expect("expected panel");
+    // For plain panels, the raw output should already be escape-free.
+    assert_eq!(panel, common::strip_ansi_and_osc(&panel));
+    assert!(panel.contains("POST"));
+    assert!(panel.contains("/mcp"));
+    assert!(panel.contains("201"));
+    assert!(panel.contains("42ms"));
 }
