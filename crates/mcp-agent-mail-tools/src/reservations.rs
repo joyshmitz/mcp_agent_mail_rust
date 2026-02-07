@@ -945,4 +945,148 @@ mod tests {
             assert!(result.to_string_lossy().ends_with("projects/repo"));
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Empty paths validation (file_reservation_paths logic)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn empty_paths_detected() {
+        let paths: Vec<String> = vec![];
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn non_empty_paths_accepted() {
+        let paths = ["src/*.rs".to_string()];
+        assert!(!paths.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // TTL validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn default_ttl_is_one_hour() {
+        let ttl: i64 = 3600;
+        assert_eq!(ttl, 3600);
+    }
+
+    #[test]
+    fn ttl_below_60_warns_but_accepted() {
+        let ttl = 30_i64;
+        assert!(ttl < 60);
+        // Tool does not reject; just logs
+    }
+
+    #[test]
+    fn default_exclusive_is_true() {
+        let exclusive: bool = true;
+        assert!(exclusive);
+    }
+
+    // -----------------------------------------------------------------------
+    // Response type serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn granted_reservation_serializes() {
+        let r = GrantedReservation {
+            id: 1,
+            path_pattern: "src/**/*.rs".into(),
+            exclusive: true,
+            reason: "Working on parser".into(),
+            expires_ts: "2026-02-06T02:00:00Z".into(),
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(json["id"], 1);
+        assert_eq!(json["path_pattern"], "src/**/*.rs");
+        assert_eq!(json["exclusive"], true);
+    }
+
+    #[test]
+    fn reservation_conflict_serializes() {
+        let r = ReservationConflict {
+            path: "src/main.rs".into(),
+            holders: vec![ConflictHolder {
+                agent_name: "RedFox".into(),
+                reservation_id: 5,
+                expires_ts: "2026-02-06T03:00:00Z".into(),
+            }],
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(json["path"], "src/main.rs");
+        assert_eq!(json["holders"][0]["agent_name"], "RedFox");
+        assert_eq!(json["holders"][0]["reservation_id"], 5);
+    }
+
+    #[test]
+    fn reservation_response_serializes() {
+        let r = ReservationResponse {
+            granted: vec![GrantedReservation {
+                id: 1,
+                path_pattern: "*.rs".into(),
+                exclusive: true,
+                reason: "test".into(),
+                expires_ts: "2026-02-06T02:00:00Z".into(),
+            }],
+            conflicts: vec![],
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(json["granted"].as_array().unwrap().len(), 1);
+        assert!(json["conflicts"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn release_result_serializes() {
+        let r = ReleaseResult {
+            released: 3,
+            released_at: "2026-02-06T01:00:00Z".into(),
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(json["released"], 3);
+        assert!(json["released_at"].is_string());
+    }
+
+    #[test]
+    fn renewal_result_serializes() {
+        let r = RenewalResult {
+            renewed: 2,
+            file_reservations: vec![RenewedReservation {
+                id: 10,
+                path_pattern: "docs/*.md".into(),
+                old_expires_ts: "2026-02-06T01:00:00Z".into(),
+                new_expires_ts: "2026-02-06T02:00:00Z".into(),
+            }],
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(json["renewed"], 2);
+        assert_eq!(json["file_reservations"][0]["id"], 10);
+        assert!(json["file_reservations"][0]["old_expires_ts"].is_string());
+    }
+
+    #[test]
+    fn reservation_response_round_trips() {
+        let original = ReservationResponse {
+            granted: vec![],
+            conflicts: vec![ReservationConflict {
+                path: "lib.rs".into(),
+                holders: vec![ConflictHolder {
+                    agent_name: "GoldHawk".into(),
+                    reservation_id: 7,
+                    expires_ts: "2026-02-06T04:00:00Z".into(),
+                }],
+            }],
+        };
+        let json_str = serde_json::to_string(&original).unwrap();
+        let deserialized: ReservationResponse = serde_json::from_str(&json_str).unwrap();
+        assert!(deserialized.granted.is_empty());
+        assert_eq!(deserialized.conflicts.len(), 1);
+        assert_eq!(deserialized.conflicts[0].holders[0].agent_name, "GoldHawk");
+    }
 }

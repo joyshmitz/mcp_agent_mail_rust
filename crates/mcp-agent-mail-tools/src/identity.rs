@@ -283,7 +283,7 @@ Check that all parameters have valid values."
 
     // Validate attachments_policy if provided
     let policy = attachments_policy.unwrap_or_else(|| "auto".to_string());
-    if !["auto", "inline", "file", "none"].contains(&policy.as_str()) {
+    if !is_valid_attachments_policy(&policy) {
         return Err(legacy_tool_error(
             "INVALID_ARGUMENT",
             format!(
@@ -426,7 +426,7 @@ Check that all parameters have valid values."
 
     // Validate attachments_policy if provided
     let policy = attachments_policy.unwrap_or_else(|| "auto".to_string());
-    if !["auto", "inline", "file", "none"].contains(&policy.as_str()) {
+    if !is_valid_attachments_policy(&policy) {
         return Err(legacy_tool_error(
             "INVALID_ARGUMENT",
             format!(
@@ -518,6 +518,14 @@ Choose a different name (or omit the name to auto-generate one)."
         .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
 }
 
+/// Validate `attachments_policy` value.
+///
+/// Returns `true` if the policy is one of the valid values: auto, inline, file, none.
+#[must_use]
+pub fn is_valid_attachments_policy(policy: &str) -> bool {
+    ["auto", "inline", "file", "none"].contains(&policy)
+}
+
 /// Look up agent profile with optional recent commits.
 ///
 /// # Parameters
@@ -600,4 +608,266 @@ pub async fn whois(
 
     serde_json::to_string(&response)
         .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── redact_database_url ──
+
+    #[test]
+    fn redact_hides_password_in_postgres_url() {
+        assert_eq!(
+            redact_database_url("postgres://user:secret@localhost/db"),
+            "postgres://****@localhost/db"
+        );
+    }
+
+    #[test]
+    fn redact_hides_password_in_sqlite_userinfo() {
+        assert_eq!(
+            redact_database_url("sqlite://admin:pass123@/data/test.db"),
+            "sqlite://****@/data/test.db"
+        );
+    }
+
+    #[test]
+    fn redact_preserves_url_without_credentials() {
+        assert_eq!(
+            redact_database_url("sqlite:///data/agent_mail.db"),
+            "sqlite:///data/agent_mail.db"
+        );
+    }
+
+    #[test]
+    fn redact_preserves_plain_path() {
+        assert_eq!(
+            redact_database_url("/data/agent_mail.db"),
+            "/data/agent_mail.db"
+        );
+    }
+
+    #[test]
+    fn redact_handles_empty_string() {
+        assert_eq!(redact_database_url(""), "");
+    }
+
+    #[test]
+    fn redact_handles_no_at_sign() {
+        assert_eq!(
+            redact_database_url("postgres://localhost/db"),
+            "postgres://localhost/db"
+        );
+    }
+
+    #[test]
+    fn redact_handles_complex_password_with_special_chars() {
+        assert_eq!(
+            redact_database_url("postgres://user:p@ss%40word@host:5432/db"),
+            "postgres://****@host:5432/db"
+        );
+    }
+
+    // ── is_valid_attachments_policy ──
+
+    #[test]
+    fn valid_attachments_policies_accepted() {
+        assert!(is_valid_attachments_policy("auto"));
+        assert!(is_valid_attachments_policy("inline"));
+        assert!(is_valid_attachments_policy("file"));
+        assert!(is_valid_attachments_policy("none"));
+    }
+
+    #[test]
+    fn invalid_attachments_policies_rejected() {
+        assert!(!is_valid_attachments_policy(""));
+        assert!(!is_valid_attachments_policy("AUTO"));
+        assert!(!is_valid_attachments_policy("Inline"));
+        assert!(!is_valid_attachments_policy("always"));
+        assert!(!is_valid_attachments_policy("never"));
+        assert!(!is_valid_attachments_policy("detach"));
+        assert!(!is_valid_attachments_policy(" auto"));
+        assert!(!is_valid_attachments_policy("auto "));
+    }
+
+    // ── Response type serialization ──
+
+    #[test]
+    fn health_check_response_serializes() {
+        let r = HealthCheckResponse {
+            status: "ok".into(),
+            environment: "development".into(),
+            http_host: "0.0.0.0".into(),
+            http_port: 8765,
+            database_url: "sqlite:///data/test.db".into(),
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["http_port"], 8765);
+    }
+
+    #[test]
+    fn project_response_serializes() {
+        let r = ProjectResponse {
+            id: 1,
+            slug: "data-projects-test".into(),
+            human_key: "/data/projects/test".into(),
+            created_at: "2026-02-06T00:00:00Z".into(),
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(json["id"], 1);
+        assert_eq!(json["slug"], "data-projects-test");
+        assert_eq!(json["human_key"], "/data/projects/test");
+    }
+
+    #[test]
+    fn agent_response_serializes_all_fields() {
+        let r = AgentResponse {
+            id: 42,
+            name: "BlueLake".into(),
+            program: "claude-code".into(),
+            model: "opus-4.5".into(),
+            task_description: "Testing".into(),
+            inception_ts: "2026-02-06T00:00:00Z".into(),
+            last_active_ts: "2026-02-06T01:00:00Z".into(),
+            project_id: 1,
+            attachments_policy: "auto".into(),
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(json["name"], "BlueLake");
+        assert_eq!(json["program"], "claude-code");
+        assert_eq!(json["attachments_policy"], "auto");
+        assert_eq!(json["id"], 42);
+        assert_eq!(json["project_id"], 1);
+    }
+
+    #[test]
+    fn agent_response_round_trips() {
+        let original = AgentResponse {
+            id: 42,
+            name: "BlueLake".into(),
+            program: "claude-code".into(),
+            model: "opus-4.5".into(),
+            task_description: "Testing".into(),
+            inception_ts: "2026-02-06T00:00:00Z".into(),
+            last_active_ts: "2026-02-06T01:00:00Z".into(),
+            project_id: 1,
+            attachments_policy: "auto".into(),
+        };
+        let json_str = serde_json::to_string(&original).unwrap();
+        let deserialized: AgentResponse = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(deserialized.name, original.name);
+        assert_eq!(deserialized.id, original.id);
+        assert_eq!(deserialized.program, original.program);
+    }
+
+    #[test]
+    fn whois_response_flattens_agent_fields() {
+        let r = WhoisResponse {
+            agent: AgentResponse {
+                id: 1,
+                name: "RedFox".into(),
+                program: "codex-cli".into(),
+                model: "gpt-5".into(),
+                task_description: String::new(),
+                inception_ts: "2026-02-06T00:00:00Z".into(),
+                last_active_ts: "2026-02-06T00:00:00Z".into(),
+                project_id: 1,
+                attachments_policy: "auto".into(),
+            },
+            recent_commits: vec![CommitInfo {
+                hexsha: "abc123".into(),
+                summary: "test commit".into(),
+                authored_ts: "2026-02-06T00:00:00Z".into(),
+            }],
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        // Agent fields are flattened into the top level
+        assert_eq!(json["name"], "RedFox");
+        assert_eq!(json["program"], "codex-cli");
+        // Commits are nested
+        assert_eq!(json["recent_commits"][0]["hexsha"], "abc123");
+    }
+
+    #[test]
+    fn whois_response_empty_commits_array() {
+        let r = WhoisResponse {
+            agent: AgentResponse {
+                id: 1,
+                name: "BlueLake".into(),
+                program: "claude-code".into(),
+                model: "opus-4.5".into(),
+                task_description: String::new(),
+                inception_ts: String::new(),
+                last_active_ts: String::new(),
+                project_id: 1,
+                attachments_policy: "none".into(),
+            },
+            recent_commits: vec![],
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert!(json["recent_commits"].as_array().unwrap().is_empty());
+    }
+
+    // ── Path validation (ensure_project logic) ──
+
+    #[test]
+    fn absolute_paths_detected() {
+        assert!(Path::new("/data/projects/test").is_absolute());
+        assert!(Path::new("/").is_absolute());
+        assert!(Path::new("/home/user/.config").is_absolute());
+    }
+
+    #[test]
+    fn relative_paths_detected() {
+        assert!(!Path::new("data/projects/test").is_absolute());
+        assert!(!Path::new("./test").is_absolute());
+        assert!(!Path::new("test").is_absolute());
+        assert!(!Path::new("").is_absolute());
+    }
+
+    // ── Agent name validation (from core) ──
+
+    #[test]
+    fn valid_agent_names_accepted() {
+        use mcp_agent_mail_core::models::is_valid_agent_name;
+        assert!(is_valid_agent_name("BlueLake"));
+        assert!(is_valid_agent_name("RedFox"));
+        assert!(is_valid_agent_name("GoldHawk"));
+    }
+
+    #[test]
+    fn invalid_agent_names_rejected() {
+        use mcp_agent_mail_core::models::is_valid_agent_name;
+        assert!(!is_valid_agent_name(""));
+        assert!(!is_valid_agent_name("blue_lake")); // underscore not allowed
+        assert!(!is_valid_agent_name("123"));
+        assert!(!is_valid_agent_name("Blue Lake")); // space not allowed
+        assert!(!is_valid_agent_name("EaglePeak")); // eagle is a noun, not adjective
+        assert!(!is_valid_agent_name("BraveLion")); // brave not in adjective list
+        assert!(!is_valid_agent_name("x")); // too short
+    }
+
+    // ── Whitespace trimming for program/model ──
+
+    #[test]
+    fn whitespace_only_program_is_empty_after_trim() {
+        assert!("".trim().is_empty());
+        assert!("  ".trim().is_empty());
+        assert!("\t".trim().is_empty());
+        assert!(!"claude-code".trim().is_empty());
+    }
+
+    #[test]
+    fn whitespace_only_model_is_empty_after_trim() {
+        assert!("".trim().is_empty());
+        assert!("  ".trim().is_empty());
+        assert!(!"opus-4.5".trim().is_empty());
+    }
 }

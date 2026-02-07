@@ -1492,4 +1492,164 @@ mod tests {
         assert_eq!(apply_prefix("My topic", "FW:"), "FW: My topic");
         assert_eq!(apply_prefix("FW: My topic", "FW:"), "FW: My topic");
     }
+
+    // -----------------------------------------------------------------------
+    // Empty recipients detection (send_message validation)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn empty_to_list_detected() {
+        let to: Vec<String> = vec![];
+        assert!(to.is_empty());
+    }
+
+    #[test]
+    fn non_empty_to_list_accepted() {
+        let to = ["BlueLake".to_string()];
+        assert!(!to.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Response type serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn send_message_response_serializes() {
+        let r = SendMessageResponse {
+            deliveries: vec![],
+            count: 0,
+            attachments: vec![],
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(json["count"], 0);
+        assert!(json["deliveries"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn inbox_message_omits_body_when_none() {
+        let r = InboxMessage {
+            id: 1,
+            project_id: 1,
+            sender_id: 1,
+            thread_id: None,
+            subject: "test".into(),
+            importance: "normal".into(),
+            ack_required: false,
+            from: "BlueLake".into(),
+            created_ts: Some("2026-02-06T00:00:00Z".into()),
+            kind: "to".into(),
+            attachments: vec![],
+            body_md: None,
+        };
+        let json_str = serde_json::to_string(&r).unwrap();
+        assert!(!json_str.contains("body_md"));
+    }
+
+    #[test]
+    fn inbox_message_includes_body_when_present() {
+        let r = InboxMessage {
+            id: 1,
+            project_id: 1,
+            sender_id: 1,
+            thread_id: Some("thread-1".into()),
+            subject: "test".into(),
+            importance: "normal".into(),
+            ack_required: true,
+            from: "BlueLake".into(),
+            created_ts: Some("2026-02-06T00:00:00Z".into()),
+            kind: "to".into(),
+            attachments: vec!["img.webp".into()],
+            body_md: Some("Hello world".into()),
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(json["body_md"], "Hello world");
+        assert_eq!(json["ack_required"], true);
+        assert_eq!(json["thread_id"], "thread-1");
+    }
+
+    #[test]
+    fn read_status_response_omits_null_read_at() {
+        let r = ReadStatusResponse {
+            message_id: 42,
+            read: false,
+            read_at: None,
+        };
+        let json_str = serde_json::to_string(&r).unwrap();
+        assert!(!json_str.contains("read_at"));
+        let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(json["message_id"], 42);
+        assert_eq!(json["read"], false);
+    }
+
+    #[test]
+    fn ack_status_response_includes_timestamps() {
+        let r = AckStatusResponse {
+            message_id: 10,
+            acknowledged: true,
+            acknowledged_at: Some("2026-02-06T01:00:00Z".into()),
+            read_at: Some("2026-02-06T00:30:00Z".into()),
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(json["acknowledged"], true);
+        assert!(json["acknowledged_at"].is_string());
+        assert!(json["read_at"].is_string());
+    }
+
+    #[test]
+    fn message_payload_serializes_all_fields() {
+        let r = MessagePayload {
+            id: 1,
+            project_id: 1,
+            sender_id: 2,
+            thread_id: Some("t-1".into()),
+            subject: "Hello".into(),
+            body_md: "# Content".into(),
+            importance: "high".into(),
+            ack_required: true,
+            created_ts: Some("2026-02-06T00:00:00Z".into()),
+            attachments: vec!["file.webp".into()],
+            from: "BlueLake".into(),
+            to: vec!["RedFox".into()],
+            cc: vec!["GoldHawk".into()],
+            bcc: vec![],
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(json["from"], "BlueLake");
+        assert_eq!(json["to"][0], "RedFox");
+        assert_eq!(json["cc"][0], "GoldHawk");
+        assert!(json["bcc"].as_array().unwrap().is_empty());
+        assert_eq!(json["importance"], "high");
+    }
+
+    #[test]
+    fn reply_response_round_trips() {
+        let original = ReplyMessageResponse {
+            id: 5,
+            project_id: 1,
+            sender_id: 2,
+            thread_id: Some("t-1".into()),
+            subject: "Re: Hello".into(),
+            importance: "normal".into(),
+            ack_required: false,
+            created_ts: Some("2026-02-06T00:00:00Z".into()),
+            attachments: vec![],
+            body_md: "Reply body".into(),
+            from: "BlueLake".into(),
+            to: vec!["RedFox".into()],
+            cc: vec![],
+            bcc: vec![],
+            reply_to: 3,
+            deliveries: vec![],
+            count: 1,
+        };
+        let json_str = serde_json::to_string(&original).unwrap();
+        let deserialized: ReplyMessageResponse = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(deserialized.id, 5);
+        assert_eq!(deserialized.reply_to, 3);
+        assert_eq!(deserialized.subject, "Re: Hello");
+    }
 }

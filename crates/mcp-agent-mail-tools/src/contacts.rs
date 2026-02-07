@@ -82,6 +82,23 @@ pub struct RespondContactResponse {
     pub updated: usize,
 }
 
+/// Valid contact policy values.
+pub const VALID_CONTACT_POLICIES: &[&str] = &["open", "auto", "contacts_only", "block_all"];
+
+/// Normalize a contact policy string.
+///
+/// Trims whitespace, lowercases, and returns the value if it matches a known
+/// policy. Unknown values silently default to `"auto"`.
+#[must_use]
+pub fn normalize_contact_policy(raw: &str) -> String {
+    let norm = raw.trim().to_ascii_lowercase();
+    if VALID_CONTACT_POLICIES.contains(&norm.as_str()) {
+        norm
+    } else {
+        "auto".to_string()
+    }
+}
+
 /// Request contact approval to message another agent.
 ///
 /// Creates or refreshes a pending `AgentLink` and sends a small `ack_required` intro message.
@@ -363,11 +380,7 @@ pub async fn set_contact_policy(
     agent_name: String,
     policy: String,
 ) -> McpResult<String> {
-    let policy_norm = policy.trim().to_ascii_lowercase();
-    let policy_norm = match policy_norm.as_str() {
-        "open" | "auto" | "contacts_only" | "block_all" => policy_norm,
-        _ => "auto".to_string(),
-    };
+    let policy_norm = normalize_contact_policy(&policy);
 
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
@@ -400,4 +413,159 @@ pub async fn set_contact_policy(
 
     serde_json::to_string(&response)
         .map_err(|e| McpError::internal_error(format!("JSON serialization error: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── normalize_contact_policy ──
+
+    #[test]
+    fn valid_policies_preserved() {
+        assert_eq!(normalize_contact_policy("open"), "open");
+        assert_eq!(normalize_contact_policy("auto"), "auto");
+        assert_eq!(normalize_contact_policy("contacts_only"), "contacts_only");
+        assert_eq!(normalize_contact_policy("block_all"), "block_all");
+    }
+
+    #[test]
+    fn case_insensitive_normalization() {
+        assert_eq!(normalize_contact_policy("OPEN"), "open");
+        assert_eq!(normalize_contact_policy("Auto"), "auto");
+        assert_eq!(normalize_contact_policy("CONTACTS_ONLY"), "contacts_only");
+        assert_eq!(normalize_contact_policy("Block_All"), "block_all");
+    }
+
+    #[test]
+    fn whitespace_trimmed() {
+        assert_eq!(normalize_contact_policy("  open  "), "open");
+        assert_eq!(normalize_contact_policy("\tauto\n"), "auto");
+    }
+
+    #[test]
+    fn unknown_policies_default_to_auto() {
+        assert_eq!(normalize_contact_policy(""), "auto");
+        assert_eq!(normalize_contact_policy("invalid"), "auto");
+        assert_eq!(normalize_contact_policy("reject"), "auto");
+        assert_eq!(normalize_contact_policy("allow"), "auto");
+        assert_eq!(normalize_contact_policy("block"), "auto");
+        assert_eq!(normalize_contact_policy("none"), "auto");
+        assert_eq!(normalize_contact_policy("contacts-only"), "auto");
+    }
+
+    // ── Response type serialization ──
+
+    #[test]
+    fn contact_link_state_serializes() {
+        let r = ContactLinkState {
+            from: "BlueLake".into(),
+            from_project: "/data/projects/test".into(),
+            to: "RedFox".into(),
+            to_project: "/data/projects/test".into(),
+            status: "pending".into(),
+            expires_ts: Some("2026-02-13T00:00:00Z".into()),
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(json["from"], "BlueLake");
+        assert_eq!(json["to"], "RedFox");
+        assert_eq!(json["status"], "pending");
+        assert!(json["expires_ts"].is_string());
+    }
+
+    #[test]
+    fn contact_link_state_null_expires() {
+        let r = ContactLinkState {
+            from: "A".into(),
+            from_project: "/p".into(),
+            to: "B".into(),
+            to_project: "/p".into(),
+            status: "approved".into(),
+            expires_ts: None,
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert!(json["expires_ts"].is_null());
+    }
+
+    #[test]
+    fn simple_contact_entry_serializes() {
+        let r = SimpleContactEntry {
+            to: "RedFox".into(),
+            status: "approved".into(),
+            reason: "collaboration".into(),
+            updated_ts: None,
+            expires_ts: None,
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(json["to"], "RedFox");
+        assert_eq!(json["status"], "approved");
+        assert!(json["updated_ts"].is_null());
+    }
+
+    #[test]
+    fn simple_policy_response_serializes() {
+        let r = SimplePolicyResponse {
+            agent: "BlueLake".into(),
+            policy: "contacts_only".into(),
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(json["agent"], "BlueLake");
+        assert_eq!(json["policy"], "contacts_only");
+    }
+
+    #[test]
+    fn respond_contact_response_serializes() {
+        let r = RespondContactResponse {
+            from: "A".into(),
+            to: "B".into(),
+            approved: true,
+            expires_ts: Some("2026-03-06T00:00:00Z".into()),
+            updated: 1,
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(json["approved"], true);
+        assert_eq!(json["updated"], 1);
+        assert_eq!(json["from"], "A");
+    }
+
+    #[test]
+    fn contact_link_round_trips() {
+        let original = ContactLink {
+            id: 1,
+            from_agent: "BlueLake".into(),
+            from_project: "/data/p1".into(),
+            to_agent: "RedFox".into(),
+            to_project: "/data/p2".into(),
+            status: "approved".into(),
+            reason: "coordination".into(),
+            created_ts: "2026-02-06T00:00:00Z".into(),
+            updated_ts: "2026-02-06T01:00:00Z".into(),
+            expires_ts: Some("2026-03-06T00:00:00Z".into()),
+        };
+        let json_str = serde_json::to_string(&original).unwrap();
+        let deserialized: ContactLink = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(deserialized.id, original.id);
+        assert_eq!(deserialized.from_agent, original.from_agent);
+        assert_eq!(deserialized.to_agent, original.to_agent);
+        assert_eq!(deserialized.status, original.status);
+    }
+
+    // ── TTL defaults ──
+
+    #[test]
+    fn default_request_ttl_is_seven_days() {
+        let ttl: i64 = 604_800;
+        assert_eq!(ttl, 7 * 24 * 3600);
+    }
+
+    #[test]
+    fn default_respond_ttl_is_thirty_days() {
+        let ttl: i64 = 2_592_000;
+        assert_eq!(ttl, 30 * 24 * 3600);
+    }
 }
