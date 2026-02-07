@@ -19,7 +19,7 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
-use git2::{Repository, Signature};
+use git2::{IndexAddOption, Repository, Signature};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha1::Digest as Sha1Digest;
@@ -182,7 +182,7 @@ enum WbqMsg {
 
 #[derive(Debug)]
 struct WbqOpEnvelope {
-    enqueued_us: u64,
+    enqueued_at: Instant,
     op: Box<WriteOp>,
 }
 
@@ -190,12 +190,12 @@ struct WriteBehindQueue {
     sender: std::sync::mpsc::SyncSender<WbqMsg>,
     drain_handle: OrderedMutex<Option<std::thread::JoinHandle<()>>>,
     op_depth: Arc<AtomicU64>,
-    last_peak_reset_us: Arc<AtomicU64>,
 }
 
-const WBQ_CHANNEL_CAPACITY: usize = 256;
-const WBQ_DRAIN_BATCH_CAP: usize = 64;
+const WBQ_CHANNEL_CAPACITY: usize = 8_192;
+const WBQ_DRAIN_BATCH_CAP: usize = 256;
 const WBQ_FLUSH_INTERVAL_MS: u64 = 100;
+const WBQ_ENQUEUE_TIMEOUT_MS: u64 = 100;
 
 static WBQ: OnceLock<WriteBehindQueue> = OnceLock::new();
 
@@ -203,46 +203,94 @@ static WBQ: OnceLock<WriteBehindQueue> = OnceLock::new();
 pub fn wbq_start() {
     WBQ.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::sync_channel(WBQ_CHANNEL_CAPACITY);
+        let op_depth = Arc::new(AtomicU64::new(0));
+        let op_depth_worker = Arc::clone(&op_depth);
         let handle = std::thread::Builder::new()
             .name("wbq-drain".into())
-            .spawn(move || wbq_drain_loop(rx))
+            .spawn(move || wbq_drain_loop(rx, op_depth_worker))
             .expect("failed to spawn WBQ drain worker");
+
+        mcp_agent_mail_core::global_metrics()
+            .storage
+            .wbq_capacity
+            .set(u64::try_from(WBQ_CHANNEL_CAPACITY).unwrap_or(u64::MAX));
+
         WriteBehindQueue {
             sender: tx,
             drain_handle: OrderedMutex::new(LockLevel::StorageWbqDrainHandle, Some(handle)),
-            op_depth: Arc::new(AtomicU64::new(0)),
-            last_peak_reset_us: Arc::new(AtomicU64::new(0)),
+            op_depth,
         }
     });
 }
 
-/// Enqueue a write op. Returns `false` if the channel is full (caller should
-/// fall back to synchronous write).
+fn wbq_record_enqueue_success(wbq: &WriteBehindQueue) {
+    let metrics = mcp_agent_mail_core::global_metrics();
+    metrics.storage.wbq_enqueued_total.inc();
+
+    let depth = wbq
+        .op_depth
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    metrics.storage.wbq_depth.set(depth);
+    metrics.storage.wbq_peak_depth.fetch_max(depth);
+
+    let cap = u64::try_from(WBQ_CHANNEL_CAPACITY).unwrap_or(u64::MAX);
+    let threshold = cap.saturating_mul(80).saturating_div(100);
+    if threshold > 0 && depth >= threshold {
+        if metrics.storage.wbq_over_80_since_us.load() == 0 {
+            metrics.storage.wbq_over_80_since_us.set(now_micros_u64());
+        }
+    } else {
+        metrics.storage.wbq_over_80_since_us.set(0);
+    }
+}
+
+/// Enqueue a write op. Returns `false` only if the queue is unavailable
+/// (timed out or worker disconnected).
 pub fn wbq_enqueue(op: WriteOp) -> bool {
     wbq_start();
     let wbq = WBQ.get().expect("WBQ must be initialised");
-    let now_us = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as u64;
     let envelope = WbqOpEnvelope {
-        enqueued_us: now_us,
+        enqueued_at: Instant::now(),
         op: Box::new(op),
     };
-    match wbq.sender.try_send(WbqMsg::Op(envelope)) {
+
+    let msg = WbqMsg::Op(envelope);
+    match wbq.sender.try_send(msg) {
         Ok(()) => {
-            mcp_agent_mail_core::global_metrics()
-                .storage
-                .wbq_enqueued_total
-                .inc();
+            wbq_record_enqueue_success(wbq);
             true
         }
-        Err(_) => {
+        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+        Err(std::sync::mpsc::TrySendError::Full(msg)) => {
+            // Backpressure: queue is temporarily full. Block briefly to avoid
+            // synchronous IO fallback on the tool hot path.
             mcp_agent_mail_core::global_metrics()
                 .storage
                 .wbq_fallbacks_total
                 .inc();
-            false
+            // std::sync::mpsc::SyncSender does not expose a stable send_timeout; emulate with
+            // try_send + a short sleep until a deadline.
+            let deadline = Instant::now() + Duration::from_millis(WBQ_ENQUEUE_TIMEOUT_MS);
+            let mut cur = msg;
+            loop {
+                match wbq.sender.try_send(cur) {
+                    Ok(()) => {
+                        wbq_record_enqueue_success(wbq);
+                        break true;
+                    }
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                        break false;
+                    }
+                    Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                        if Instant::now() >= deadline {
+                            break false;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                        cur = returned;
+                    }
+                }
+            }
         }
     }
 }
@@ -295,7 +343,7 @@ pub fn wbq_stats() -> WbqStats {
     }
 }
 
-fn wbq_drain_loop(rx: std::sync::mpsc::Receiver<WbqMsg>) {
+fn wbq_drain_loop(rx: std::sync::mpsc::Receiver<WbqMsg>, op_depth: Arc<AtomicU64>) {
     let flush_interval = Duration::from_millis(WBQ_FLUSH_INTERVAL_MS);
     let mut flush_waiters: Vec<std::sync::mpsc::SyncSender<()>> = Vec::new();
     let mut shutting_down = false;
@@ -327,19 +375,46 @@ fn wbq_drain_loop(rx: std::sync::mpsc::Receiver<WbqMsg>) {
         }
 
         let drained = batch.len();
+        let drained_u64 = u64::try_from(drained).unwrap_or(u64::MAX);
+
+        let depth_after = op_depth
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_sub(drained_u64))
+            })
+            .unwrap_or(0)
+            .saturating_sub(drained_u64);
+
+        let metrics = mcp_agent_mail_core::global_metrics();
+        metrics.storage.wbq_depth.set(depth_after);
+        let cap = u64::try_from(WBQ_CHANNEL_CAPACITY).unwrap_or(u64::MAX);
+        let threshold = cap.saturating_mul(80).saturating_div(100);
+        if threshold > 0 && depth_after >= threshold {
+            if metrics.storage.wbq_over_80_since_us.load() == 0 {
+                metrics.storage.wbq_over_80_since_us.set(now_micros_u64());
+            }
+        } else {
+            metrics.storage.wbq_over_80_since_us.set(0);
+        }
+
         let mut errors = 0usize;
         for envelope in batch {
-            if let Err(e) = wbq_execute_op(&envelope.op) {
+            let r = wbq_execute_op(&envelope.op);
+            let latency_us = u64::try_from(
+                envelope
+                    .enqueued_at
+                    .elapsed()
+                    .as_micros()
+                    .min(u128::from(u64::MAX)),
+            )
+            .unwrap_or(u64::MAX);
+            metrics.storage.wbq_queue_latency_us.record(latency_us);
+            if let Err(e) = r {
                 tracing::warn!("[wbq-drain] op failed: {e}");
                 errors += 1;
             }
         }
 
-        let metrics = mcp_agent_mail_core::global_metrics();
-        metrics
-            .storage
-            .wbq_drained_total
-            .add(u64::try_from(drained).unwrap_or(u64::MAX));
+        metrics.storage.wbq_drained_total.add(drained_u64);
         metrics
             .storage
             .wbq_errors_total
@@ -358,7 +433,38 @@ fn wbq_drain_loop(rx: std::sync::mpsc::Receiver<WbqMsg>) {
     for msg in rx.try_iter() {
         match msg {
             WbqMsg::Op(envelope) => {
-                let _ = wbq_execute_op(&envelope.op);
+                let depth_after = op_depth
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                        Some(cur.saturating_sub(1))
+                    })
+                    .unwrap_or(0)
+                    .saturating_sub(1);
+                let metrics = mcp_agent_mail_core::global_metrics();
+                metrics.storage.wbq_depth.set(depth_after);
+                let cap = u64::try_from(WBQ_CHANNEL_CAPACITY).unwrap_or(u64::MAX);
+                let threshold = cap.saturating_mul(80).saturating_div(100);
+                if threshold > 0 && depth_after >= threshold {
+                    if metrics.storage.wbq_over_80_since_us.load() == 0 {
+                        metrics.storage.wbq_over_80_since_us.set(now_micros_u64());
+                    }
+                } else {
+                    metrics.storage.wbq_over_80_since_us.set(0);
+                }
+
+                let r = wbq_execute_op(&envelope.op);
+                let latency_us = u64::try_from(
+                    envelope
+                        .enqueued_at
+                        .elapsed()
+                        .as_micros()
+                        .min(u128::from(u64::MAX)),
+                )
+                .unwrap_or(u64::MAX);
+                metrics.storage.wbq_queue_latency_us.record(latency_us);
+                metrics.storage.wbq_drained_total.inc();
+                if r.is_err() {
+                    metrics.storage.wbq_errors_total.inc();
+                }
             }
             WbqMsg::Flush(done_tx) => {
                 let _ = done_tx.try_send(());
@@ -961,11 +1067,40 @@ enum CoalescerMsg {
 
 /// Fields for a single commit request within the coalescer pipeline.
 struct CoalescerCommitFields {
+    enqueued_at: Instant,
     repo_root: PathBuf,
     git_author_name: String,
     git_author_email: String,
     message: String,
     rel_paths: Vec<String>,
+}
+
+struct CoalescerSpillRepo {
+    pending_requests: u64,
+    earliest_enqueued_at: Instant,
+    dirty_all: bool,
+    paths: HashSet<String>,
+    git_author_name: String,
+    git_author_email: String,
+    message_first_lines: VecDeque<String>,
+    message_total: u64,
+}
+
+struct CoalescerSpilledWork {
+    repo_root: PathBuf,
+    pending_requests: u64,
+    earliest_enqueued_at: Instant,
+    dirty_all: bool,
+    paths: Vec<String>,
+    git_author_name: String,
+    git_author_email: String,
+    message_first_lines: Vec<String>,
+    message_total: u64,
+}
+
+struct CommitCoalescerShard {
+    sender: std::sync::mpsc::SyncSender<CoalescerMsg>,
+    spill: Arc<Mutex<HashMap<PathBuf, CoalescerSpillRepo>>>,
 }
 
 /// Fire-and-forget git commit coalescer with background worker thread.
@@ -977,8 +1112,9 @@ struct CoalescerCommitFields {
 /// Under extreme load, this naturally coalesces many small commits into fewer
 /// large ones, dramatically reducing git index.lock contention.
 pub struct CommitCoalescer {
-    sender: std::sync::mpsc::Sender<CoalescerMsg>,
+    shards: Vec<CommitCoalescerShard>,
     stats: Arc<Mutex<CommitQueueStats>>,
+    pending_requests: Arc<AtomicU64>,
     /// Kept alive to share with worker thread (accessed via Arc clone).
     _batch_sizes: Arc<Mutex<VecDeque<usize>>>,
 }
@@ -990,28 +1126,126 @@ pub struct CommitCoalescer {
 pub const DEFAULT_COALESCER_FLUSH_MS: u64 = 50;
 
 const COALESCER_MAX_BATCH_SIZE: usize = 10;
+const COMMIT_COALESCER_SHARDS: usize = 4;
+const COMMIT_COALESCER_SOFT_CAP: u64 = 8_192;
+const COMMIT_COALESCER_SHARD_CAPACITY: usize =
+    COMMIT_COALESCER_SOFT_CAP.div_ceil(COMMIT_COALESCER_SHARDS as u64) as usize;
+
+const COALESCER_SPILL_PATH_CAP: usize = 4_096;
+const COALESCER_SPILL_MESSAGE_CAP: usize = 32;
+const COALESCER_SPILL_MESSAGE_LINE_MAX_CHARS: usize = 120;
+
+fn coalescer_shard_idx(repo_root: &Path, shard_count: usize) -> usize {
+    if shard_count <= 1 {
+        return 0;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(repo_root, &mut hasher);
+    (std::hash::Hasher::finish(&hasher) as usize) % shard_count
+}
 
 impl CommitCoalescer {
     /// Create a new coalescer and spawn the background worker thread.
     pub fn new(flush_interval: Duration) -> Self {
-        let (tx, rx) = std::sync::mpsc::channel();
         let stats = Arc::new(Mutex::new(CommitQueueStats::default()));
         let batch_sizes = Arc::new(Mutex::new(VecDeque::new()));
+        let pending_requests = Arc::new(AtomicU64::new(0));
+        let mut shards = Vec::with_capacity(COMMIT_COALESCER_SHARDS);
+        for shard_idx in 0..COMMIT_COALESCER_SHARDS {
+            let (tx, rx) = std::sync::mpsc::sync_channel(COMMIT_COALESCER_SHARD_CAPACITY);
+            let spill: Arc<Mutex<HashMap<PathBuf, CoalescerSpillRepo>>> =
+                Arc::new(Mutex::new(HashMap::new()));
 
-        let worker_stats = Arc::clone(&stats);
-        let worker_sizes = Arc::clone(&batch_sizes);
+            let worker_stats = Arc::clone(&stats);
+            let worker_sizes = Arc::clone(&batch_sizes);
+            let worker_pending_requests = Arc::clone(&pending_requests);
+            let worker_spill = Arc::clone(&spill);
 
-        std::thread::Builder::new()
-            .name("commit-coalescer".into())
-            .spawn(move || {
-                coalescer_worker_loop(rx, worker_stats, worker_sizes, flush_interval);
-            })
-            .expect("failed to spawn commit coalescer worker");
+            std::thread::Builder::new()
+                .name(format!("commit-coalescer-{shard_idx}"))
+                .spawn(move || {
+                    coalescer_worker_loop(
+                        rx,
+                        worker_stats,
+                        worker_sizes,
+                        worker_pending_requests,
+                        worker_spill,
+                        flush_interval,
+                    );
+                })
+                .expect("failed to spawn commit coalescer worker");
+
+            shards.push(CommitCoalescerShard { sender: tx, spill });
+        }
+
+        mcp_agent_mail_core::global_metrics()
+            .storage
+            .commit_soft_cap
+            .set(COMMIT_COALESCER_SOFT_CAP);
 
         Self {
-            sender: tx,
+            shards,
             stats,
+            pending_requests,
             _batch_sizes: batch_sizes,
+        }
+    }
+
+    fn spill_commit_fields(
+        spill: &Arc<Mutex<HashMap<PathBuf, CoalescerSpillRepo>>>,
+        fields: CoalescerCommitFields,
+    ) {
+        let repo_root = fields.repo_root;
+
+        let first_line = fields
+            .message
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let first_line = first_line
+            .chars()
+            .take(COALESCER_SPILL_MESSAGE_LINE_MAX_CHARS)
+            .collect::<String>();
+
+        let mut guard = spill.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = guard
+            .entry(repo_root)
+            .or_insert_with(|| CoalescerSpillRepo {
+                pending_requests: 0,
+                earliest_enqueued_at: fields.enqueued_at,
+                dirty_all: false,
+                paths: HashSet::new(),
+                git_author_name: fields.git_author_name.clone(),
+                git_author_email: fields.git_author_email.clone(),
+                message_first_lines: VecDeque::new(),
+                message_total: 0,
+            });
+
+        entry.pending_requests = entry.pending_requests.saturating_add(1);
+        entry.message_total = entry.message_total.saturating_add(1);
+        if fields.enqueued_at < entry.earliest_enqueued_at {
+            entry.earliest_enqueued_at = fields.enqueued_at;
+        }
+
+        // Use the most recent author info (expected to be stable).
+        entry.git_author_name = fields.git_author_name;
+        entry.git_author_email = fields.git_author_email;
+
+        if !first_line.is_empty() && entry.message_first_lines.len() < COALESCER_SPILL_MESSAGE_CAP {
+            entry.message_first_lines.push_back(first_line);
+        }
+
+        if !entry.dirty_all {
+            for p in fields.rel_paths {
+                entry.paths.insert(p);
+                if entry.paths.len() > COALESCER_SPILL_PATH_CAP {
+                    entry.dirty_all = true;
+                    entry.paths.clear();
+                    break;
+                }
+            }
         }
     }
 
@@ -1033,29 +1267,113 @@ impl CommitCoalescer {
             return;
         }
 
+        let metrics = mcp_agent_mail_core::global_metrics();
+        metrics.storage.commit_enqueued_total.inc();
+
         {
             let mut s = self.stats.lock().unwrap_or_else(|e| e.into_inner());
             s.enqueued += 1;
         }
 
+        let shard_idx = coalescer_shard_idx(&repo_root, self.shards.len());
+        let shard = &self.shards[shard_idx];
+
+        let enqueued_at = Instant::now();
         let msg = CoalescerMsg::Commit(CoalescerCommitFields {
-            repo_root: repo_root.clone(),
+            enqueued_at,
+            repo_root,
             git_author_name: config.git_author_name.clone(),
             git_author_email: config.git_author_email.clone(),
-            message: message.clone(),
-            rel_paths: rel_paths.clone(),
+            message,
+            rel_paths,
         });
 
-        if self.sender.send(msg).is_err() {
-            // Worker thread died — fallback to synchronous commit so files
-            // that are already on disk still get committed to git.
-            tracing::warn!("[commit-coalescer] worker unreachable, sync fallback");
-            if let Ok(repo) = Repository::open(&repo_root) {
-                let refs: Vec<&str> = rel_paths.iter().map(String::as_str).collect();
-                let _ = commit_paths(&repo, config, &message, &refs);
+        let pending = self
+            .pending_requests
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        metrics.storage.commit_pending_requests.set(pending);
+        metrics
+            .storage
+            .commit_peak_pending_requests
+            .fetch_max(pending);
+
+        let threshold = COMMIT_COALESCER_SOFT_CAP
+            .saturating_mul(80)
+            .saturating_div(100);
+        if threshold > 0 && pending >= threshold {
+            if metrics.storage.commit_over_80_since_us.load() == 0 {
+                metrics
+                    .storage
+                    .commit_over_80_since_us
+                    .set(now_micros_u64());
             }
-            let mut s = self.stats.lock().unwrap_or_else(|e| e.into_inner());
-            s.errors += 1;
+        } else {
+            metrics.storage.commit_over_80_since_us.set(0);
+        }
+
+        match shard.sender.try_send(msg) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(CoalescerMsg::Commit(fields))) => {
+                // Queue is saturated. Spill minimal coalescable state so the tool hot path stays
+                // non-blocking and memory remains bounded.
+                Self::spill_commit_fields(&shard.spill, fields);
+            }
+            Err(std::sync::mpsc::TrySendError::Full(CoalescerMsg::Flush(_))) => {
+                // We never send Flush from enqueue(), but handle defensively.
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(CoalescerMsg::Commit(fields))) => {
+                // Worker thread died — synchronous fallback prevents data loss for files already
+                // on disk. This is NOT a saturation policy.
+                tracing::warn!("[commit-coalescer] worker unreachable, sync fallback");
+                metrics.storage.commit_sync_fallbacks_total.inc();
+
+                let mut sync_ok = false;
+                if let Ok(repo) = Repository::open(&fields.repo_root) {
+                    let refs: Vec<&str> = fields.rel_paths.iter().map(String::as_str).collect();
+                    sync_ok = commit_paths(&repo, config, &fields.message, &refs).is_ok();
+                }
+                if !sync_ok {
+                    metrics.storage.commit_errors_total.inc();
+                    let mut s = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+                    s.errors += 1;
+                }
+
+                let latency_us = u64::try_from(
+                    fields
+                        .enqueued_at
+                        .elapsed()
+                        .as_micros()
+                        .min(u128::from(u64::MAX)),
+                )
+                .unwrap_or(u64::MAX);
+                metrics.storage.commit_queue_latency_us.record(latency_us);
+                metrics.storage.commit_drained_total.inc();
+
+                let pending_after = self
+                    .pending_requests
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                        Some(cur.saturating_sub(1))
+                    })
+                    .unwrap_or(0)
+                    .saturating_sub(1);
+                metrics.storage.commit_pending_requests.set(pending_after);
+
+                let threshold = COMMIT_COALESCER_SOFT_CAP
+                    .saturating_mul(80)
+                    .saturating_div(100);
+                if threshold > 0 && pending_after >= threshold {
+                    if metrics.storage.commit_over_80_since_us.load() == 0 {
+                        metrics
+                            .storage
+                            .commit_over_80_since_us
+                            .set(now_micros_u64());
+                    }
+                } else {
+                    metrics.storage.commit_over_80_since_us.set(0);
+                }
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(CoalescerMsg::Flush(_))) => {}
         }
     }
 
@@ -1064,10 +1382,36 @@ impl CommitCoalescer {
     /// Use this in tests or during graceful shutdown to ensure all queued
     /// commits are persisted before proceeding.
     pub fn flush_sync(&self) {
-        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
-        if self.sender.send(CoalescerMsg::Flush(done_tx)).is_ok() {
-            // Wait up to 30s for the worker to process all pending commits.
-            let _ = done_rx.recv_timeout(Duration::from_secs(30));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut done_rxs = Vec::with_capacity(self.shards.len());
+
+        for shard in &self.shards {
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+            let mut msg = CoalescerMsg::Flush(done_tx);
+            loop {
+                match shard.sender.try_send(msg) {
+                    Ok(()) => {
+                        done_rxs.push(done_rx);
+                        break;
+                    }
+                    Err(std::sync::mpsc::TrySendError::Full(m)) => {
+                        msg = m;
+                        if Instant::now() >= deadline {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
+                }
+            }
+        }
+
+        for done_rx in done_rxs {
+            if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+                let _ = done_rx.recv_timeout(remaining);
+            } else {
+                return;
+            }
         }
     }
 
@@ -1091,6 +1435,8 @@ fn coalescer_worker_loop(
     rx: std::sync::mpsc::Receiver<CoalescerMsg>,
     stats: Arc<Mutex<CommitQueueStats>>,
     batch_sizes: Arc<Mutex<VecDeque<usize>>>,
+    pending_requests: Arc<AtomicU64>,
+    spill: Arc<Mutex<HashMap<PathBuf, CoalescerSpillRepo>>>,
     flush_interval: Duration,
 ) {
     let mut flush_waiters: Vec<std::sync::mpsc::SyncSender<()>> = Vec::new();
@@ -1110,11 +1456,7 @@ fn coalescer_worker_loop(
                 flush_waiters.push(done_tx);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // Nothing pending — notify any flush waiters and continue
-                for w in flush_waiters.drain(..) {
-                    let _ = w.try_send(());
-                }
-                continue;
+                // No channel message: continue to spill-drain / flush notification below.
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -1135,16 +1477,207 @@ fn coalescer_worker_loop(
             }
         }
 
+        let spilled = coalescer_drain_spill(&spill);
+
+        if pending.is_empty() && spilled.is_empty() {
+            // Nothing pending — notify any flush waiters and continue
+            for w in flush_waiters.drain(..) {
+                let _ = w.try_send(());
+            }
+            continue;
+        }
+
         // Phase 3: Commit batches by repo
-        for (repo_root, requests) in &pending {
+        for (repo_root, requests) in pending {
             for chunk in requests.chunks(COALESCER_MAX_BATCH_SIZE) {
-                coalescer_commit_batch(repo_root, chunk, &stats, &batch_sizes);
+                coalescer_commit_batch(&repo_root, chunk, &stats, &batch_sizes);
+
+                let drained_u64 = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+                let metrics = mcp_agent_mail_core::global_metrics();
+                metrics.storage.commit_drained_total.add(drained_u64);
+
+                // End-to-end latency: from enqueue to commit completion (or failure).
+                for req in chunk {
+                    let latency_us = u64::try_from(
+                        req.enqueued_at
+                            .elapsed()
+                            .as_micros()
+                            .min(u128::from(u64::MAX)),
+                    )
+                    .unwrap_or(u64::MAX);
+                    metrics.storage.commit_queue_latency_us.record(latency_us);
+                }
+
+                let pending_after = pending_requests
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                        Some(cur.saturating_sub(drained_u64))
+                    })
+                    .unwrap_or(0)
+                    .saturating_sub(drained_u64);
+                metrics.storage.commit_pending_requests.set(pending_after);
+
+                let threshold = COMMIT_COALESCER_SOFT_CAP
+                    .saturating_mul(80)
+                    .saturating_div(100);
+                if threshold > 0 && pending_after >= threshold {
+                    if metrics.storage.commit_over_80_since_us.load() == 0 {
+                        metrics
+                            .storage
+                            .commit_over_80_since_us
+                            .set(now_micros_u64());
+                    }
+                } else {
+                    metrics.storage.commit_over_80_since_us.set(0);
+                }
+            }
+        }
+
+        for work in &spilled {
+            coalescer_commit_spilled_work(work, &stats, &batch_sizes);
+
+            let drained_u64 = work.pending_requests;
+            let metrics = mcp_agent_mail_core::global_metrics();
+            metrics.storage.commit_drained_total.add(drained_u64);
+
+            let latency_us = u64::try_from(
+                work.earliest_enqueued_at
+                    .elapsed()
+                    .as_micros()
+                    .min(u128::from(u64::MAX)),
+            )
+            .unwrap_or(u64::MAX);
+            metrics.storage.commit_queue_latency_us.record(latency_us);
+
+            let pending_after = pending_requests
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                    Some(cur.saturating_sub(drained_u64))
+                })
+                .unwrap_or(0)
+                .saturating_sub(drained_u64);
+            metrics.storage.commit_pending_requests.set(pending_after);
+
+            let threshold = COMMIT_COALESCER_SOFT_CAP
+                .saturating_mul(80)
+                .saturating_div(100);
+            if threshold > 0 && pending_after >= threshold {
+                if metrics.storage.commit_over_80_since_us.load() == 0 {
+                    metrics
+                        .storage
+                        .commit_over_80_since_us
+                        .set(now_micros_u64());
+                }
+            } else {
+                metrics.storage.commit_over_80_since_us.set(0);
             }
         }
 
         // Phase 4: Notify flush waiters that all pending work is done
         for w in flush_waiters.drain(..) {
             let _ = w.try_send(());
+        }
+    }
+}
+
+fn coalescer_drain_spill(
+    spill: &Arc<Mutex<HashMap<PathBuf, CoalescerSpillRepo>>>,
+) -> Vec<CoalescerSpilledWork> {
+    let mut guard = spill.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_empty() {
+        return Vec::new();
+    }
+
+    let mut drained = Vec::with_capacity(guard.len());
+    for (repo_root, repo) in guard.drain() {
+        drained.push(CoalescerSpilledWork {
+            repo_root,
+            pending_requests: repo.pending_requests,
+            earliest_enqueued_at: repo.earliest_enqueued_at,
+            dirty_all: repo.dirty_all,
+            paths: repo.paths.into_iter().collect(),
+            git_author_name: repo.git_author_name,
+            git_author_email: repo.git_author_email,
+            message_first_lines: repo.message_first_lines.into_iter().collect(),
+            message_total: repo.message_total,
+        });
+    }
+    drained
+}
+
+fn coalescer_commit_spilled_work(
+    work: &CoalescerSpilledWork,
+    stats: &Arc<Mutex<CommitQueueStats>>,
+    batch_sizes: &Arc<Mutex<VecDeque<usize>>>,
+) {
+    if work.pending_requests == 0 {
+        return;
+    }
+
+    let config = Config {
+        git_author_name: work.git_author_name.clone(),
+        git_author_email: work.git_author_email.clone(),
+        ..Config::default()
+    };
+
+    let mut msg = format!("spill: {} ops coalesced", work.pending_requests);
+    if work.dirty_all {
+        msg.push_str(" (commit-all)");
+    }
+    msg.push_str("\n\n");
+
+    let visible = work.message_first_lines.len() as u64;
+    for line in &work.message_first_lines {
+        msg.push_str("- ");
+        msg.push_str(line);
+        msg.push('\n');
+    }
+    if work.message_total > visible {
+        msg.push_str(&format!("- ... (+{} more)\n", work.message_total - visible));
+    }
+
+    let commit_result = if work.dirty_all {
+        coalescer_commit_all_with_retry(&work.repo_root, &config, &msg)
+            .map(|()| work.pending_requests)
+    } else if work.paths.is_empty() {
+        Ok(work.pending_requests)
+    } else {
+        coalescer_commit_with_retry(&work.repo_root, &config, &msg, &work.paths)
+            .map(|()| work.pending_requests)
+    };
+
+    // Update stats
+    match commit_result {
+        Ok(batch_u64) => {
+            let batch_size = usize::try_from(batch_u64).unwrap_or(usize::MAX);
+            let mut s = stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.commits += 1;
+            s.batched += batch_size;
+
+            let mut sizes = batch_sizes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            sizes.push_back(batch_size);
+            if sizes.len() > 100 {
+                sizes.pop_front();
+            }
+            let avg = if sizes.is_empty() {
+                0.0
+            } else {
+                sizes.iter().sum::<usize>() as f64 / sizes.len() as f64
+            };
+            s.avg_batch_size = (avg * 100.0).round() / 100.0;
+        }
+        Err(e) => {
+            tracing::warn!("[commit-coalescer] spill commit error: {e}");
+            mcp_agent_mail_core::global_metrics()
+                .storage
+                .commit_errors_total
+                .inc();
+            let mut s = stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.errors += 1;
         }
     }
 }
@@ -1269,6 +1802,10 @@ fn coalescer_commit_batch(
         }
         Err(e) => {
             tracing::warn!("[commit-coalescer] batch commit error: {e}");
+            mcp_agent_mail_core::global_metrics()
+                .storage
+                .commit_errors_total
+                .inc();
             let mut s = stats
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1320,6 +1857,46 @@ fn coalescer_commit_with_retry(
                 std::thread::sleep(Duration::from_millis(base_ms + jitter));
 
                 // Try cleaning stale locks on later attempts
+                if attempt >= 3 {
+                    let _ = try_clean_stale_git_lock(repo_root, 60.0);
+                }
+            }
+            Err(other) => return Err(other),
+        }
+    }
+
+    unreachable!()
+}
+
+fn coalescer_commit_all_with_retry(repo_root: &Path, config: &Config, message: &str) -> Result<()> {
+    const MAX_RETRIES: usize = 7;
+
+    for attempt in 0..=MAX_RETRIES {
+        let repo = Repository::open(repo_root)?;
+
+        match commit_all(&repo, config, message) {
+            Ok(()) => return Ok(()),
+            Err(StorageError::Git(ref git_err)) if is_git_index_lock_error(git_err) => {
+                if attempt >= MAX_RETRIES {
+                    if try_clean_stale_git_lock(repo_root, 30.0) {
+                        let repo2 = Repository::open(repo_root)?;
+                        return commit_all(&repo2, config, message);
+                    }
+                    return Err(StorageError::GitIndexLock {
+                        message: format!("index.lock contention after {MAX_RETRIES} retries"),
+                        lock_path: repo_root.join(".git").join("index.lock"),
+                        attempts: MAX_RETRIES,
+                    });
+                }
+
+                let base_ms = 50 * (1u64 << attempt.min(5));
+                let jitter = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .subsec_micros() as u64
+                    % (base_ms / 2 + 1);
+                std::thread::sleep(Duration::from_millis(base_ms + jitter));
+
                 if attempt >= 3 {
                     let _ = try_clean_stale_git_lock(repo_root, 60.0);
                 }
@@ -2249,12 +2826,20 @@ fn update_thread_digest(
 
     let entry = format!("{subject_line}{header}{link_line}{preview}\n\n---\n\n");
 
-    // Append to digest
-    let is_new = !digest_path.exists();
-    let mut file = fs::OpenOptions::new()
-        .create(true)
+    // Append to digest. Use create_new to atomically determine if this is
+    // the first entry (eliminates TOCTOU race between exists() + create).
+    let (mut file, is_new) = match fs::OpenOptions::new()
         .append(true)
-        .open(&digest_path)?;
+        .create_new(true)
+        .open(&digest_path)
+    {
+        Ok(f) => (f, true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let f = fs::OpenOptions::new().append(true).open(&digest_path)?;
+            (f, false)
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     if is_new {
         file.write_all(format!("# Thread {thread_id}\n\n").as_bytes())?;
@@ -2489,6 +3074,7 @@ pub fn store_attachment(
 pub fn process_attachments(
     archive: &ProjectArchive,
     config: &Config,
+    base_dir: &Path,
     attachment_paths: &[String],
     embed_policy: EmbedPolicy,
 ) -> Result<(Vec<AttachmentMeta>, Vec<String>)> {
@@ -2496,20 +3082,7 @@ pub fn process_attachments(
     let mut all_rel_paths = Vec::new();
 
     for path_str in attachment_paths {
-        let path = PathBuf::from(path_str);
-        let resolved = if path.is_absolute() {
-            path
-        } else {
-            resolve_archive_relative_path(archive, path_str)?
-        };
-
-        if !resolved.exists() {
-            return Err(StorageError::InvalidPath(format!(
-                "Attachment not found: {}",
-                resolved.display()
-            )));
-        }
-
+        let resolved = resolve_source_attachment_path(base_dir, config, path_str)?;
         let stored = store_attachment(archive, config, &resolved, embed_policy)?;
         all_meta.push(stored.meta);
         all_rel_paths.extend(stored.rel_paths);
@@ -2534,6 +3107,7 @@ fn image_pattern_re() -> &'static Regex {
 pub fn process_markdown_images(
     archive: &ProjectArchive,
     config: &Config,
+    base_dir: &Path,
     body_md: &str,
     embed_policy: EmbedPolicy,
 ) -> Result<(String, Vec<AttachmentMeta>, Vec<String>)> {
@@ -2560,19 +3134,10 @@ pub fn process_markdown_images(
             continue;
         }
 
-        // Resolve the path
-        let resolved = if Path::new(&path).is_absolute() {
-            PathBuf::from(&path)
-        } else {
-            match resolve_archive_relative_path(archive, &path) {
-                Ok(p) => p,
-                Err(_) => continue, // Skip unresolvable paths
-            }
-        };
-
-        if !resolved.exists() {
+        // Resolve best-effort: missing/unresolvable paths should not fail the whole message.
+        let Some(resolved) = resolve_source_attachment_path_opt(base_dir, config, &path) else {
             continue;
-        }
+        };
 
         match store_attachment(archive, config, &resolved, embed_policy) {
             Ok(stored) => {
@@ -2592,6 +3157,93 @@ pub fn process_markdown_images(
     }
 
     Ok((result, all_meta, all_rel_paths))
+}
+
+/// Resolve an attachment source path from a user-provided string.
+///
+/// Semantics:
+/// - Relative paths are resolved relative to `base_dir` (typically the project's `human_key`).
+/// - Absolute paths outside `base_dir` are allowed only when `allow_absolute_attachment_paths=true`.
+/// - Absolute paths inside `base_dir` are always allowed.
+fn resolve_source_attachment_path(base_dir: &Path, config: &Config, raw_path: &str) -> Result<PathBuf> {
+    let raw = raw_path.trim();
+    if raw.is_empty() {
+        return Err(StorageError::InvalidPath("Attachment path cannot be empty".to_string()));
+    }
+
+    // Canonicalize base dir so prefix checks cannot be bypassed via symlinks.
+    let base = base_dir.canonicalize().map_err(|e| {
+        StorageError::InvalidPath(format!(
+            "Attachment base directory does not exist or is not accessible: {} ({e})",
+            base_dir.display()
+        ))
+    })?;
+
+    let input = PathBuf::from(raw);
+    let candidate = if input.is_absolute() {
+        input
+    } else {
+        base.join(input)
+    };
+
+    if !candidate.exists() {
+        return Err(StorageError::InvalidPath(format!(
+            "Attachment not found: {}",
+            candidate.display()
+        )));
+    }
+
+    let resolved = candidate.canonicalize().map_err(|e| {
+        StorageError::InvalidPath(format!(
+            "Invalid attachment path: {} ({e})",
+            candidate.display()
+        ))
+    })?;
+
+    if resolved.starts_with(&base) {
+        return Ok(resolved);
+    }
+
+    if config.allow_absolute_attachment_paths {
+        return Ok(resolved);
+    }
+
+    Err(StorageError::InvalidPath(format!(
+        "Absolute attachment paths outside the project are not allowed: {}",
+        resolved.display()
+    )))
+}
+
+/// Best-effort variant for Markdown image conversion (skip missing/unresolvable paths).
+fn resolve_source_attachment_path_opt(
+    base_dir: &Path,
+    config: &Config,
+    raw_path: &str,
+) -> Option<PathBuf> {
+    let raw = raw_path.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    let base = base_dir.canonicalize().ok()?;
+    let input = PathBuf::from(raw);
+    let candidate = if input.is_absolute() {
+        input
+    } else {
+        base.join(input)
+    };
+    if !candidate.exists() {
+        return None;
+    }
+    let resolved = candidate.canonicalize().ok()?;
+
+    if resolved.starts_with(&base) {
+        return Some(resolved);
+    }
+    if config.allow_absolute_attachment_paths {
+        return Some(resolved);
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -3192,6 +3844,39 @@ fn commit_paths(
     Ok(())
 }
 
+/// Add all changed files to the git index and create a commit.
+///
+/// Only used as an overload escape hatch for the async commit coalescer when the
+/// spill path set grows too large to track precisely.
+fn commit_all(repo: &Repository, config: &Config, message: &str) -> Result<()> {
+    // Ensure this is a non-bare repo with a workdir.
+    let _workdir = repo.workdir().ok_or(StorageError::NotInitialized)?;
+
+    let sig = Signature::now(&config.git_author_name, &config.git_author_email)?;
+    let mut index = repo.index()?;
+
+    // Respect .gitignore, add all changes under the workdir.
+    index.add_all(["*"].iter(), IndexAddOption::DEFAULT, None)?;
+
+    index.write()?;
+    let tree_oid = index.write_tree()?;
+    let tree = repo.find_tree(tree_oid)?;
+
+    let final_message = append_trailers(message);
+    let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+
+    match parent {
+        Some(ref p) => {
+            repo.commit(Some("HEAD"), &sig, &sig, &final_message, &tree, &[p])?;
+        }
+        None => {
+            repo.commit(Some("HEAD"), &sig, &sig, &final_message, &tree, &[])?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Append git trailers (Agent:, Thread:) based on commit message content.
 fn append_trailers(message: &str) -> String {
     let lower = message.to_lowercase();
@@ -3252,19 +3937,25 @@ fn rel_path(base: &Path, target: &Path) -> Result<String> {
 /// Resolve a relative path safely inside the project archive root.
 ///
 /// Rejects directory traversal and ensures the path stays within the archive.
+/// When `canonicalize()` fails (e.g. the file doesn't exist yet), we manually
+/// resolve `..` and `.` components to prevent bypass via non-existent paths.
 pub fn resolve_archive_relative_path(archive: &ProjectArchive, raw_path: &str) -> Result<PathBuf> {
     let normalized = raw_path.trim().replace('\\', "/");
 
-    if normalized.is_empty()
-        || normalized.starts_with('/')
-        || normalized.starts_with("..")
-        || normalized.contains("/../")
-        || normalized.ends_with("/..")
-        || normalized == ".."
-    {
+    if normalized.is_empty() || normalized.starts_with('/') {
         return Err(StorageError::InvalidPath(
             "directory traversal not allowed".to_string(),
         ));
+    }
+
+    // Reject any component that is ".." — even if it's embedded in intermediate segments.
+    // We do this by splitting on `/` and checking each segment.
+    for segment in normalized.split('/') {
+        if segment == ".." {
+            return Err(StorageError::InvalidPath(
+                "directory traversal not allowed".to_string(),
+            ));
+        }
     }
 
     let safe_rel = normalized.trim_start_matches('/');
@@ -3272,11 +3963,31 @@ pub fn resolve_archive_relative_path(archive: &ProjectArchive, raw_path: &str) -
         .root
         .canonicalize()
         .unwrap_or_else(|_| archive.root.clone());
-    let candidate = archive
-        .root
-        .join(safe_rel)
-        .canonicalize()
-        .unwrap_or_else(|_| archive.root.join(safe_rel));
+
+    // First try canonicalize (resolves symlinks + normalizes). If the file
+    // exists, this is the most robust check.
+    let candidate = match archive.root.join(safe_rel).canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            // File doesn't exist yet. Manually normalize the path components
+            // to prevent traversal via `foo/../../../etc/passwd` patterns.
+            // We already rejected bare ".." segments above, but be defensive
+            // by re-normalizing through component iteration.
+            let mut resolved = root.clone();
+            for component in Path::new(safe_rel).components() {
+                match component {
+                    Component::Normal(c) => resolved.push(c),
+                    Component::CurDir => { /* skip `.` */ }
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                        return Err(StorageError::InvalidPath(
+                            "directory traversal not allowed".to_string(),
+                        ));
+                    }
+                }
+            }
+            resolved
+        }
+    };
 
     if !candidate.starts_with(&root) {
         return Err(StorageError::InvalidPath(
@@ -3287,23 +3998,57 @@ pub fn resolve_archive_relative_path(archive: &ProjectArchive, raw_path: &str) -
     Ok(candidate)
 }
 
-/// Write text content to a file, creating parent directories as needed.
+/// Write text content to a file atomically (write-to-temp-then-rename).
+///
+/// Creates parent directories as needed. The rename is atomic on POSIX
+/// filesystems when source and destination are on the same filesystem,
+/// which they are because we put the temp file in the same directory.
 fn write_text(path: &Path, content: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, content)?;
-    Ok(())
+    atomic_write_bytes(path, content.as_bytes())
 }
 
-/// Write JSON content to a file, creating parent directories as needed.
+/// Write JSON content to a file atomically (write-to-temp-then-rename).
+///
+/// Creates parent directories as needed.
 fn write_json(path: &Path, value: &serde_json::Value) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let content = serde_json::to_string_pretty(value)?;
-    fs::write(path, content)?;
-    Ok(())
+    atomic_write_bytes(path, content.as_bytes())
+}
+
+/// Write bytes to a file atomically via a temp file + rename.
+///
+/// The temp file is created in the same directory as the target so that
+/// `fs::rename` is guaranteed to be atomic (same filesystem).
+fn atomic_write_bytes(path: &Path, data: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    let parent = path.parent().unwrap_or(Path::new("."));
+    // Use pid + thread-id + counter for a unique temp name to avoid collisions
+    // when multiple threads/processes write to the same directory.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_name = format!(
+        ".tmp-{}-{}-{seq}",
+        std::process::id(),
+        // Include a hash of the target filename for extra uniqueness
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    );
+    let tmp_path = parent.join(&tmp_name);
+    let mut f = fs::File::create(&tmp_path)?;
+    f.write_all(data)?;
+    f.sync_data()?;
+    fs::rename(&tmp_path, path).map_err(|e| {
+        // Best-effort cleanup of the temp file on rename failure
+        let _ = fs::remove_file(&tmp_path);
+        e.into()
+    })
 }
 
 /// ISO 8601 timestamp for the current time.
@@ -3551,6 +4296,18 @@ mod tests {
         assert!(resolve_archive_relative_path(&archive, "../../../etc/passwd").is_err());
         assert!(resolve_archive_relative_path(&archive, "..").is_err());
         assert!(resolve_archive_relative_path(&archive, "/etc/passwd").is_err());
+
+        // Embedded traversal via non-existent intermediate dirs should also fail
+        assert!(resolve_archive_relative_path(&archive, "foo/../../etc/passwd").is_err());
+        assert!(resolve_archive_relative_path(&archive, "a/b/../../../etc/shadow").is_err());
+
+        // Non-existent file within archive should succeed (returns joined path)
+        let resolved =
+            resolve_archive_relative_path(&archive, "subdir/newfile.txt").unwrap();
+        assert!(resolved.starts_with(&archive.root));
+
+        // Backslash normalization
+        assert!(resolve_archive_relative_path(&archive, "..\\..\\etc\\passwd").is_err());
     }
 
     #[test]
@@ -4186,6 +4943,7 @@ mod tests {
         let (meta, rel_paths) = process_attachments(
             &archive,
             &config,
+            &archive.root,
             &[img1.display().to_string(), img2.display().to_string()],
             EmbedPolicy::File,
         )
@@ -4207,7 +4965,7 @@ mod tests {
 
         let body = "Check this: ![diagram](diagram.png) and text.";
         let (new_body, meta, rel_paths) =
-            process_markdown_images(&archive, &config, body, EmbedPolicy::Inline).unwrap();
+            process_markdown_images(&archive, &config, &archive.root, body, EmbedPolicy::Inline).unwrap();
 
         assert_eq!(meta.len(), 1);
         assert!(!rel_paths.is_empty());

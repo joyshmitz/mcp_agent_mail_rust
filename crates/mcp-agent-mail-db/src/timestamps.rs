@@ -17,6 +17,9 @@ pub fn naive_to_micros(dt: NaiveDateTime) -> i64 {
 }
 
 /// Convert microseconds since Unix epoch to chrono `NaiveDateTime`.
+///
+/// For extreme values outside chrono's representable range, returns the
+/// Unix epoch (1970-01-01 00:00:00) as a safe fallback instead of panicking.
 #[must_use]
 pub fn micros_to_naive(micros: i64) -> NaiveDateTime {
     // Use divrem that handles negative values correctly
@@ -26,7 +29,7 @@ pub fn micros_to_naive(micros: i64) -> NaiveDateTime {
     let nsecs = u32::try_from(sub_micros * 1000).unwrap_or(0);
     Utc.timestamp_opt(secs, nsecs)
         .single()
-        .expect("valid timestamp")
+        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).single().unwrap())
         .naive_utc()
 }
 
@@ -139,5 +142,20 @@ mod tests {
         // Should be 1969-12-31 23:59:59.999999
         let back = naive_to_micros(dt);
         assert_eq!(back, micros);
+    }
+
+    #[test]
+    fn test_extreme_values_no_panic() {
+        // These extreme values are outside chrono's representable range.
+        // Before the fix, this would panic with "valid timestamp".
+        // After the fix, it returns Unix epoch as a safe fallback.
+        let epoch = NaiveDateTime::parse_from_str("1970-01-01 00:00:00", "%Y-%m-%d %H:%M:%S")
+            .unwrap();
+
+        let dt = micros_to_naive(i64::MAX);
+        assert_eq!(dt, epoch);
+
+        let dt = micros_to_naive(i64::MIN);
+        assert_eq!(dt, epoch);
     }
 }

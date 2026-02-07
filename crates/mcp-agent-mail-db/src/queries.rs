@@ -313,8 +313,14 @@ fn map_sql_outcome<T>(out: Outcome<T, SqlError>) -> Outcome<T, DbError> {
     }
 }
 
+/// `SQLite` default `SQLITE_MAX_VARIABLE_NUMBER` is 999 (32766 in newer builds).
+/// We cap IN-clause item counts well below that to prevent excessively large
+/// SQL strings and parameter arrays from untrusted input.
+const MAX_IN_CLAUSE_ITEMS: usize = 500;
+
 fn placeholders(count: usize) -> String {
-    std::iter::repeat_n("?", count)
+    let capped = count.min(MAX_IN_CLAUSE_ITEMS);
+    std::iter::repeat_n("?", capped)
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -1222,9 +1228,10 @@ pub async fn list_message_recipient_names_for_messages(
          WHERE m.project_id = ? AND r.message_id IN ({placeholders})"
     );
 
-    let mut params: Vec<Value> = Vec::with_capacity(message_ids.len() + 1);
+    let capped_ids = &message_ids[..message_ids.len().min(MAX_IN_CLAUSE_ITEMS)];
+    let mut params: Vec<Value> = Vec::with_capacity(capped_ids.len() + 1);
     params.push(Value::BigInt(project_id));
-    for id in message_ids {
+    for id in capped_ids {
         params.push(Value::BigInt(*id));
     }
 
@@ -2505,18 +2512,19 @@ pub async fn list_approved_contact_ids(
 
     let tracked = tracked(&*conn);
 
-    let placeholders = placeholders(candidate_ids.len());
+    let capped_ids = &candidate_ids[..candidate_ids.len().min(MAX_IN_CLAUSE_ITEMS)];
+    let placeholders = placeholders(capped_ids.len());
     let sql = format!(
         "SELECT b_agent_id FROM agent_links \
          WHERE a_project_id = ? AND a_agent_id = ? AND b_project_id = ? \
            AND status = 'approved' AND b_agent_id IN ({placeholders})"
     );
 
-    let mut params: Vec<Value> = Vec::with_capacity(candidate_ids.len() + 3);
+    let mut params: Vec<Value> = Vec::with_capacity(capped_ids.len() + 3);
     params.push(Value::BigInt(project_id));
     params.push(Value::BigInt(sender_id));
     params.push(Value::BigInt(project_id));
-    for id in candidate_ids {
+    for id in capped_ids {
         params.push(Value::BigInt(*id));
     }
 
@@ -2561,7 +2569,8 @@ pub async fn list_recent_contact_agent_ids(
 
     let tracked = tracked(&*conn);
 
-    let placeholders = placeholders(candidate_ids.len());
+    let capped_ids = &candidate_ids[..candidate_ids.len().min(MAX_IN_CLAUSE_ITEMS)];
+    let placeholders = placeholders(capped_ids.len());
     let sql_sent = format!(
         "SELECT DISTINCT r.agent_id \
          FROM message_recipients r \
@@ -2569,11 +2578,11 @@ pub async fn list_recent_contact_agent_ids(
          WHERE m.project_id = ? AND m.sender_id = ? AND m.created_ts > ? \
            AND r.agent_id IN ({placeholders})"
     );
-    let mut params_sent: Vec<Value> = Vec::with_capacity(candidate_ids.len() + 3);
+    let mut params_sent: Vec<Value> = Vec::with_capacity(capped_ids.len() + 3);
     params_sent.push(Value::BigInt(project_id));
     params_sent.push(Value::BigInt(sender_id));
     params_sent.push(Value::BigInt(since_ts));
-    for id in candidate_ids {
+    for id in capped_ids {
         params_sent.push(Value::BigInt(*id));
     }
 
@@ -2584,11 +2593,11 @@ pub async fn list_recent_contact_agent_ids(
          WHERE m.project_id = ? AND r.agent_id = ? AND m.created_ts > ? \
            AND m.sender_id IN ({placeholders})"
     );
-    let mut params_recv: Vec<Value> = Vec::with_capacity(candidate_ids.len() + 3);
+    let mut params_recv: Vec<Value> = Vec::with_capacity(capped_ids.len() + 3);
     params_recv.push(Value::BigInt(project_id));
     params_recv.push(Value::BigInt(sender_id));
     params_recv.push(Value::BigInt(since_ts));
-    for id in candidate_ids {
+    for id in capped_ids {
         params_recv.push(Value::BigInt(*id));
     }
 
