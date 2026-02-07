@@ -1366,6 +1366,23 @@ impl StartupDashboard {
         fields: Vec<(String, String)>,
         json: Option<serde_json::Value>,
     ) {
+        // Sanitize at ingestion time so the timeline detail pane cannot leak secrets.
+        let fields = fields
+            .into_iter()
+            .map(|(k, v)| {
+                let v = if console::is_sensitive_key(&k) {
+                    console::mask_sensitive_value(&v)
+                } else if let Some(sanitized) = console::sanitize_known_value(&k, &v) {
+                    sanitized
+                } else {
+                    v
+                };
+                (k, v)
+            })
+            .collect();
+
+        let json = json.map(|j| console::mask_json(&j));
+
         let mut buf = lock_mutex(&self.event_buffer);
         let id = buf.push(kind, severity, summary, fields, json);
         drop(buf);
@@ -2455,17 +2472,25 @@ impl HttpState {
     /// Legacy parity: `FastAPI` `mount(base_no_slash, app)` + `mount(base_with_slash, app)`
     /// routes the exact base **and** all sub-paths to the stateless MCP app.
     fn path_allowed(&self, path: &str) -> bool {
-        let base = normalize_base_path(&self.config.http_path);
-        if base == "/" {
+        let base_no_slash = normalize_base_path(&self.config.http_path);
+        if base_no_slash == "/" {
             return true;
         }
-        let base_no_slash = base.trim_end_matches('/');
-        // Exact match: /api
-        if path == base_no_slash {
+
+        if path_matches_base(path, &base_no_slash) {
             return true;
         }
-        // With trailing slash and any sub-path: /api/ or /api/foo
-        path.starts_with(&format!("{base_no_slash}/"))
+
+        // Dev convenience: accept `/api/*` and `/mcp/*` interchangeably so different
+        // MCP clients can talk to the same server without an extra HTTP_PATH export.
+        // Only applies to the root bases (/api or /mcp); nested bases keep strict semantics.
+        if let Some(alias_no_slash) = mcp_base_alias_no_slash(&base_no_slash) {
+            if path_matches_base(path, alias_no_slash) {
+                return true;
+            }
+        }
+
+        false
     }
 
     fn check_bearer_auth(&self, req: &Http1Request) -> Option<Http1Response> {
@@ -3577,6 +3602,43 @@ fn normalize_base_path(path: &str) -> String {
     // Trim trailing slashes, but ensure we never return empty string
     let result = out.trim_end_matches('/');
     if result.is_empty() { "/" } else { result }.to_string()
+}
+
+fn path_matches_base(path: &str, base_no_slash: &str) -> bool {
+    // Exact match: /api
+    if path == base_no_slash {
+        return true;
+    }
+    // With trailing slash and any sub-path: /api/ or /api/foo
+    path.starts_with(&format!("{base_no_slash}/"))
+}
+
+fn mcp_base_alias_no_slash(base_no_slash: &str) -> Option<&'static str> {
+    match base_no_slash {
+        "/api" => Some("/mcp"),
+        "/mcp" => Some("/api"),
+        _ => None,
+    }
+}
+
+#[allow(dead_code)] // Prepared for future MCP path alias support
+fn canonicalize_mcp_path_for_handler(path: &str, base_no_slash: &str) -> String {
+    let Some(alias_no_slash) = mcp_base_alias_no_slash(base_no_slash) else {
+        return path.to_string();
+    };
+
+    // Exact alias base: /mcp -> /api
+    if path == alias_no_slash {
+        return base_no_slash.to_string();
+    }
+
+    // Alias subpaths: /mcp/* -> /api/*
+    let prefix = format!("{alias_no_slash}/");
+    let Some(rest) = path.strip_prefix(&prefix) else {
+        return path.to_string();
+    };
+
+    format!("{base_no_slash}/{rest}")
 }
 
 fn split_path_query(uri: &str) -> (String, Option<String>) {

@@ -1640,6 +1640,7 @@ pub fn render_split_frame(
 
 use std::collections::VecDeque;
 
+use chrono::SecondsFormat;
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::table::{Row, Table};
 
@@ -1703,6 +1704,7 @@ impl ConsoleEventKind {
 #[derive(Debug, Clone)]
 pub struct ConsoleEvent {
     pub id: u64,
+    pub ts_iso: String,
     pub kind: ConsoleEventKind,
     pub severity: ConsoleEventSeverity,
     pub summary: String,
@@ -1734,12 +1736,14 @@ impl ConsoleEventBuffer {
         json: Option<Value>,
     ) -> u64 {
         let id = self.next_id;
+        let ts_iso = chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
         self.next_id = self.next_id.saturating_add(1);
         if self.events.len() >= TIMELINE_MAX_EVENTS {
             let _ = self.events.pop_front();
         }
         self.events.push_back(ConsoleEvent {
             id,
+            ts_iso,
             kind,
             severity,
             summary: summary.into(),
@@ -1788,6 +1792,7 @@ pub struct TimelinePane {
     scroll_offset: usize,
     viewport_height: usize,
     filter_severity: Option<ConsoleEventSeverity>,
+    filter_kind: Option<ConsoleEventKind>,
     query: String,
     search_input: TextInput,
 }
@@ -1803,6 +1808,7 @@ impl TimelinePane {
             scroll_offset: 0,
             viewport_height: 12,
             filter_severity: None,
+            filter_kind: None,
             query: String::new(),
             search_input: TextInput::new().with_placeholder("Search events..."),
         }
@@ -1818,6 +1824,10 @@ impl TimelinePane {
 
     pub const fn filter_severity(&self) -> Option<ConsoleEventSeverity> {
         self.filter_severity
+    }
+
+    pub const fn filter_kind(&self) -> Option<ConsoleEventKind> {
+        self.filter_kind
     }
 
     pub const fn on_event_pushed(&mut self, new_id: u64) {
@@ -1870,9 +1880,25 @@ impl TimelinePane {
         self.scroll_offset = 0;
     }
 
+    pub const fn cycle_kind_filter(&mut self) {
+        self.filter_kind = match self.filter_kind {
+            None => Some(ConsoleEventKind::ToolCallStart),
+            Some(ConsoleEventKind::ToolCallStart) => Some(ConsoleEventKind::ToolCallEnd),
+            Some(ConsoleEventKind::ToolCallEnd) => Some(ConsoleEventKind::HttpRequest),
+            Some(ConsoleEventKind::HttpRequest) => None,
+        };
+        self.scroll_offset = 0;
+    }
+
     fn matches_event(&self, event: &ConsoleEvent) -> bool {
         if let Some(sev) = self.filter_severity
             && event.severity != sev
+        {
+            return false;
+        }
+
+        if let Some(kind) = self.filter_kind
+            && event.kind != kind
         {
             return false;
         }
@@ -2004,6 +2030,10 @@ impl TimelinePane {
                         self.cycle_severity_filter();
                         true
                     }
+                    KeyCode::Char('k') => {
+                        self.cycle_kind_filter();
+                        true
+                    }
                     KeyCode::Enter => {
                         self.toggle_details();
                         true
@@ -2055,6 +2085,7 @@ impl TimelinePane {
         const HELP: &str = "\
  /        Search\n\
  f        Cycle severity filter\n\
+ k        Cycle kind filter\n\
  F        Toggle follow\n\
  Up/Down  Select event\n\
  PgUp/Dn  Page\n\
@@ -2172,8 +2203,9 @@ impl TimelinePane {
                 let ev = &events[visible[sel]];
                 let mut lines = Vec::new();
                 lines.push(format!(
-                    "#{}  {}  {}",
+                    "#{}  {}  {}  {}",
                     ev.id,
+                    ev.ts_iso,
                     ev.severity.label(),
                     ev.kind.label()
                 ));
@@ -2251,7 +2283,12 @@ pub fn render_split_frame_timeline(
         .map(|s| format!(" sev={} ", s.label()))
         .unwrap_or_default();
 
-    let title = format!(" Timeline{sev}{follow_indicator}");
+    let kind = timeline
+        .filter_kind()
+        .map(|k| format!(" kind={} ", k.label()))
+        .unwrap_or_default();
+
+    let title = format!(" Timeline{sev}{kind}{follow_indicator}");
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .title(&title);
@@ -3767,6 +3804,7 @@ mod tests {
         assert_eq!(pane.mode(), TimelinePaneMode::Normal);
         assert!(pane.follow_enabled());
         assert!(pane.filter_severity().is_none());
+        assert!(pane.filter_kind().is_none());
     }
 
     #[test]
@@ -3783,11 +3821,25 @@ mod tests {
     }
 
     #[test]
+    fn timeline_pane_kind_filter_cycle() {
+        let mut pane = TimelinePane::new();
+        pane.cycle_kind_filter();
+        assert_eq!(pane.filter_kind(), Some(ConsoleEventKind::ToolCallStart));
+        pane.cycle_kind_filter();
+        assert_eq!(pane.filter_kind(), Some(ConsoleEventKind::ToolCallEnd));
+        pane.cycle_kind_filter();
+        assert_eq!(pane.filter_kind(), Some(ConsoleEventKind::HttpRequest));
+        pane.cycle_kind_filter();
+        assert!(pane.filter_kind().is_none());
+    }
+
+    #[test]
     fn timeline_pane_filter_matches() {
         let mut pane = TimelinePane::new();
         let events = vec![
             ConsoleEvent {
                 id: 1,
+                ts_iso: "2026-02-07T00:00:00Z".into(),
                 kind: ConsoleEventKind::HttpRequest,
                 severity: ConsoleEventSeverity::Info,
                 summary: "GET /health".into(),
@@ -3796,6 +3848,7 @@ mod tests {
             },
             ConsoleEvent {
                 id: 2,
+                ts_iso: "2026-02-07T00:00:01Z".into(),
                 kind: ConsoleEventKind::ToolCallEnd,
                 severity: ConsoleEventSeverity::Error,
                 summary: "send_message failed".into(),
@@ -3804,6 +3857,7 @@ mod tests {
             },
             ConsoleEvent {
                 id: 3,
+                ts_iso: "2026-02-07T00:00:02Z".into(),
                 kind: ConsoleEventKind::HttpRequest,
                 severity: ConsoleEventSeverity::Warn,
                 summary: "POST /mcp 404".into(),
@@ -3884,6 +3938,7 @@ mod tests {
         let events = vec![
             ConsoleEvent {
                 id: 1,
+                ts_iso: "2026-02-07T00:00:00Z".into(),
                 kind: ConsoleEventKind::HttpRequest,
                 severity: ConsoleEventSeverity::Info,
                 summary: "GET /health 200 5ms".into(),
@@ -3892,6 +3947,7 @@ mod tests {
             },
             ConsoleEvent {
                 id: 2,
+                ts_iso: "2026-02-07T00:00:01Z".into(),
                 kind: ConsoleEventKind::ToolCallStart,
                 severity: ConsoleEventSeverity::Info,
                 summary: "send_message".into(),
@@ -3909,6 +3965,7 @@ mod tests {
         let mut pane = TimelinePane::new();
         let events = vec![ConsoleEvent {
             id: 1,
+            ts_iso: "2026-02-07T00:00:00Z".into(),
             kind: ConsoleEventKind::HttpRequest,
             severity: ConsoleEventSeverity::Info,
             summary: "GET /health".into(),
