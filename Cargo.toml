@@ -97,6 +97,22 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 module_name_repetitions = "allow"
 
+# ── Build profiles ──────────────────────────────────────────────────────────
+
+[profile.dev]
+opt-level = 1            # Slight optimization for faster test execution
+debug = 2                # Full debug info for development
+
+[profile.release]
+lto = "thin"             # Cross-crate optimization (80% of full LTO, much faster compile)
+codegen-units = 1        # Single codegen unit for maximum optimization
+panic = "abort"          # No unwinding overhead (smaller + faster binary)
+opt-level = 3            # Maximum optimization for speed
+strip = "symbols"        # Remove debug symbols from production binary
+
+[profile.bench]
+inherits = "release"     # Benchmarks use same optimizations as release
+
 [patch.crates-io]
 # Force a single asupersync throughout the dependency graph to avoid
 # type-identity mismatches (Cx/Outcome/etc).
