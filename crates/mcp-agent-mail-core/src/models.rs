@@ -489,7 +489,28 @@ pub fn sanitize_agent_name(value: &str) -> Option<String> {
     Some(cleaned)
 }
 
+/// Precomputed set of all 4,278 valid lowercased agent names for O(1) lookup.
+///
+/// Initialized on first access. 62 adjectives × 69 nouns ≈ 51 KB.
+fn valid_names_set() -> &'static std::collections::HashSet<String> {
+    static SET: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        let mut set =
+            std::collections::HashSet::with_capacity(VALID_ADJECTIVES.len() * VALID_NOUNS.len());
+        for adj in VALID_ADJECTIVES {
+            for noun in VALID_NOUNS {
+                set.insert(format!("{adj}{noun}"));
+            }
+        }
+        set
+    })
+}
+
 /// Validates that an agent name follows the adjective+noun pattern.
+///
+/// Uses a precomputed `HashSet` of all 4,278 valid names for O(1) lookup,
+/// replacing the previous O(62×69) linear scan.
 ///
 /// # Examples
 /// ```
@@ -501,16 +522,7 @@ pub fn sanitize_agent_name(value: &str) -> Option<String> {
 /// ```
 #[must_use]
 pub fn is_valid_agent_name(name: &str) -> bool {
-    let lower = name.to_lowercase();
-
-    for adj in VALID_ADJECTIVES {
-        if let Some(rest) = lower.strip_prefix(adj) {
-            if VALID_NOUNS.contains(&rest) {
-                return true;
-            }
-        }
-    }
-    false
+    valid_names_set().contains(&name.to_lowercase())
 }
 
 fn capitalize_first(s: &str) -> String {
