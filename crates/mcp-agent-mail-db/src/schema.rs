@@ -73,6 +73,8 @@ CREATE INDEX IF NOT EXISTS idx_messages_project_sender_created ON messages(proje
 CREATE INDEX IF NOT EXISTS idx_messages_thread_id ON messages(thread_id);
 CREATE INDEX IF NOT EXISTS idx_messages_importance ON messages(importance);
 CREATE INDEX IF NOT EXISTS idx_messages_created_ts ON messages(created_ts);
+CREATE INDEX IF NOT EXISTS idx_msg_thread_created ON messages(thread_id, created_ts);
+CREATE INDEX IF NOT EXISTS idx_msg_project_importance_created ON messages(project_id, importance, created_ts);
 
 -- Message recipients (many-to-many)
 CREATE TABLE IF NOT EXISTS message_recipients (
@@ -85,6 +87,7 @@ CREATE TABLE IF NOT EXISTS message_recipients (
 );
 CREATE INDEX IF NOT EXISTS idx_message_recipients_agent ON message_recipients(agent_id);
 CREATE INDEX IF NOT EXISTS idx_message_recipients_agent_message ON message_recipients(agent_id, message_id);
+CREATE INDEX IF NOT EXISTS idx_mr_agent_ack ON message_recipients(agent_id, ack_ts);
 
 -- File reservations table
 CREATE TABLE IF NOT EXISTS file_reservations (
@@ -119,6 +122,8 @@ CREATE TABLE IF NOT EXISTS agent_links (
 CREATE INDEX IF NOT EXISTS idx_agent_links_a_project ON agent_links(a_project_id);
 CREATE INDEX IF NOT EXISTS idx_agent_links_b_project ON agent_links(b_project_id);
 CREATE INDEX IF NOT EXISTS idx_agent_links_status ON agent_links(status);
+CREATE INDEX IF NOT EXISTS idx_al_a_agent_status ON agent_links(a_project_id, a_agent_id, status);
+CREATE INDEX IF NOT EXISTS idx_al_b_agent_status ON agent_links(b_project_id, b_agent_id, status);
 
 -- Project sibling suggestions
 CREATE TABLE IF NOT EXISTS project_sibling_suggestions (
@@ -301,6 +306,7 @@ fn extract_trigger_statements(sql: &str) -> Vec<&str> {
 /// `sqlmodel_sqlite::SqliteConnection::execute_sync`, which only executes the first
 /// prepared statement). Triggers are included as single `CREATE TRIGGER ... END;` statements.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn schema_migrations() -> Vec<Migration> {
     let mut migrations: Vec<Migration> = Vec::new();
 
@@ -404,6 +410,71 @@ pub fn schema_migrations() -> Vec<Migration> {
             ts_conversion("created_ts"),
             ts_conversion("expires_ts")
         ),
+        String::new(),
+    ));
+
+    // ── v4: composite indexes for hot-path queries ──────────────────────
+    // These cover the most frequent query patterns that previously required
+    // full table scans or suboptimal single-column index usage.
+    //
+    // 1. message_recipients(agent_id, ack_ts) — ack-required / ack-overdue views
+    //    Queries: list_unacknowledged_messages, fetch_unacked_for_agent
+    migrations.push(Migration::new(
+        "v4_idx_mr_agent_ack".to_string(),
+        "composite index on message_recipients(agent_id, ack_ts) for ack views".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_mr_agent_ack ON message_recipients(agent_id, ack_ts)"
+            .to_string(),
+        String::new(),
+    ));
+
+    // 2. messages(thread_id, created_ts) — thread retrieval with ordering
+    //    Queries: list_thread_messages, summarize_thread
+    migrations.push(Migration::new(
+        "v4_idx_msg_thread_created".to_string(),
+        "composite index on messages(thread_id, created_ts) for thread queries".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_msg_thread_created ON messages(thread_id, created_ts)"
+            .to_string(),
+        String::new(),
+    ));
+
+    // 3. messages(project_id, importance, created_ts) — urgent-unread views
+    //    Queries: fetch_inbox (urgent_only=true), views/urgent-unread resource
+    migrations.push(Migration::new(
+        "v4_idx_msg_project_importance_created".to_string(),
+        "composite index on messages(project_id, importance, created_ts) for urgent views"
+            .to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_msg_project_importance_created ON messages(project_id, importance, created_ts)"
+            .to_string(),
+        String::new(),
+    ));
+
+    // 4. agent_links(a_project_id, a_agent_id, status) — outgoing contact queries
+    //    Queries: list_contacts (outgoing), list_approved_contact_ids, is_contact_allowed
+    migrations.push(Migration::new(
+        "v4_idx_al_a_agent_status".to_string(),
+        "composite index on agent_links(a_project_id, a_agent_id, status) for contact queries"
+            .to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_al_a_agent_status ON agent_links(a_project_id, a_agent_id, status)"
+            .to_string(),
+        String::new(),
+    ));
+
+    // 5. agent_links(b_project_id, b_agent_id, status) — incoming contact queries
+    //    Queries: list_contacts (incoming), reverse contact lookups
+    migrations.push(Migration::new(
+        "v4_idx_al_b_agent_status".to_string(),
+        "composite index on agent_links(b_project_id, b_agent_id, status) for reverse contact queries"
+            .to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_al_b_agent_status ON agent_links(b_project_id, b_agent_id, status)"
+            .to_string(),
+        String::new(),
+    ));
+
+    // 6. ANALYZE to update query planner statistics after new indexes
+    migrations.push(Migration::new(
+        "v4_analyze_after_indexes".to_string(),
+        "run ANALYZE to update query planner statistics for new indexes".to_string(),
+        "ANALYZE".to_string(),
         String::new(),
     ));
 
@@ -660,6 +731,147 @@ mod tests {
             .expect("query file_reservations");
         assert_eq!(rows[0].get_named::<String>("t1").unwrap(), "integer");
         assert_eq!(rows[0].get_named::<String>("t2").unwrap(), "integer");
+    }
+
+    #[test]
+    fn v4_migration_creates_composite_indexes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("v4_indexes.db");
+        let conn = SqliteConnection::open_file(db_path.display().to_string())
+            .expect("open sqlite connection");
+
+        // Apply all migrations.
+        block_on({
+            let conn = &conn;
+            move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
+        });
+
+        // Query sqlite_master for v4 indexes.
+        let rows = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%' ORDER BY name",
+                &[],
+            )
+            .expect("query indexes");
+
+        let index_names: Vec<String> = rows
+            .iter()
+            .map(|r| r.get_named::<String>("name").unwrap())
+            .collect();
+
+        // v4 composite indexes must exist.
+        assert!(
+            index_names.contains(&"idx_mr_agent_ack".to_string()),
+            "missing idx_mr_agent_ack in {index_names:?}"
+        );
+        assert!(
+            index_names.contains(&"idx_msg_thread_created".to_string()),
+            "missing idx_msg_thread_created in {index_names:?}"
+        );
+        assert!(
+            index_names.contains(&"idx_msg_project_importance_created".to_string()),
+            "missing idx_msg_project_importance_created in {index_names:?}"
+        );
+        assert!(
+            index_names.contains(&"idx_al_a_agent_status".to_string()),
+            "missing idx_al_a_agent_status in {index_names:?}"
+        );
+        assert!(
+            index_names.contains(&"idx_al_b_agent_status".to_string()),
+            "missing idx_al_b_agent_status in {index_names:?}"
+        );
+    }
+
+    #[test]
+    fn v4_indexes_applied_to_existing_db() {
+        use sqlmodel_core::Value;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("v4_existing.db");
+        let conn = SqliteConnection::open_file(db_path.display().to_string())
+            .expect("open sqlite connection");
+
+        conn.execute_raw(PRAGMA_SETTINGS_SQL)
+            .expect("apply PRAGMAs");
+
+        // Create minimal schema (pre-v4) with some data.
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL UNIQUE, human_key TEXT NOT NULL, created_at INTEGER NOT NULL)",
+            &[],
+        ).expect("create projects table");
+        conn.execute_sync(
+            "INSERT INTO projects (slug, human_key, created_at) VALUES (?, ?, ?)",
+            &[Value::Text("test".to_string()), Value::Text("/test".to_string()), Value::BigInt(100)],
+        ).expect("insert project");
+
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS agents (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL, name TEXT NOT NULL, program TEXT NOT NULL, model TEXT NOT NULL, task_description TEXT NOT NULL DEFAULT '', inception_ts INTEGER NOT NULL, last_active_ts INTEGER NOT NULL, attachments_policy TEXT NOT NULL DEFAULT 'auto', contact_policy TEXT NOT NULL DEFAULT 'auto', UNIQUE(project_id, name))",
+            &[],
+        ).expect("create agents table");
+        conn.execute_sync(
+            "INSERT INTO agents (project_id, name, program, model, inception_ts, last_active_ts) VALUES (?, ?, ?, ?, ?, ?)",
+            &[Value::BigInt(1), Value::Text("BlueLake".to_string()), Value::Text("cc".to_string()), Value::Text("opus".to_string()), Value::BigInt(100), Value::BigInt(100)],
+        ).expect("insert agent");
+
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL DEFAULT 'normal', ack_required INTEGER NOT NULL DEFAULT 0, created_ts INTEGER NOT NULL, attachments TEXT NOT NULL DEFAULT '[]')",
+            &[],
+        ).expect("create messages table");
+        conn.execute_sync(
+            "INSERT INTO messages (project_id, sender_id, thread_id, subject, body_md, importance, created_ts) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            &[Value::BigInt(1), Value::BigInt(1), Value::Text("t1".to_string()), Value::Text("Hi".to_string()), Value::Text("body".to_string()), Value::Text("urgent".to_string()), Value::BigInt(200)],
+        ).expect("insert message");
+
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'to', read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id, agent_id))",
+            &[],
+        ).expect("create message_recipients table");
+        conn.execute_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?, ?, ?)",
+            &[Value::BigInt(1), Value::BigInt(1), Value::Text("to".to_string())],
+        ).expect("insert recipient");
+
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS agent_links (id INTEGER PRIMARY KEY AUTOINCREMENT, a_project_id INTEGER NOT NULL, a_agent_id INTEGER NOT NULL, b_project_id INTEGER NOT NULL, b_agent_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending', reason TEXT NOT NULL DEFAULT '', created_ts INTEGER NOT NULL, updated_ts INTEGER NOT NULL, expires_ts INTEGER, UNIQUE(a_project_id, a_agent_id, b_project_id, b_agent_id))",
+            &[],
+        ).expect("create agent_links table");
+
+        // Now run migrations — v4 should create indexes on existing tables.
+        let applied = block_on({
+            let conn = &conn;
+            move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
+        });
+
+        // v4 indexes should be among applied migrations.
+        assert!(
+            applied.iter().any(|id| id == "v4_idx_mr_agent_ack"),
+            "v4_idx_mr_agent_ack should be applied: {applied:?}"
+        );
+
+        // Verify queries using the new indexes work with data.
+        let rows = conn
+            .query_sync(
+                "SELECT agent_id FROM message_recipients WHERE agent_id = 1 AND ack_ts IS NULL",
+                &[],
+            )
+            .expect("query using idx_mr_agent_ack");
+        assert_eq!(rows.len(), 1);
+
+        let rows = conn
+            .query_sync(
+                "SELECT id FROM messages WHERE thread_id = 't1' ORDER BY created_ts ASC",
+                &[],
+            )
+            .expect("query using idx_msg_thread_created");
+        assert_eq!(rows.len(), 1);
+
+        let rows = conn
+            .query_sync(
+                "SELECT id FROM messages WHERE project_id = 1 AND importance = 'urgent' ORDER BY created_ts DESC",
+                &[],
+            )
+            .expect("query using idx_msg_project_importance_created");
+        assert_eq!(rows.len(), 1);
     }
 
     #[test]
