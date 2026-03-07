@@ -3050,6 +3050,7 @@ fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
         port: config.http_port,
         path: config.http_path.clone(),
         token: resolved_token.clone(),
+        mcp_server_command: Some(resolve_setup_mcp_server_command()),
         project_dir: project_dir.clone(),
         agents: Some(target_agents.clone()),
         dry_run: false,
@@ -4567,6 +4568,11 @@ fn handle_config(action: ConfigCommand) -> CliResult<()> {
     }
 }
 
+fn resolve_setup_mcp_server_command() -> PathBuf {
+    let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("am"));
+    resolve_sibling_binary(&current_exe, "mcp-agent-mail")
+}
+
 pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
     use mcp_agent_mail_core::setup;
 
@@ -4659,6 +4665,7 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
                 port,
                 path,
                 token: resolved_token.clone(),
+                mcp_server_command: Some(resolve_setup_mcp_server_command()),
                 project_dir: pdir.clone(),
                 agents: Some(target_agents),
                 dry_run,
@@ -4716,6 +4723,7 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
                 host,
                 port,
                 path,
+                mcp_server_command: Some(resolve_setup_mcp_server_command()),
                 project_dir: pdir,
                 skip_user_config: false,
                 ..Default::default()

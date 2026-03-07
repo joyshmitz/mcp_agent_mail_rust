@@ -78,6 +78,35 @@ sync_toml_mcp_url() {
     return 0
   fi
 
+  # Codex stdio configs use `command = "...mcp-agent-mail"` instead of `url =`.
+  # Do not mutate those entries into HTTP configs during URL sync.
+  if awk '
+    BEGIN {
+      in_section = 0
+      found_command = 0
+    }
+
+    /^\[mcp_servers\.mcp_agent_mail\][[:space:]]*$/ || /^\[mcp_servers\."mcp-agent-mail"\][[:space:]]*$/ {
+      in_section = 1
+      next
+    }
+
+    /^\[/ {
+      in_section = 0
+    }
+
+    in_section && /^[[:space:]]*command[[:space:]]*=/ {
+      found_command = 1
+      exit
+    }
+
+    END {
+      exit(found_command ? 0 : 1)
+    }
+  ' "$config_file"; then
+    return 0
+  fi
+
   awk -v desired_url="$desired_url" -v create_if_missing="$create_if_missing" '
     BEGIN {
       in_section = 0

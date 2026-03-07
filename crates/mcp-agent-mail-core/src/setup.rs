@@ -160,6 +160,8 @@ pub enum ConfigContent {
         server_name: &'static str,
         server_value: Value,
     },
+    /// Merge the Codex MCP server entry into `config.toml`.
+    CodexToml { command: String, args: Vec<String> },
     /// Write complete JSON (for new files only).
     JsonFull(Value),
     /// Merge Claude Code hooks into settings.json.
@@ -175,6 +177,7 @@ pub struct SetupParams {
     pub port: u16,
     pub path: String,
     pub token: String,
+    pub mcp_server_command: Option<PathBuf>,
     pub project_dir: PathBuf,
     pub agents: Option<Vec<AgentPlatform>>,
     pub dry_run: bool,
@@ -191,6 +194,7 @@ impl Default for SetupParams {
             port: 8765,
             path: "/mcp/".to_string(),
             token: String::new(),
+            mcp_server_command: None,
             project_dir: PathBuf::from("."),
             agents: None,
             dry_run: false,
@@ -437,6 +441,80 @@ pub fn merge_mcp_server(
     Ok(serde_json::to_string_pretty(&doc)? + "\n")
 }
 
+const CODEX_TOML_SECTION_HEADERS: &[&str] = &[
+    "[mcp_servers.mcp_agent_mail]",
+    r#"[mcp_servers."mcp-agent-mail"]"#,
+];
+
+fn is_codex_mcp_section_header(line: &str) -> bool {
+    CODEX_TOML_SECTION_HEADERS.contains(&line.trim())
+}
+
+fn toml_basic_string(value: &str) -> Result<String, SetupError> {
+    serde_json::to_string(value).map_err(SetupError::Json)
+}
+
+fn codex_toml_section_lines(command: &str, args: &[String]) -> Result<Vec<String>, SetupError> {
+    let mut lines = vec![
+        "[mcp_servers.mcp_agent_mail]".to_string(),
+        format!("command = {}", toml_basic_string(command)?),
+    ];
+    if !args.is_empty() {
+        lines.push(format!(
+            "args = {}",
+            serde_json::to_string(args).map_err(SetupError::Json)?
+        ));
+    }
+    Ok(lines)
+}
+
+/// Merge the Codex MCP entry into a TOML config file.
+///
+/// Replaces any existing `mcp_agent_mail` / `mcp-agent-mail` section with a
+/// command-based stdio server entry that launches the Rust `mcp-agent-mail`
+/// binary directly.
+pub fn merge_codex_mcp_server(
+    existing: Option<&str>,
+    command: &str,
+    args: &[String],
+) -> Result<String, SetupError> {
+    let replacement = codex_toml_section_lines(command, args)?;
+    let mut output = Vec::new();
+    let mut inserted = false;
+    let mut in_target_section = false;
+
+    for line in existing.unwrap_or_default().lines() {
+        let trimmed = line.trim();
+        if is_codex_mcp_section_header(trimmed) {
+            if !inserted {
+                output.extend(replacement.iter().cloned());
+                inserted = true;
+            }
+            in_target_section = true;
+            continue;
+        }
+        if in_target_section && trimmed.starts_with('[') {
+            in_target_section = false;
+        }
+        if in_target_section {
+            continue;
+        }
+        output.push(line.to_string());
+    }
+
+    if !inserted {
+        while matches!(output.last(), Some(line) if line.trim().is_empty()) {
+            output.pop();
+        }
+        if !output.is_empty() {
+            output.push(String::new());
+        }
+        output.extend(replacement);
+    }
+
+    Ok(output.join("\n") + "\n")
+}
+
 // ---------------------------------------------------------------------------
 // Claude Code hooks merge
 // ---------------------------------------------------------------------------
@@ -647,6 +725,15 @@ fn project_local_action(
     }
 }
 
+fn resolve_codex_server_command(params: &SetupParams) -> String {
+    params
+        .mcp_server_command
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("mcp-agent-mail"))
+        .to_string_lossy()
+        .into_owned()
+}
+
 impl AgentPlatform {
     /// Generate config file actions for this platform.
     #[must_use]
@@ -676,14 +763,7 @@ impl AgentPlatform {
                 standard_http_server_value(&url, token),
                 "Windsurf project-local MCP config",
             )],
-            Self::Codex => vec![project_local_action(
-                self,
-                pdir,
-                "codex.mcp.json",
-                "mcpServers",
-                standard_http_server_value(&url, token),
-                "Codex CLI project-local MCP config",
-            )],
+            Self::Codex => self.codex_actions(params, pdir, &home),
             Self::Gemini => self.gemini_actions(params, &url, token, pdir, &home),
             Self::OpenCode => vec![project_local_action(
                 self,
@@ -712,6 +792,35 @@ impl AgentPlatform {
                 backup: true,
             }],
         }
+    }
+
+    fn codex_actions(self, params: &SetupParams, pdir: &Path, home: &Path) -> Vec<ConfigAction> {
+        let command = resolve_codex_server_command(params);
+        let mut actions = vec![ConfigAction {
+            platform: self,
+            file_path: pdir.join(".codex").join("config.toml"),
+            description: "Codex CLI project-local MCP config".into(),
+            content: ConfigContent::CodexToml {
+                command: command.clone(),
+                args: Vec::new(),
+            },
+            permissions: 0o600,
+            backup: true,
+        }];
+        if !params.skip_user_config {
+            actions.push(ConfigAction {
+                platform: self,
+                file_path: home.join(".codex").join("config.toml"),
+                description: "Codex CLI user-level MCP config".into(),
+                content: ConfigContent::CodexToml {
+                    command,
+                    args: Vec::new(),
+                },
+                permissions: 0o600,
+                backup: true,
+            });
+        }
+        actions
     }
 
     fn claude_actions(
@@ -895,6 +1004,9 @@ pub fn write_config_atomic(action: &ConfigAction) -> Result<ActionOutcome, Setup
             server_name,
             server_value.clone(),
         )?,
+        ConfigContent::CodexToml { command, args } => {
+            merge_codex_mcp_server(existing.as_deref(), command, args)?
+        }
         ConfigContent::JsonFull(val) => serde_json::to_string_pretty(val)? + "\n",
         ConfigContent::HooksMerge {
             project_slug,
@@ -1076,6 +1188,10 @@ fn check_config_file(path: &Path, expected_url: &str) -> (bool, bool) {
     let Ok(content) = std::fs::read_to_string(path) else {
         return (false, false);
     };
+    let toml_status = check_codex_toml_config(&content, expected_url);
+    if toml_status.0 {
+        return toml_status;
+    }
     let Ok(doc) = serde_json::from_str::<Value>(&content) else {
         return (false, false);
     };
@@ -1095,6 +1211,49 @@ fn check_config_file(path: &Path, expected_url: &str) -> (bool, bool) {
     }
 
     (false, false)
+}
+
+fn check_codex_toml_config(content: &str, expected_url: &str) -> (bool, bool) {
+    let mut in_target_section = false;
+    let mut saw_target_section = false;
+    let mut command_value: Option<String> = None;
+    let mut url_value: Option<String> = None;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if is_codex_mcp_section_header(trimmed) {
+            in_target_section = true;
+            saw_target_section = true;
+            continue;
+        }
+        if in_target_section && trimmed.starts_with('[') {
+            break;
+        }
+        if !in_target_section || trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((key, raw_value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = raw_value.trim().trim_matches('"').trim_matches('\'');
+        match key {
+            "command" => command_value = Some(value.to_string()),
+            "url" => url_value = Some(value.to_string()),
+            _ => {}
+        }
+    }
+
+    if !saw_target_section {
+        return (false, false);
+    }
+    if command_value.is_some() {
+        return (true, true);
+    }
+    if let Some(url) = url_value {
+        return (true, urls_match_for_status(&url, expected_url));
+    }
+    (true, false)
 }
 
 fn urls_match_for_status(actual_url: &str, expected_url: &str) -> bool {
@@ -1381,6 +1540,27 @@ mod tests {
                 assert!(server_value["url"].as_str().unwrap().contains("8765"));
             }
             _ => panic!("expected JsonMerge"),
+        }
+    }
+
+    #[test]
+    fn config_actions_codex_use_real_toml_targets() {
+        let params = SetupParams {
+            project_dir: PathBuf::from("/tmp/project"),
+            skip_user_config: false,
+            mcp_server_command: Some(PathBuf::from("/tmp/bin/mcp-agent-mail")),
+            ..Default::default()
+        };
+        let actions = AgentPlatform::Codex.config_actions(&params);
+        assert_eq!(actions.len(), 2);
+        assert!(actions[0].file_path.ends_with(".codex/config.toml"));
+        assert!(actions[1].file_path.ends_with(".codex/config.toml"));
+        match &actions[0].content {
+            ConfigContent::CodexToml { command, args } => {
+                assert_eq!(command, "/tmp/bin/mcp-agent-mail");
+                assert!(args.is_empty());
+            }
+            _ => panic!("expected CodexToml"),
         }
     }
 
@@ -1688,6 +1868,25 @@ mod tests {
 
         let (_, wrong_url) = check_config_file(&path, "http://127.0.0.1:9999/mcp/");
         assert!(!wrong_url);
+    }
+
+    #[test]
+    fn merge_codex_mcp_server_replaces_http_section() {
+        let existing = r#"
+[mcp_servers.mcp_agent_mail]
+transport = "http"
+url = "http://127.0.0.1:8765/mcp/"
+
+[projects."/tmp/project"]
+trust_level = "trusted"
+"#;
+        let merged =
+            merge_codex_mcp_server(Some(existing), "/opt/bin/mcp-agent-mail", &[]).unwrap();
+        assert!(merged.contains("[mcp_servers.mcp_agent_mail]"));
+        assert!(merged.contains(r#"command = "/opt/bin/mcp-agent-mail""#));
+        assert!(!merged.contains(r#"transport = "http""#));
+        assert!(!merged.contains(r#"url = "http://127.0.0.1:8765/mcp/""#));
+        assert!(merged.contains(r#"[projects."/tmp/project"]"#));
     }
 
     // ── br-3h13: Additional setup.rs test coverage ──────────────────
@@ -2142,6 +2341,23 @@ mod tests {
         let (has_server, url_matches) = check_config_file(&path, "http://127.0.0.1:8765/mcp/");
         assert!(has_server);
         assert!(!url_matches);
+    }
+
+    #[test]
+    fn check_config_file_codex_toml_command_section_is_healthy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"[mcp_servers.mcp_agent_mail]
+command = "/opt/bin/mcp-agent-mail"
+"#,
+        )
+        .unwrap();
+
+        let (has_server, url_matches) = check_config_file(&path, "http://127.0.0.1:8765/mcp/");
+        assert!(has_server);
+        assert!(url_matches);
     }
 
     #[test]
